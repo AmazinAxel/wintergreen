@@ -1,0 +1,2 @@
+#pragma once
+#define WINTERGREEN_SD_DIR "@WINTERGREEN_SD_DIR@"
