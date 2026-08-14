@@ -7,7 +7,7 @@
 #include "../HeapLog.h"
 
 #include "../Application.h"
-#include "../display/brand_font_nous.h"
+#include "../display/brand_font_wintergreen.h"
 #include "../display/ui_font_header.h"
 #include "../display/ui_font_large.h"
 #include "../display/ui_font_medium.h"
@@ -41,6 +41,19 @@ static constexpr int kSubtitleGap = 3;      // gap between bottom of title block
 static constexpr int kSubtitleSpacing = 6;  // extra pixels between consecutive subtitles (added to y_advance)
 static constexpr int kItemSpacing = 6;      // vertical gap between list item rows
 
+// True only if `f` has a real bitmap for every character of `s`. The brand font is a
+// logotype cut with a minimal glyph set, so a font built for a different wordmark
+// silently renders blanks. Screens fall back to ui_font_ when this returns false.
+static bool font_covers(const BitmapFont& f, const char* s) {
+  if (!f.valid())
+    return false;
+  for (const char* p = s; *p; ++p) {
+    if (f.glyph_data(static_cast<char32_t>(static_cast<unsigned char>(*p))).bits == nullptr)
+      return false;
+  }
+  return true;
+}
+
 void ListMenuScreen::start(DrawBuffer& buf, IRuntime& runtime) {
   buf_ = &buf;
   runtime_ = &runtime;
@@ -58,15 +71,21 @@ void ListMenuScreen::start(DrawBuffer& buf, IRuntime& runtime) {
     header_font_.init(kFontData_ui_header_mbf, kFontData_ui_header_mbf_size);
   brand_font_ = BitmapFont{};
   if (font_size_idx_ == 1)
-    brand_font_.init(kFontData_brand_nous_medium_mbf, kFontData_brand_nous_medium_mbf_size);
+    brand_font_.init(kFontData_brand_wintergreen_medium_mbf, kFontData_brand_wintergreen_medium_mbf_size);
   else if (font_size_idx_ == 2)
-    brand_font_.init(kFontData_brand_nous_large_mbf, kFontData_brand_nous_large_mbf_size);
+    brand_font_.init(kFontData_brand_wintergreen_large_mbf, kFontData_brand_wintergreen_large_mbf_size);
   else if (font_size_idx_ == 3)
-    brand_font_.init(kFontData_brand_nous_header_mbf, kFontData_brand_nous_header_mbf_size);
+    brand_font_.init(kFontData_brand_wintergreen_header_mbf, kFontData_brand_wintergreen_header_mbf_size);
   else
-    brand_font_.init(kFontData_brand_nous_small_mbf, kFontData_brand_nous_small_mbf_size);
+    brand_font_.init(kFontData_brand_wintergreen_small_mbf, kFontData_brand_wintergreen_small_mbf_size);
   brand_header_font_ = BitmapFont{};
-  brand_header_font_.init(kFontData_brand_nous_header_mbf, kFontData_brand_nous_header_mbf_size);
+  brand_header_font_.init(kFontData_brand_wintergreen_header_mbf, kFontData_brand_wintergreen_header_mbf_size);
+  // Drop the brand fonts unless they can actually spell the wordmark; otherwise the
+  // header renders as blank space instead of falling back to ui_font_.
+  if (!font_covers(brand_font_, "wintergreen"))
+    brand_font_ = BitmapFont{};
+  if (!font_covers(brand_header_font_, "wintergreen"))
+    brand_header_font_ = BitmapFont{};
   subtitle_font_ = BitmapFont{};
   subtitle_font_.init(kFontData_ui_small_mbf, kFontData_ui_small_mbf_size);
   section_font_ = BitmapFont{};
@@ -99,16 +118,16 @@ void ListMenuScreen::start(DrawBuffer& buf, IRuntime& runtime) {
   draw_all_(buf, runtime.battery_percentage());
 }
 
-int ListMenuScreen::nous_slot_h_() const {
+int ListMenuScreen::wintergreen_slot_h_() const {
   static constexpr int kPadT = 5, kGap = 3, kPadB = 6;
   if (!subtitle_font_.valid()) return ui_font_.y_advance() + kItemSpacing;
   const int sub_h = section_font_.valid() ? section_font_.y_advance() : subtitle_font_.y_advance();
   return kPadT + ui_font_.y_advance() + kGap + sub_h + kPadB + 1;
 }
 
-int ListMenuScreen::nous_visible_from_(int scroll_off, int available_h) const {
+int ListMenuScreen::wintergreen_visible_from_(int scroll_off, int available_h) const {
   static constexpr int kSepH = 8;
-  const int sh = nous_slot_h_();
+  const int sh = wintergreen_slot_h_();
   int cnt = 0, h = 0, n = count();
   for (int i = scroll_off; i < n; i++) {
     const int ih = is_separator(i) ? kSepH : sh;
@@ -126,15 +145,15 @@ int ListMenuScreen::get_visible_count_(int H, int scroll_off) const {
       static constexpr int kBotPad = 5, kBotMargin = 10;
       bot_h = 1 + kBotPad + section_font_.y_advance() + kBotPad + kBotMargin;
     }
-    return nous_visible_from_(scroll_off, H - header_h - bot_h);
+    return wintergreen_visible_from_(scroll_off, H - header_h - bot_h);
   }
   if ((theme_ == MenuTheme::Chronicle || force_chronicle_list_) && subtitle_font_.valid() && subtitle_.empty()) {
     const int bot = (theme_ == MenuTheme::Chronicle) ? 0 : kBottomAreaH;
-    return nous_visible_from_(scroll_off, H - header_h - bot);
+    return wintergreen_visible_from_(scroll_off, H - header_h - bot);
   }
   if ((theme_ == MenuTheme::Stele || !subtitle_.empty()) && subtitle_font_.valid()) {
     static constexpr int kBarPadY = 6;
-    return nous_visible_from_(scroll_off, H - header_h - (kBarPadY + subtitle_font_.y_advance() + kBarPadY + 1));
+    return wintergreen_visible_from_(scroll_off, H - header_h - (kBarPadY + subtitle_font_.y_advance() + kBarPadY + 1));
   }
   const int line_h = ui_font_.y_advance() + kItemSpacing;
   const int avail = H - header_h - kBottomAreaH;
@@ -212,7 +231,7 @@ int ListMenuScreen::compute_header_h_() const {
     static constexpr int kBarPadY = 6;
     static constexpr int kSubPadY = 4;
     int h = kBarPadY + ui_font_.y_advance() + kBarPadY + 2;  // status bar + 2px sep
-    const std::string subhdr = nous_header_left();
+    const std::string subhdr = wintergreen_header_left();
     if (!subhdr.empty() && subtitle_font_.valid())
       h += kSubPadY + subtitle_font_.y_advance() + kSubPadY + 1;
     return h;
@@ -305,8 +324,8 @@ int ListMenuScreen::draw_header_(DrawBuffer& buf, int W, int H, std::optional<ui
                                  ui_font_, false);
     } else {
       const BitmapFont& brand_f = brand_font_.valid() ? brand_font_ : ui_font_;
-      const int nous_y = 10 + (hf_adv - brand_f.y_advance()) / 2 + brand_f.baseline();
-      buf.draw_text_proportional(kPad, nous_y, "nous", 4, brand_f, false);
+      const int wintergreen_y = 10 + (hf_adv - brand_f.y_advance()) / 2 + brand_f.baseline();
+      buf.draw_text_proportional(kPad, wintergreen_y, "wintergreen", brand_f, false);
     }
 
     if (battery_pct) {
@@ -327,9 +346,9 @@ int ListMenuScreen::draw_header_(DrawBuffer& buf, int W, int H, std::optional<ui
     const int bar_h = kBarPadY + ui_font_.y_advance() + kBarPadY;
     const int text_y = kBarPadY + ui_font_.baseline();
 
-    // Status bar left: "nous" brand
+    // Status bar left: "wintergreen" brand
     const BitmapFont& brand_f = brand_font_.valid() ? brand_font_ : ui_font_;
-    buf.draw_text_proportional(14, text_y, "nous", 4, brand_f, false);
+    buf.draw_text_proportional(14, text_y, "wintergreen", brand_f, false);
 
     // Status bar right: battery indicator
     if (battery_pct.has_value() && app_) {
@@ -369,10 +388,10 @@ int ListMenuScreen::draw_header_(DrawBuffer& buf, int W, int H, std::optional<ui
     buf.fill_rect(0, bar_h, W, 2, false);
     int y = bar_h + 2;
 
-    // Subheader row: nous_header_left() in subtitle_font_, left-aligned
+    // Subheader row: wintergreen_header_left() in subtitle_font_, left-aligned
     {
       static constexpr int kSubPadY = 4;
-      const std::string subhdr = nous_header_left();
+      const std::string subhdr = wintergreen_header_left();
       if (!subhdr.empty() && subtitle_font_.valid()) {
         y += kSubPadY;
         buf.draw_text_proportional(14, y + subtitle_font_.baseline(),
@@ -500,7 +519,7 @@ int ListMenuScreen::draw_bottom_(DrawBuffer& buf, int W, int H, std::optional<ui
     const int bottom_h = kBarPadY + subtitle_font_.y_advance() + kBarPadY + 1;
     const int bar_y = H - bottom_h;
     buf.fill_rect(0, bar_y, W, 1, false);
-    std::string footer = nous_header_left();
+    std::string footer = wintergreen_header_left();
     if (battery_pct.has_value()) {
       char nbuf[12];
       std::snprintf(nbuf, sizeof(nbuf), " \xc2\xb7 %d%%", battery_pct.value());
@@ -591,7 +610,7 @@ void ListMenuScreen::draw_list_(DrawBuffer& buf, int W, int H, int header_h, int
     const int slot_h = kPadT + title_h + kGap + sub_h + kPadB + 1;
     const int available_h = H - header_h - bottom_h;
 
-    const int visible = nous_visible_from_(scroll_offset_, available_h);
+    const int visible = wintergreen_visible_from_(scroll_offset_, available_h);
     if (visible <= 0) return;
     const int end = std::min(scroll_offset_ + visible, n);
     const bool has_scrollbar = (n > visible);
@@ -714,7 +733,7 @@ void ListMenuScreen::draw_list_(DrawBuffer& buf, int W, int H, int header_h, int
     const int slot_h = kPadT + title_h + kGap + sub_h + kPadB + 1;
     const int available_h = H - header_h - bottom_h;
 
-    const int visible = nous_visible_from_(scroll_offset_, available_h);
+    const int visible = wintergreen_visible_from_(scroll_offset_, available_h);
     if (visible <= 0) return;
     const int end = std::min(scroll_offset_ + visible, n);
 

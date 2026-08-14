@@ -66,7 +66,7 @@ std::string_view ReaderOptionsScreen::get_item_subtitle(int index) const {
   return subtitle_buf_;
 }
 
-std::string ReaderOptionsScreen::nous_header_left() const {
+std::string ReaderOptionsScreen::wintergreen_header_left() const {
   return "reading";
 }
 

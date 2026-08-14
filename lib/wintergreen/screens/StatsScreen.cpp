@@ -512,14 +512,14 @@ void GlobalStatsScreen::draw_all_(DrawBuffer& buf, std::optional<uint8_t> batter
   int y;
 
   if (is_lyra) {
-    // Lyra-style statusbar: "nous" brand + battery%, then rule — matching Lyra/LyraExt height.
+    // Lyra-style statusbar: "wintergreen" brand + battery%, then rule — matching Lyra/LyraExt height.
     const int hf_adv = header_font_.valid() ? header_font_.y_advance() : ui_font_.y_advance();
     const BitmapFont& brand_f = brand_font_.valid() ? brand_font_ : ui_font_;
     const BitmapFont& bf = section_font_.valid() ? section_font_ : ui_font_;
     static constexpr int kPad = 12;
 
-    const int nous_y = 10 + (hf_adv - brand_f.y_advance()) / 2 + brand_f.baseline();
-    buf.draw_text_proportional(kPad, nous_y, "nous", 4, brand_f, false);
+    const int wintergreen_y = 10 + (hf_adv - brand_f.y_advance()) / 2 + brand_f.baseline();
+    buf.draw_text_proportional(kPad, wintergreen_y, "wintergreen", brand_f, false);
 
     if (battery_pct) {
       char pbuf[8];

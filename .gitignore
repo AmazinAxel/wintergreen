@@ -1,0 +1,4 @@
+.pio
+__pycache__
+assets_embedded.S
+firmware.bin

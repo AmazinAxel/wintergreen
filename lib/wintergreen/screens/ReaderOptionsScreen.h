@@ -153,7 +153,7 @@ class ReaderOptionsScreen final : public ListMenuScreen {
   void start(DrawBuffer& buf, IRuntime& runtime) override;
 
   std::string_view get_item_subtitle(int index) const override;
-  std::string nous_header_left() const override;
+  std::string wintergreen_header_left() const override;
 
  protected:
   void on_start() override;

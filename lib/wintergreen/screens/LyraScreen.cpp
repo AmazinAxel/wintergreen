@@ -257,8 +257,8 @@ void LyraScreen::draw_all_(DrawBuffer& buf, std::optional<uint8_t> battery_pct) 
     const BitmapFont& brand_f = brand_font_.valid() ? brand_font_ : ui_font_;
     const BitmapFont& bf = section_font_.valid() ? section_font_ : ui_font_;
     // Centre both texts in hf_adv so they share the same visual baseline row.
-    const int nous_y = y + (hf_adv - brand_f.y_advance()) / 2 + brand_f.baseline();
-    buf.draw_text_proportional(kPad, nous_y, "nous", 4, brand_f, false);
+    const int wintergreen_y = y + (hf_adv - brand_f.y_advance()) / 2 + brand_f.baseline();
+    buf.draw_text_proportional(kPad, wintergreen_y, "wintergreen", brand_f, false);
 
     if (battery_pct) {
       char pbuf[8];

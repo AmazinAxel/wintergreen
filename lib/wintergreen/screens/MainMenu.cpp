@@ -250,7 +250,7 @@ std::string_view MainMenu::get_item_subtitle(int index) const {
   return subtitle_buf_;
 }
 
-std::string MainMenu::nous_header_left() const {
+std::string MainMenu::wintergreen_header_left() const {
   const int n = static_cast<int>(entries_.size());
   char buf[24];
   if (ListMenuScreen::theme() == ListMenuScreen::MenuTheme::Stele)
@@ -404,10 +404,10 @@ void MainMenu::draw_all_(DrawBuffer& buf, std::optional<uint8_t> battery_pct) co
   int y = 14;
   const int hf_adv = header_font_.valid() ? header_font_.y_advance() : ui_font_.y_advance();
 
-  // "nous" brand
+  // "wintergreen" brand
   {
     const BitmapFont& brand_f = brand_font_.valid() ? brand_font_ : ui_font_;
-    buf.draw_text_proportional(kPad, y + brand_f.baseline(), "nous", brand_f, false);
+    buf.draw_text_proportional(kPad, y + brand_f.baseline(), "wintergreen", brand_f, false);
   }
 
   // Battery top-right (section_font_ for larger %)

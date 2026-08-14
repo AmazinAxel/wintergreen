@@ -80,7 +80,7 @@ static std::string get_sleep_image_label(const std::string& path) {
   } else if (path == "book-cover:") {
     label += "Book Cover";
   } else if (path.rfind("embedded:", 0) == 0) {
-    label += "nous";
+    label += "wintergreen";
   } else {
     const char* p = path.rfind("bmp:", 0) == 0 ? path.c_str() + 4 : path.c_str();
     const char* slash = nullptr;
@@ -253,7 +253,7 @@ void SettingsScreen::on_start() {
     }
   }
 
-  // Build sleep image list: nous → Auto → Book Cover → individual files
+  // Build sleep image list: wintergreen → Auto → Book Cover → individual files
   sleep_images_.clear();
   sleep_images_.push_back("embedded:0");
   sleep_images_.push_back("auto:");
@@ -922,18 +922,18 @@ void SettingsScreen::draw_all_(DrawBuffer& buf, std::optional<uint8_t> battery_p
 
   // ── Header ───────────────────────────────────────────────────────────────
   if (is_lyra) {
-    // Lyra-style: "nous" brand on left, battery% on right, same row height as Lyra/LyraExt home.
+    // Lyra-style: "wintergreen" brand on left, battery% on right, same row height as Lyra/LyraExt home.
     y = 10;
     const BitmapFont& brand_f = brand_font_.valid() ? brand_font_ : ui_font_;
     const BitmapFont& bf = section_font_.valid() ? section_font_ : ui_font_;
-    const int nous_y = y + (hf_adv - brand_f.y_advance()) / 2 + brand_f.baseline();
-    buf.draw_text_proportional(kLM, nous_y, "nous", 4, brand_f, false);
+    const int wintergreen_y = y + (hf_adv - brand_f.y_advance()) / 2 + brand_f.baseline();
+    buf.draw_text_proportional(kLM, wintergreen_y, "wintergreen", brand_f, false);
     {
-      const int nous_w = static_cast<int>(brand_f.word_width("nous", 4, FontStyle::Regular));
+      const int wintergreen_w = static_cast<int>(brand_f.word_width("wintergreen", std::strlen("wintergreen"), FontStyle::Regular));
       char dot_ver[48];
       std::snprintf(dot_ver, sizeof(dot_ver), " \xc2\xb7 %s", WINTERGREEN_VERSION);
       const int dv_y = y + (hf_adv - ui_font_.y_advance()) / 2 + ui_font_.baseline();
-      buf.draw_text_proportional(kLM + nous_w, dv_y, dot_ver, std::strlen(dot_ver), ui_font_, false);
+      buf.draw_text_proportional(kLM + wintergreen_w, dv_y, dot_ver, std::strlen(dot_ver), ui_font_, false);
     }
     if (battery_pct) {
       char pbuf[8];

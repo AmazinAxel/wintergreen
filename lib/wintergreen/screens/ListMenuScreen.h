@@ -60,8 +60,8 @@ class ListMenuScreen : public IScreen {
 
   bool force_chronicle_list_ = false;  // use Chronicle-style rows regardless of global theme
 
-  // When non-empty and theme is Lyra/LyraExt: used in place of "nous" in the header,
-  // drawn with ui_font_ instead of brand_font_. Leave empty for the normal "nous" logo.
+  // When non-empty and theme is Lyra/LyraExt: used in place of "wintergreen" in the header,
+  // drawn with ui_font_ instead of brand_font_. Leave empty for the normal "wintergreen" logo.
   std::string lyra_header_override_;
 
   // 0 = center (default), 1 = left, 2 = right
@@ -152,11 +152,11 @@ class ListMenuScreen : public IScreen {
 
   // Nous theme: left side of the top bar header (e.g. "X books", "Settings").
   // Default returns title_ if set. Override per screen.
-  virtual std::string nous_header_left() const { return title_ ? title_ : ""; }
+  virtual std::string wintergreen_header_left() const { return title_ ? title_ : ""; }
 
   // Nous theme: section title drawn in header_font_ below the status bar.
   // Empty = no section title row. Override in screens that need a page heading.
-  virtual std::string nous_section_title() const { return {}; }
+  virtual std::string wintergreen_section_title() const { return {}; }
 
   // Called during start(). Set title_ and call add_item() to populate the list.
   virtual void on_start() = 0;
@@ -172,8 +172,8 @@ class ListMenuScreen : public IScreen {
   BitmapFont header_font_;
   BitmapFont subtitle_font_;   // always small; used for item subtitles and tight labels
   BitmapFont section_font_;    // one step below ui_font_; use for APPEARANCE/NAVIGATE etc.
-  BitmapFont brand_font_;        // "nous" logotype, sized to match ui_font_
-  BitmapFont brand_header_font_; // "nous" logotype, sized to match header_font_
+  BitmapFont brand_font_;        // "wintergreen" logotype, sized to match ui_font_
+  BitmapFont brand_header_font_; // "wintergreen" logotype, sized to match header_font_
   static int font_size_idx_;  // 0=Normal, 1=Large, 2=XLarge
   static MenuTheme theme_;
 
@@ -227,11 +227,11 @@ class ListMenuScreen : public IScreen {
   int draw_header_(DrawBuffer& buf, int W, int H, std::optional<uint8_t> battery_pct = {}) const;
 
   // Nous theme: height of one list item slot (title + subtitle + padding + divider).
-  int nous_slot_h_() const;
+  int wintergreen_slot_h_() const;
 
   // Nous theme: how many items are visible starting at scroll_off given available_h pixels.
   // Accounts for separator items being shorter than regular slots.
-  int nous_visible_from_(int scroll_off, int available_h) const;
+  int wintergreen_visible_from_(int scroll_off, int available_h) const;
 
   // 2. Draws the battery bar and button-hint glyphs at the bottom of the screen.
   //    Returns the height reserved at the bottom (list items must stay above this).

@@ -77,7 +77,7 @@ class MainMenu final : public ListMenuScreen {
   std::string_view get_item_label(int index) const override;
   std::string_view get_item_subtitle(int index) const override;
   std::string_view get_item_right(int index) const override;
-  std::string nous_header_left() const override;
+  std::string wintergreen_header_left() const override;
   bool is_separator(int index) const override;
   bool is_item_converted(int index) const override;
   int count() const override;
