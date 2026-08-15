@@ -54,7 +54,7 @@ struct ReaderSettings {
 
   static constexpr uint16_t kHPaddingPresets[] = {4, 12, 24, 40};
   static constexpr uint16_t kVPaddingPresets[] = {0, 4, 12, 20};
-
+  
   static constexpr uint16_t kSpacingPercents[] = {0, 80, 90, 100, 110, 120};  // Index matches SpacingOverride
 
   static constexpr const char* kHPaddingNames[] = {"Narrow", "Normal", "Wide", "Wider"};
@@ -177,9 +177,7 @@ class ReaderOptionsScreen final : public ListMenuScreen {
   int idx_chapters_ = -1;
   int idx_rotate_display_ = -1;
   int idx_reader_rotate_display_ = -1;
-  int idx_reader_images_ = -1;
   int idx_links_ = -1;
-  int idx_stats_ = -1;
 
   // Page links set by ReaderScreen before pushing this screen.
   std::vector<PageLink> page_links_;

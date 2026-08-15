@@ -115,12 +115,10 @@ void LyraExtScreen::load_cover_(int i) {
 }
 
 void LyraExtScreen::on_start() {
-  // Lyra Ext is portrait-only; clamp landscape rotations to portrait and persist it.
+  // Menus are portrait-only; the reader may leave the buffer in landscape.
   const Rotation rot = current_rotation_();
-  if (rot == Rotation::Deg0 || rot == Rotation::Deg180) {
+  if (rot == Rotation::Deg0 || rot == Rotation::Deg180)
     set_buf_rotation_(Rotation::Deg90);
-    if (app_) app_->set_rotate_display(0);  // 0 = Portrait (Deg90)
-  }
 
   if (app_ && app_->data_dir_) {
     const std::string idx_path = std::string(app_->data_dir_) + "/book_index.dat";
@@ -159,8 +157,6 @@ void LyraExtScreen::on_start() {
 
   idx_all_books_    = item_idx++; add_item("All Books");
   idx_recent_books_ = item_idx++; add_item("Recent Books");
-  idx_stats_        = item_idx++; add_item("Stats");
-  idx_settings_     = item_idx++; add_item("Settings");
 
   // Load or flag covers.
   for (int i = 0; i < num_books_; ++i) {
@@ -191,8 +187,6 @@ void LyraExtScreen::on_select(int index) {
   }
   if (index == idx_all_books_)         app_->push_screen(ScreenId::MainMenu);
   else if (index == idx_recent_books_) app_->push_screen(ScreenId::RecentBooks);
-  else if (index == idx_stats_)        app_->push_screen(ScreenId::GlobalStats);
-  else if (index == idx_settings_)     app_->push_screen(ScreenId::Settings);
 }
 
 void LyraExtScreen::update(const ButtonState& buttons, DrawBuffer& buf, IRuntime& runtime) {
@@ -235,7 +229,6 @@ void LyraExtScreen::draw_all_(DrawBuffer& buf, std::optional<uint8_t> battery_pc
   const int H = buf.height();
   buf.fill(true);
 
-  // All spacing constants match LyraScreen exactly.
   static constexpr int kPad         = 12;
   static constexpr int kTopGap      = 36;
   static constexpr int kSlotGap     = 8;    // gap between the 3 cover slots
@@ -252,7 +245,7 @@ void LyraExtScreen::draw_all_(DrawBuffer& buf, std::optional<uint8_t> battery_pc
   // ── Header ───────────────────────────────────────────────────────────────
   int y = 10;
   {
-    const BitmapFont& brand_f = brand_font_.valid() ? brand_font_ : ui_font_;
+    const BitmapFont& brand_f = ui_font_;
     const BitmapFont& bf = section_font_.valid() ? section_font_ : ui_font_;
     // Centre both texts in hf_adv so they share the same visual baseline row.
     const int wintergreen_y = y + (hf_adv - brand_f.y_advance()) / 2 + brand_f.baseline();
@@ -341,8 +334,6 @@ void LyraExtScreen::draw_all_(DrawBuffer& buf, std::optional<uint8_t> battery_pc
   const NavItem nav[] = {
     {idx_all_books_,    "All Books"},
     {idx_recent_books_, "Recent Books"},
-    {idx_stats_,        "Stats"},
-    {idx_settings_,     "Settings"},
   };
   for (const auto& item : nav) {
     if (item.idx < 0) continue;

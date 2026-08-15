@@ -11,8 +11,6 @@
 
 namespace wintergreen {
 
-enum class BookListFormat { TitleOnly, TitleAndAuthor, Filename };
-enum class BookSortOrder { Alphabetical, LastOpened };
 
 // Main screen — lists EPUB books from a directory.
 // Button1 = open book, Button0 = settings.
@@ -56,19 +54,7 @@ class MainMenu final : public ListMenuScreen {
     return "Books";
   }
 
-  BookListFormat list_format() const {
-    return list_format_;
-  }
-  void set_list_format(BookListFormat format) {
-    list_format_ = format;
-  }
 
-  BookSortOrder sort_order() const {
-    return sort_order_;
-  }
-  void set_sort_order(BookSortOrder order) {
-    sort_order_ = order;
-  }
 
   void set_app(Application* app) {
     app_ = app;
@@ -79,11 +65,7 @@ class MainMenu final : public ListMenuScreen {
   std::string_view get_item_right(int index) const override;
   std::string wintergreen_header_left() const override;
   bool is_separator(int index) const override;
-  bool is_item_converted(int index) const override;
   int count() const override;
-
-  void draw_all_(DrawBuffer& buf, std::optional<uint8_t> battery_pct = std::nullopt) const override;
-  int get_visible_count_(int H, int scroll_off) const override;
 
   void start(DrawBuffer& buf, IRuntime& runtime) override {
     buf_ = &buf;
@@ -104,8 +86,6 @@ class MainMenu final : public ListMenuScreen {
   std::string initial_selection_;   // path to pre-select after scan
   std::string last_selected_path_;  // path of the most recently opened book
   DrawBuffer* buf_ = nullptr;
-  BookListFormat list_format_ = BookListFormat::TitleOnly;
-  BookSortOrder sort_order_ = BookSortOrder::Alphabetical;
   bool needs_scan_ = false;
   // Cached BookIndex::generation() value from the last populate_list_(). When
   // update() detects a mismatch, the index was mutated externally (e.g. by a
@@ -130,8 +110,6 @@ class MainMenu final : public ListMenuScreen {
   // Inserted by populate_list_() for LastOpened sort ("Recents", "All Books").
   std::vector<std::pair<int, std::string>> separators_;
 
-  // Visual index of the pinned "Stats" item (0 for non-Lyra, -1 when absent).
-  int stats_item_idx_ = -1;
 
   // Number of separators with visual_index strictly less than v.
   int seps_before_(int v) const {
@@ -142,12 +120,11 @@ class MainMenu final : public ListMenuScreen {
   }
 
   int entries_index_for(int visual) const {
-    const int offset = (stats_item_idx_ >= 0) ? 1 : 0;
-    return visual - seps_before_(visual) - offset;
+    return visual - seps_before_(visual);
   }
 
   int visual_for_entries(int real) const {
-    int r = 0, v = (stats_item_idx_ >= 0) ? 1 : 0;
+    int r = 0, v = 0;
     while (v < count()) {
       while (v < count() && is_separator(v)) v++;
       if (v >= count()) break;

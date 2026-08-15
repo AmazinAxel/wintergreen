@@ -32,14 +32,6 @@ static bool sv_eq(XmlStringView sv, const char* s) {
   return sv == s;
 }
 
-// Extract just the file data for a given zip entry into a vector.
-static EpubError extract_entry(IZipFile& file, const ZipReader& zip, const ZipEntry& entry, std::vector<uint8_t>& out) {
-  if (zip.extract(file, entry, out) != ZipError::Ok) {
-    return EpubError::ZipError;
-  }
-  return EpubError::Ok;
-}
-
 // ---------------------------------------------------------------------------
 // CssCache
 // ---------------------------------------------------------------------------
@@ -610,8 +602,7 @@ EpubError Epub::open(IZipFile& file, uint8_t* work_buf, uint8_t* xml_buf, bool p
     return EpubError::ZipError;
 
   std::string rootfile_path;
-  auto err = parse_container(file, rootfile_path, work_buf,
-                             ZipEntryInput::kDecompSize + ZipEntryInput::kDictSize + 2048, xml_buf, 4096);
+  auto err = parse_container(file, rootfile_path, work_buf, kWorkBufSize, xml_buf, 4096);
   if (err != EpubError::Ok)
     return err;
 

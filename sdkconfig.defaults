@@ -1,16 +1,22 @@
-# Project-wide sdkconfig overrides for wintergreen.
-# These values are merged into the generated sdkconfig.<env> on build.
-
 CONFIG_ESPTOOLPY_FLASHSIZE_16MB=y
 CONFIG_ESPTOOLPY_FLASHSIZE="16MB"
 
-# Enable FAT Long File Name support (needed for .epub filenames)
+# QIO: double the flash read bandwidth of dio. Revert to CONFIG_ESPTOOLPY_FLASHMODE_DIO
+# if the board won't boot — not every module straps the extra flash pins.
+CONFIG_ESPTOOLPY_FLASHMODE_QIO=y
+
+# FAT Long File Name support for .epub filenames
 CONFIG_FATFS_LFN_HEAP=y
 
 # Build a per-file cluster-link map so fseek() stays in RAM instead of
 # re-traversing the FAT chain on every random access. ~29% faster conversion.
 CONFIG_FATFS_USE_FASTSEEK=y
 CONFIG_FATFS_USE_LABEL=y
+
+# Codepage 437, not dynamic. Dynamic links every OEM table including the four
+# CJK ones (932/936/949/950) — 478 KB of flash. Only affects 8.3 short names;
+# long filenames still go through the UTF-8 LFN path.
+CONFIG_FATFS_CODEPAGE_437=y
 
 # Main task needs enough stack for EPUB parsing (ZIP + XML + CSS) and
 # for FatFS/SDSPI calls inside settings flows (clear cache, etc).
@@ -22,7 +28,11 @@ CONFIG_ESP_MAIN_TASK_STACK_SIZE=16384
 CONFIG_COMPILER_OPTIMIZATION_PERF=y
 CONFIG_COMPILER_OPTIMIZATION_DEBUG=n
 
-# Use newlib nano printf (smaller code, no float support needed)
+# Silent assertions: keeps the check, drops the file/line/message strings from
+# flash. HAL follows the system level, so setting HAL alone had no effect.
+CONFIG_COMPILER_OPTIMIZATION_ASSERTIONS_SILENT=y
+
+# Use newlib nano printf
 CONFIG_NEWLIB_NANO_FORMAT=y
 
 # Move FreeRTOS functions to flash (slightly slower, saves IRAM)

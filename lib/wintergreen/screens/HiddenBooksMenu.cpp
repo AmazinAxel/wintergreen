@@ -79,9 +79,9 @@ void HiddenBooksMenu::scan_() {
 }
 
 void HiddenBooksMenu::on_start() {
-  force_chronicle_list_ = true;
+  detail_list_ = true;
   title_ = "Hidden";
-  lyra_header_override_ = "secret";
+  header_override_ = "secret";
   paths_.clear();
   scan_();
   if (paths_.empty()) {

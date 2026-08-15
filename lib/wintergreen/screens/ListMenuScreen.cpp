@@ -7,21 +7,16 @@
 #include "../HeapLog.h"
 
 #include "../Application.h"
-#include "../display/brand_font_wintergreen.h"
 #include "../display/ui_font_header.h"
 #include "../display/ui_font_large.h"
-#include "../display/ui_font_medium.h"
 #include "../display/ui_font_small.h"
 
 namespace wintergreen {
 
 int ListMenuScreen::font_size_idx_ = 0;
-ListMenuScreen::MenuTheme ListMenuScreen::theme_ = ListMenuScreen::MenuTheme::Chronicle;
 
 void ListMenuScreen::apply_ui_font(BitmapFont& out) {
-  if (font_size_idx_ == 1)
-    out.init(kFontData_ui_medium_mbf, kFontData_ui_medium_mbf_size);
-  else if (font_size_idx_ == 2)
+  if (font_size_idx_ == 2)
     out.init(kFontData_ui_large_mbf, kFontData_ui_large_mbf_size);
   else if (font_size_idx_ == 3)
     out.init(kFontData_ui_header_mbf, kFontData_ui_header_mbf_size);
@@ -41,27 +36,12 @@ static constexpr int kSubtitleGap = 3;      // gap between bottom of title block
 static constexpr int kSubtitleSpacing = 6;  // extra pixels between consecutive subtitles (added to y_advance)
 static constexpr int kItemSpacing = 6;      // vertical gap between list item rows
 
-// True only if `f` has a real bitmap for every character of `s`. The brand font is a
-// logotype cut with a minimal glyph set, so a font built for a different wordmark
-// silently renders blanks. Screens fall back to ui_font_ when this returns false.
-static bool font_covers(const BitmapFont& f, const char* s) {
-  if (!f.valid())
-    return false;
-  for (const char* p = s; *p; ++p) {
-    if (f.glyph_data(static_cast<char32_t>(static_cast<unsigned char>(*p))).bits == nullptr)
-      return false;
-  }
-  return true;
-}
-
 void ListMenuScreen::start(DrawBuffer& buf, IRuntime& runtime) {
   buf_ = &buf;
   runtime_ = &runtime;
   // Re-init ui_font_ whenever the font_size_idx_ setting may have changed.
   ui_font_ = BitmapFont{};
-  if (font_size_idx_ == 1)
-    ui_font_.init(kFontData_ui_medium_mbf, kFontData_ui_medium_mbf_size);
-  else if (font_size_idx_ == 2)
+  if (font_size_idx_ == 2)
     ui_font_.init(kFontData_ui_large_mbf, kFontData_ui_large_mbf_size);
   else if (font_size_idx_ == 3)
     ui_font_.init(kFontData_ui_header_mbf, kFontData_ui_header_mbf_size);
@@ -69,30 +49,11 @@ void ListMenuScreen::start(DrawBuffer& buf, IRuntime& runtime) {
     ui_font_.init(kFontData_ui_small_mbf, kFontData_ui_small_mbf_size);
   if (!header_font_.valid())
     header_font_.init(kFontData_ui_header_mbf, kFontData_ui_header_mbf_size);
-  brand_font_ = BitmapFont{};
-  if (font_size_idx_ == 1)
-    brand_font_.init(kFontData_brand_wintergreen_medium_mbf, kFontData_brand_wintergreen_medium_mbf_size);
-  else if (font_size_idx_ == 2)
-    brand_font_.init(kFontData_brand_wintergreen_large_mbf, kFontData_brand_wintergreen_large_mbf_size);
-  else if (font_size_idx_ == 3)
-    brand_font_.init(kFontData_brand_wintergreen_header_mbf, kFontData_brand_wintergreen_header_mbf_size);
-  else
-    brand_font_.init(kFontData_brand_wintergreen_small_mbf, kFontData_brand_wintergreen_small_mbf_size);
-  brand_header_font_ = BitmapFont{};
-  brand_header_font_.init(kFontData_brand_wintergreen_header_mbf, kFontData_brand_wintergreen_header_mbf_size);
-  // Drop the brand fonts unless they can actually spell the wordmark; otherwise the
-  // header renders as blank space instead of falling back to ui_font_.
-  if (!font_covers(brand_font_, "wintergreen"))
-    brand_font_ = BitmapFont{};
-  if (!font_covers(brand_header_font_, "wintergreen"))
-    brand_header_font_ = BitmapFont{};
   subtitle_font_ = BitmapFont{};
   subtitle_font_.init(kFontData_ui_small_mbf, kFontData_ui_small_mbf_size);
   section_font_ = BitmapFont{};
-  if (font_size_idx_ >= 3)
+  if (font_size_idx_ >= 2)
     section_font_.init(kFontData_ui_large_mbf, kFontData_ui_large_mbf_size);
-  else if (font_size_idx_ >= 2)
-    section_font_.init(kFontData_ui_medium_mbf, kFontData_ui_medium_mbf_size);
   else
     section_font_.init(kFontData_ui_small_mbf, kFontData_ui_small_mbf_size);
   if (app_)
@@ -139,7 +100,7 @@ int ListMenuScreen::wintergreen_visible_from_(int scroll_off, int available_h) c
 
 int ListMenuScreen::get_visible_count_(int H, int scroll_off) const {
   const int header_h = compute_header_h_();
-  if ((theme_ == MenuTheme::Lyra || theme_ == MenuTheme::LyraExt) && subtitle_font_.valid() && subtitle_.empty()) {
+  if (!plain_list_ && subtitle_font_.valid() && subtitle_.empty()) {
     int bot_h = 0;
     if (section_font_.valid()) {
       static constexpr int kBotPad = 5, kBotMargin = 10;
@@ -147,11 +108,9 @@ int ListMenuScreen::get_visible_count_(int H, int scroll_off) const {
     }
     return wintergreen_visible_from_(scroll_off, H - header_h - bot_h);
   }
-  if ((theme_ == MenuTheme::Chronicle || force_chronicle_list_) && subtitle_font_.valid() && subtitle_.empty()) {
-    const int bot = (theme_ == MenuTheme::Chronicle) ? 0 : kBottomAreaH;
-    return wintergreen_visible_from_(scroll_off, H - header_h - bot);
-  }
-  if ((theme_ == MenuTheme::Stele || !subtitle_.empty()) && subtitle_font_.valid()) {
+  if (detail_list_ && subtitle_font_.valid() && subtitle_.empty())
+    return wintergreen_visible_from_(scroll_off, H - header_h - kBottomAreaH);
+  if (!subtitle_.empty() && subtitle_font_.valid()) {
     static constexpr int kBarPadY = 6;
     return wintergreen_visible_from_(scroll_off, H - header_h - (kBarPadY + subtitle_font_.y_advance() + kBarPadY + 1));
   }
@@ -209,7 +168,7 @@ int ListMenuScreen::compute_header_h_() const {
   // Book-details card: unified across all themes when subtitle_ (author) is set.
   if (!subtitle_.empty() && ui_font_.valid()) {
     static constexpr int kBarPadY = 8;
-    int h = kBarPadY + ui_font_.y_advance() + kBarPadY + 1;  // N O U S bar + 1px rule
+    int h = kBarPadY + ui_font_.y_advance() + kBarPadY + 1;  // wordmark bar + 1px rule
     if (header_font_.valid() && subtitle_font_.valid()) {
       static constexpr int kCardPadT = 10, kCardPadB = 10, kTitleGap = 4, kLineGap = 6;
       h += kCardPadT;
@@ -221,25 +180,10 @@ int ListMenuScreen::compute_header_h_() const {
     }
     return h;
   }
-  if (theme_ == MenuTheme::Lyra || theme_ == MenuTheme::LyraExt) {
+  if (!plain_list_) {
     const int hf = header_font_.valid() ? header_font_.y_advance()
                                         : (ui_font_.valid() ? ui_font_.y_advance() : 0);
     return 10 + hf + 8 + 1;  // top pad + header row + gap + rule
-  }
-  if (theme_ == MenuTheme::Chronicle) {
-    if (!ui_font_.valid()) return 0;
-    static constexpr int kBarPadY = 6;
-    static constexpr int kSubPadY = 4;
-    int h = kBarPadY + ui_font_.y_advance() + kBarPadY + 2;  // status bar + 2px sep
-    const std::string subhdr = wintergreen_header_left();
-    if (!subhdr.empty() && subtitle_font_.valid())
-      h += kSubPadY + subtitle_font_.y_advance() + kSubPadY + 1;
-    return h;
-  }
-  if (theme_ == MenuTheme::Stele) {
-    if (!ui_font_.valid()) return 0;
-    static constexpr int kBarPadY = 8;
-    return kBarPadY + ui_font_.y_advance() + kBarPadY + 1;
   }
   int subtitle_h = 0;
   if (ui_font_.valid()) {
@@ -265,9 +209,10 @@ int ListMenuScreen::draw_header_(DrawBuffer& buf, int W, int H, std::optional<ui
     static constexpr int kBarPadY = 8;
     const int bar_h = kBarPadY + ui_font_.y_advance() + kBarPadY;
     const int text_y = kBarPadY + ui_font_.baseline();
-    const char kBrand[] = "N O U S";
-    const int bw = ui_font_.word_width(kBrand, 7, FontStyle::Regular);
-    buf.draw_text_proportional((W - bw) / 2, text_y, kBrand, 7, ui_font_, false);
+    static const char kBrand[] = "wintergreen";
+    const size_t blen = std::strlen(kBrand);
+    const int bw = ui_font_.word_width(kBrand, blen, FontStyle::Regular);
+    buf.draw_text_proportional((W - bw) / 2, text_y, kBrand, blen, ui_font_, false);
     buf.fill_rect(0, bar_h, W, 1, false);
     int y = bar_h + 1;
     if (header_font_.valid() && subtitle_font_.valid()) {
@@ -310,23 +255,17 @@ int ListMenuScreen::draw_header_(DrawBuffer& buf, int W, int H, std::optional<ui
     }
     return y;
   }
-  if (theme_ == MenuTheme::Lyra || theme_ == MenuTheme::LyraExt) {
+  if (!plain_list_) {
     if (!ui_font_.valid()) return 0;
     const int hf_adv = header_font_.valid() ? header_font_.y_advance() : ui_font_.y_advance();
     static constexpr int kPad = 12;
     const BitmapFont& bf = section_font_.valid() ? section_font_ : ui_font_;
 
-    if (!lyra_header_override_.empty()) {
-      // Override (e.g. "secret") drawn in ui_font_, centred in the header row.
-      const int text_y = 10 + (hf_adv - ui_font_.y_advance()) / 2 + ui_font_.baseline();
-      buf.draw_text_proportional(kPad, text_y,
-                                 lyra_header_override_.c_str(), lyra_header_override_.size(),
-                                 ui_font_, false);
-    } else {
-      const BitmapFont& brand_f = brand_font_.valid() ? brand_font_ : ui_font_;
-      const int wintergreen_y = 10 + (hf_adv - brand_f.y_advance()) / 2 + brand_f.baseline();
-      buf.draw_text_proportional(kPad, wintergreen_y, "wintergreen", brand_f, false);
-    }
+    // Wordmark, or a per-screen override (e.g. "secret"), left-aligned in the header row.
+    const char* head = header_override_.empty() ? "wintergreen" : header_override_.c_str();
+    const size_t head_len = std::strlen(head);
+    const int head_y = 10 + (hf_adv - ui_font_.y_advance()) / 2 + ui_font_.baseline();
+    buf.draw_text_proportional(kPad, head_y, head, head_len, ui_font_, false);
 
     if (battery_pct) {
       char pbuf[8];
@@ -339,101 +278,6 @@ int ListMenuScreen::draw_header_(DrawBuffer& buf, int W, int H, std::optional<ui
     const int rule_y = 10 + hf_adv + 8;
     buf.fill_rect(0, rule_y, W, 1, false);
     return rule_y + 1;
-  }
-  if (theme_ == MenuTheme::Chronicle) {
-    if (!ui_font_.valid()) return 0;
-    static constexpr int kBarPadY = 6;
-    const int bar_h = kBarPadY + ui_font_.y_advance() + kBarPadY;
-    const int text_y = kBarPadY + ui_font_.baseline();
-
-    // Status bar left: "wintergreen" brand
-    const BitmapFont& brand_f = brand_font_.valid() ? brand_font_ : ui_font_;
-    buf.draw_text_proportional(14, text_y, "wintergreen", brand_f, false);
-
-    // Status bar right: battery indicator
-    if (battery_pct.has_value() && app_) {
-      const uint8_t bat_mode = app_->battery_display();
-      const int bat_pct = battery_pct.value();
-      if (bat_mode == 0 || bat_mode == 2) {
-        const int kBatW = 22, kBatH = 8;
-        const int kBatX = W - kBatW - 12;
-        const int kBatY = kBarPadY + (ui_font_.y_advance() - kBatH) / 2;
-        buf.fill_rect(kBatX + 1, kBatY, kBatW - 2, 1, false);
-        buf.fill_rect(kBatX + 1, kBatY + kBatH - 1, kBatW - 2, 1, false);
-        buf.fill_rect(kBatX, kBatY + 1, 1, kBatH - 2, false);
-        buf.fill_rect(kBatX + kBatW - 1, kBatY + 1, 1, kBatH - 2, false);
-        const int max_fill = kBatW - 4;
-        const int filled = (bat_pct * max_fill) / 100;
-        if (filled > 0) {
-          buf.fill_row(kBatY + 5, kBatX + 2, kBatX + 2 + std::min(filled + 3, max_fill), false);
-          buf.fill_row(kBatY + 4, kBatX + 2, kBatX + 2 + std::min(filled + 2, max_fill), false);
-          buf.fill_row(kBatY + 3, kBatX + 2, kBatX + 2 + std::min(filled + 1, max_fill), false);
-          buf.fill_row(kBatY + 2, kBatX + 2, kBatX + 2 + std::min(filled, max_fill), false);
-        }
-        if (bat_mode == 2) {
-          char nbuf[8];
-          const int nlen = std::snprintf(nbuf, sizeof(nbuf), "%d%%", bat_pct);
-          const int nw = ui_font_.word_width(nbuf, static_cast<size_t>(nlen), FontStyle::Regular);
-          buf.draw_text_proportional(kBatX - nw - 5, text_y, nbuf, static_cast<size_t>(nlen), ui_font_, false);
-        }
-      } else if (bat_mode == 1) {
-        char nbuf[8];
-        const int nlen = std::snprintf(nbuf, sizeof(nbuf), "%d%%", bat_pct);
-        const int nw = ui_font_.word_width(nbuf, static_cast<size_t>(nlen), FontStyle::Regular);
-        buf.draw_text_proportional(W - nw - 12, text_y, nbuf, static_cast<size_t>(nlen), ui_font_, false);
-      }
-    }
-
-    // Status bar bottom rule: 2px (thicker/darker than list dividers)
-    buf.fill_rect(0, bar_h, W, 2, false);
-    int y = bar_h + 2;
-
-    // Subheader row: wintergreen_header_left() in subtitle_font_, left-aligned
-    {
-      static constexpr int kSubPadY = 4;
-      const std::string subhdr = wintergreen_header_left();
-      if (!subhdr.empty() && subtitle_font_.valid()) {
-        y += kSubPadY;
-        buf.draw_text_proportional(14, y + subtitle_font_.baseline(),
-                                   subhdr.c_str(), subhdr.size(), subtitle_font_, false);
-        y += subtitle_font_.y_advance() + kSubPadY;
-        buf.fill_rect(0, y, W, 1, false);
-        y += 1;
-      }
-    }
-
-    // Subtitle rows (used by ReaderOptionsScreen: chapter, progress, read time)
-    const bool has_subs = !subtitle_.empty() || !subtitle2_.empty() || !subtitle3_.empty();
-    if (has_subs) {
-      y += 5;
-      if (!subtitle_.empty() && ui_font_.valid()) {
-        buf.draw_text_proportional(14, y + ui_font_.baseline(), subtitle_.c_str(), subtitle_.size(), ui_font_, false);
-        y += ui_font_.y_advance() + 4;
-      }
-      if (!subtitle2_.empty() && ui_font_.valid()) {
-        buf.draw_text_proportional(14, y + ui_font_.baseline(), subtitle2_.c_str(), subtitle2_.size(), ui_font_, false);
-        y += ui_font_.y_advance() + 4;
-      }
-      if (!subtitle3_.empty() && subtitle_font_.valid()) {
-        buf.draw_text_proportional(14, y + subtitle_font_.baseline(), subtitle3_.c_str(), subtitle3_.size(), subtitle_font_, false);
-        y += subtitle_font_.y_advance() + 4;
-      }
-      y += 4;
-      buf.fill_rect(0, y, W, 1, false);
-      y += 1;
-    }
-    return y;
-  }
-  if (theme_ == MenuTheme::Stele) {
-    if (!ui_font_.valid()) return 0;
-    static constexpr int kBarPadY = 8;
-    const int bar_h = kBarPadY + ui_font_.y_advance() + kBarPadY;
-    const int text_y = kBarPadY + ui_font_.baseline();
-    const char kBrand[] = "N O U S";
-    const int bw = ui_font_.word_width(kBrand, 7, FontStyle::Regular);
-    buf.draw_text_proportional((W - bw) / 2, text_y, kBrand, 7, ui_font_, false);
-    buf.fill_rect(0, bar_h, W, 1, false);
-    return bar_h + 1;
   }
   if (title_ && header_font_.valid()) {
     const size_t len = std::strlen(title_);
@@ -474,7 +318,7 @@ int ListMenuScreen::draw_header_(DrawBuffer& buf, int W, int H, std::optional<ui
 //    Returns bottom_h = pixels reserved at the bottom (list must stay above).
 // ─────────────────────────────────────────────────────────────────────────────
 int ListMenuScreen::draw_bottom_(DrawBuffer& buf, int W, int H, std::optional<uint8_t> battery_pct) const {
-  if ((theme_ == MenuTheme::Lyra || theme_ == MenuTheme::LyraExt) && section_font_.valid()) {
+  if (!plain_list_ && section_font_.valid()) {
     const BitmapFont& sf = section_font_;
     const bool inv = app_ && app_->invert_menu_buttons();
 
@@ -512,8 +356,7 @@ int ListMenuScreen::draw_bottom_(DrawBuffer& buf, int W, int H, std::optional<ui
 
     return bot_h;
   }
-  if (theme_ == MenuTheme::Chronicle && subtitle_.empty()) return 0;
-  if (theme_ == MenuTheme::Stele || !subtitle_.empty()) {
+  if (!subtitle_.empty()) {
     if (!subtitle_font_.valid()) return 0;
     static constexpr int kBarPadY = 6;
     const int bottom_h = kBarPadY + subtitle_font_.y_advance() + kBarPadY + 1;
@@ -593,12 +436,10 @@ void ListMenuScreen::draw_list_(DrawBuffer& buf, int W, int H, int header_h, int
     return;
   }
 
-  // ── Chronicle theme ───────────────────────────────────────────────────────
-  if ((theme_ == MenuTheme::Chronicle || force_chronicle_list_) && subtitle_font_.valid() && subtitle_.empty()) {
-    // Divider below header for non-Chronicle, non-Lyra sub-screens
-    // (Lyra header already includes its own rule from draw_header_)
-    if (force_chronicle_list_ && theme_ != MenuTheme::Chronicle &&
-        theme_ != MenuTheme::Lyra && theme_ != MenuTheme::LyraExt)
+  // ── Detail rows: title + subtitle, full-width divider, right-hand column ──
+  if (detail_list_ && subtitle_font_.valid() && subtitle_.empty()) {
+    // The standard header already draws its own rule; the plain header does not.
+    if (plain_list_)
       buf.fill_rect(0, header_h, W, 1, false);
 
     static constexpr int kPadT = 5, kGap = 3, kPadB = 6;
@@ -723,8 +564,8 @@ void ListMenuScreen::draw_list_(DrawBuffer& buf, int W, int H, int header_h, int
     return;
   }
 
-  // ── Stele theme (also used for book-details mode in any theme) ───────────
-  if ((theme_ == MenuTheme::Stele || !subtitle_.empty()) && subtitle_font_.valid()) {
+  // ── Book-details mode: centred rows under the details card ───────────────
+  if (!subtitle_.empty() && subtitle_font_.valid()) {
     static constexpr int kPadT = 6, kGap = 2, kPadB = 6;
     static constexpr int kSepH = 12;
     static constexpr int kDivW = 80;

@@ -46,6 +46,7 @@ void LinksScreen::populate(const std::vector<PageLink>& links, const std::vector
 }
 
 void LinksScreen::on_start() {
+  plain_list_ = true;  // overlay on top of the reader: centred title, no status bar
   title_ = !entries_.empty() ? "Links" : "No links";
   for (const auto& e : entries_) {
     std::string display = e.label;

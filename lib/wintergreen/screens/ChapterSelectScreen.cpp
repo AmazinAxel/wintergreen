@@ -25,6 +25,7 @@ void ChapterSelectScreen::set_chapter_count(uint16_t count, uint16_t current_cha
 }
 
 void ChapterSelectScreen::on_start() {
+  plain_list_ = true;  // overlay on top of the reader: centred title, no status bar
   set_list_align(1);
   const bool has_toc = toc_ && !toc_->entries.empty();
   if (has_toc) {

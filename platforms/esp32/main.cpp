@@ -127,9 +127,6 @@ extern "C" void app_main(void) {
     ESP_LOGI("mem", "after sd_init: free=%lu largest=%lu", (unsigned long)esp_get_free_heap_size(),
              (unsigned long)heap_caps_get_largest_free_block(MALLOC_CAP_8BIT));
 
-    // Ensure books directory exists.
-    mkdir("/sdcard/books", 0775);
-
     // Data directory for converted books, settings, reading state.
     mkdir("/sdcard/.wintergreen", 0775);
     mkdir("/sdcard/.wintergreen/cache", 0775);
@@ -303,7 +300,6 @@ extern "C" void app_main(void) {
           break;
         }
         case SerialCmdType::InvalidateFont: {
-          app.set_installed_font_path("");
           app.invalidate_font();
           break;
         }

@@ -204,13 +204,8 @@ bool BookIndex::save(const std::string& index_file) const {
     return false;
   }
 
-  // Rotate backups (.bak.5 dropped, .bak.N → .bak.N+1, current → .bak.1)
-  static constexpr int kMaxBackups = 5;
-  std::remove((index_file + ".bak." + std::to_string(kMaxBackups)).c_str());
-  for (int i = kMaxBackups - 1; i >= 1; --i)
-    std::rename((index_file + ".bak." + std::to_string(i)).c_str(),
-                (index_file + ".bak." + std::to_string(i + 1)).c_str());
-  std::rename(index_file.c_str(), (index_file + ".bak.1").c_str());
+  // Atomic replace — no backup copies. The index is rebuildable from the books
+  // on the SD card, and rename() already prevents a half-written file.
   std::rename(tmp_path.c_str(), index_file.c_str());
   return true;
 }

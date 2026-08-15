@@ -243,12 +243,10 @@ void ReaderOptionsScreen::on_start() {
 
   clear_items();
   idx_justify_ = idx_padding_h_ = idx_padding_v_ = idx_line_spacing_ = idx_font_size_ = idx_progress_ = idx_progress_scope_ =
-      idx_chapters_ = idx_pub_fonts_ = idx_hyphenation_ = idx_rotate_display_ = idx_reader_rotate_display_ = idx_reader_images_ = idx_links_ = idx_stats_ = -1;
+      idx_chapters_ = idx_pub_fonts_ = idx_hyphenation_ = idx_rotate_display_ = idx_reader_rotate_display_ = idx_links_ = -1;
 
   char tmp[40];
 
-  idx_stats_ = count();
-  add_item("Statistics");
 
   bool has_toc = toc_ && !toc_->entries.empty();
   bool has_chapters = has_toc || chapter_count_ > 1;
@@ -331,8 +329,6 @@ void ReaderOptionsScreen::on_start() {
                            settings_->progress_scope == ProgressScope::Chapter ? "Chapter" : "Book"));
     }
 
-    idx_reader_images_ = count();
-    add_item(fmt_setting(tmp, sizeof(tmp), "Images", (app_ && !app_->show_reader_images()) ? "Off" : "On"));
 
     idx_reader_rotate_display_ = count();
     add_item(fmt_setting(tmp, sizeof(tmp), "Reader Display", rotation_label(app_ ? app_->rotate_reader() : 0)));
@@ -586,13 +582,6 @@ void ReaderOptionsScreen::on_select(int index) {
     refresh_items_(index);
     return;
   }
-  if (index == idx_reader_images_) {
-    if (app_) {
-      app_->set_show_reader_images(!app_->show_reader_images());
-      refresh_items_(index);
-    }
-    return;
-  }
   if (index == idx_reader_rotate_display_) {
     if (app_) {
       uint8_t v = static_cast<uint8_t>((app_->rotate_reader() + 1) % 4);
@@ -607,20 +596,6 @@ void ReaderOptionsScreen::on_select(int index) {
   }
   if (index == idx_links_) {
     app_->push_screen(ScreenId::Links);
-    return;
-  }
-  if (index == idx_stats_) {
-    if (app_) {
-      auto* r = app_->reader();
-      app_->stats_screen()->set_book_stats(
-          r->book_title(), subtitle_, chapter_title_,
-          static_cast<int>(r->chapter_index()), static_cast<int>(r->chapter_count()),
-          r->times_opened(), r->reading_ms_total(),
-          r->progress_pct(), chapter_progress_pct_,
-          r->estimated_time_left_ms(), r->page_turn_count(),
-          r->get_path());
-      app_->push_screen(ScreenId::Stats);
-    }
     return;
   }
   return;

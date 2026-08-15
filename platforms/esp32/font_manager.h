@@ -19,26 +19,11 @@ class FontManager : public wintergreen::FontManager {
  public:
   explicit FontManager(wintergreen::Application& app) : app_(app) {}
 
-  // Returns the asset name for the currently selected built-in font, or
-  // nullptr if the user selected a custom (SD-card) font.
-  static const char* embedded_asset_for(const std::string& font_name) {
-    if (font_name == "" || font_name == "Literata")
-      return "Literata.bin";
-    return nullptr;
-  }
+  // The one and only reader font. There is no font picker — this bundle is
+  // baked into the asset blob and provisioned into the font partition on first
+  // boot after a firmware update.
+  static constexpr const char* kFontAsset = "Literata.bin";
 
-  // Returns true if the file is a valid FNTS v2 bundle (the current format).
-  // Version 2 bundles always contain MBF4 v4 inner fonts, so no inner check needed.
-  static bool is_valid_font_file(const char* path) {
-    FILE* f = fopen(path, "rb");
-    if (!f)
-      return false;
-    uint8_t hdr[6] = {};
-    bool ok = fread(hdr, 1, sizeof(hdr), f) == sizeof(hdr) && memcmp(hdr, "FNTS", 4) == 0 && hdr[4] > 0 &&  // num_sizes
-              hdr[5] == 2;  // bundle version must be exactly 2
-    fclose(f);
-    return ok;
-  }
 
   void init() {
     if (font_part_.mmap()) {
@@ -51,13 +36,8 @@ class FontManager : public wintergreen::FontManager {
           }
         }
         app_.set_reader_font(font_set());
-        const char* target_asset = embedded_asset_for(app_.custom_font_path());
-        if (target_asset) {
-          uint32_t expected_crc = asset_blob::g_assets.crc(target_asset);
-          if (FontPartition::needs_provisioning(expected_crc)) {
-            ESP_LOGI("font", "font needs provisioning \u2014 will install before app start");
-          }
-        }
+        if (FontPartition::needs_provisioning(asset_blob::g_assets.crc(kFontAsset)))
+          ESP_LOGI("font", "font needs provisioning \u2014 will install before app start");
       } else {
         ESP_LOGW("font", "no valid Normal font found");
       }
@@ -67,94 +47,48 @@ class FontManager : public wintergreen::FontManager {
   // Called by ReaderScreen before opening a book (IFontEnsurer interface).
   // No-op if fonts are already provisioned.
   void ensure_ready(wintergreen::DrawBuffer& buf) override {
-    const std::string& custom_font = app_.custom_font_path();
-    const std::string& installed_font = app_.installed_font_path();
+    const uint32_t target_crc = asset_blob::g_assets.crc(kFontAsset);
 
-    const char* target_asset = embedded_asset_for(custom_font);
-    bool is_embedded = (target_asset != nullptr);
-    uint32_t target_crc = is_embedded ? asset_blob::g_assets.crc(target_asset) : 0;
+#ifdef WG_NO_EMBED_FONT
+    // Font was left out of the blob: use whatever the partition already holds.
+    if (font_set_.valid())
+      app_.set_reader_font(font_set());
+    else
+      ESP_LOGE("font", "no font in partition and none embedded — flash a full build");
+    return;
+#endif
 
-    if (custom_font == installed_font && (!is_embedded || !FontPartition::needs_provisioning(target_crc))) {
-      if (font_set_.valid()) {
-        app_.set_reader_font(font_set());
-        return;
-      }
-      // Font is marked installed but invalid â€” clear the record and fall through to re-provision.
-      ESP_LOGW("font", "installed font invalid, re-provisioning");
-      app_.set_installed_font_path("");
-    }
-
-    if (!is_embedded) {
-      if (!is_valid_font_file(custom_font.c_str())) {
-        ESP_LOGE("font", "SD card font rejected (invalid header): %s", custom_font.c_str());
-        buf.sync_bw_ram();
-        buf.show_loading("Font incompatible!", 0);
-        app_.set_custom_font_path(installed_font);
-        if (font_set_.valid())
-          app_.set_reader_font(font_set());
-        return;
-      }
-      if (!FontPartition::fits_partition(custom_font.c_str())) {
-        ESP_LOGE("font", "SD card font too large for partition: %s", custom_font.c_str());
-        buf.sync_bw_ram();
-        buf.show_loading("Font too large!", 0);
-        app_.set_custom_font_path(installed_font);
-        if (font_set_.valid())
-          app_.set_reader_font(font_set());
-        return;
-      }
+    // Already provisioned and loaded — nothing to do.
+    if (!FontPartition::needs_provisioning(target_crc) && font_set_.valid()) {
+      app_.set_reader_font(font_set());
+      return;
     }
 
     buf.sync_bw_ram();
     buf.show_loading("Installing fonts...", 0);
+    ESP_LOGI("font", "Provisioning font \"%s\" from firmware...", kFontAsset);
 
-    if (is_embedded) {
-      ESP_LOGI("font", "Provisioning font \"%s\" from firmware...", target_asset);
+    size_t mapped_size = 0;
+    esp_partition_mmap_handle_t mmap_h = 0;
+    const uint8_t* data = static_cast<const uint8_t*>(asset_blob::g_assets.map(kFontAsset, mapped_size, mmap_h));
+    if (!data) {
+      ESP_LOGE("font", "failed to map asset %s", kFontAsset);
+      return;
+    }
+    const bool ok = FontPartition::provision_embedded(
+        data, mapped_size, target_crc, buf.scratch_buf1(), wintergreen::DrawBuffer::kBufSize, buf.scratch_buf2(),
+        wintergreen::DrawBuffer::kBufSize, [&buf](int pct) { buf.show_loading("Installing fonts...", pct); });
+    asset_blob::g_assets.unmap(mmap_h);
 
-      size_t mapped_size = 0;
-      esp_partition_mmap_handle_t mmap_h = 0;
-      const uint8_t* data = static_cast<const uint8_t*>(asset_blob::g_assets.map(target_asset, mapped_size, mmap_h));
-      if (!data) {
-        ESP_LOGE("font", "failed to map asset %s", target_asset);
-        return;
-      }
-      bool ok = FontPartition::provision_embedded(
-          data, mapped_size, target_crc, buf.scratch_buf1(), wintergreen::DrawBuffer::kBufSize, buf.scratch_buf2(),
-          wintergreen::DrawBuffer::kBufSize, [&buf](int pct) { buf.show_loading("Installing fonts...", pct); });
-      asset_blob::g_assets.unmap(mmap_h);
-
-      if (ok) {
-        app_.set_installed_font_path(custom_font);
-        buf.reset_after_scratch();
-        if (font_part_.mmap()) {
-          load_fonts_();
-          app_.set_reader_font(font_set());
-        }
+    if (ok) {
+      buf.reset_after_scratch();
+      if (font_part_.mmap()) {
+        load_fonts_();
+        app_.set_reader_font(font_set());
       }
     } else {
-      ESP_LOGI("font", "Provisioning font from SD card: %s", custom_font.c_str());
-      bool prov_ok = FontPartition::provision_uncompressed_file(
-          custom_font.c_str(), buf.scratch_buf2(), wintergreen::DrawBuffer::kBufSize,
-          [&buf](int pct) { buf.show_loading("Installing fonts...", pct); });
-      buf.reset_after_scratch();
-      if (prov_ok) {
-        if (font_part_.mmap()) {
-          load_fonts_();
-          if (font_set_.valid()) {
-            app_.set_installed_font_path(custom_font);
-            app_.set_reader_font(font_set());
-          } else {
-            ESP_LOGE("font", "SD card font loaded but produced no valid Normal style");
-            app_.set_custom_font_path(installed_font);
-          }
-        }
-      } else {
-        ESP_LOGE("font", "SD card font provisioning failed: %s", custom_font.c_str());
-        buf.show_loading("Font install failed!", 0);
-        app_.set_custom_font_path(installed_font);
-        if (font_set_.valid())
-          app_.set_reader_font(font_set());
-      }
+      ESP_LOGE("font", "font provisioning failed");
+      buf.show_loading("Font install failed!", 0);
     }
   }
 

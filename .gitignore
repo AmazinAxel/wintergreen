@@ -1,4 +1,7 @@
 .pio
 __pycache__
 assets_embedded.S
+
 firmware.bin
+assets.bin
+sdkconfig.esp32c3

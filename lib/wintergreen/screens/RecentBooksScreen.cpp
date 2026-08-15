@@ -43,8 +43,7 @@ void RecentBooksScreen::on_start() {
   if (entries_.empty())
     add_item("No recently opened books");
 
-  force_chronicle_list_ = (ListMenuScreen::theme() == ListMenuScreen::MenuTheme::Lyra ||
-                            ListMenuScreen::theme() == ListMenuScreen::MenuTheme::LyraExt);
+  detail_list_ = true;
 }
 
 std::string_view RecentBooksScreen::get_item_subtitle(int index) const {

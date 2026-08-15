@@ -7,23 +7,15 @@ set(LIB ${CMAKE_CURRENT_LIST_DIR}/../../lib/wintergreen)
 set(lib_sources
     ${LIB}/Application.cpp
     ${LIB}/Loop.cpp
-    ${LIB}/screens/demo/BouncingBallDemo.cpp
-    ${LIB}/screens/demo/GrayscaleDemo.cpp
     ${LIB}/screens/ListMenuScreen.cpp
     ${LIB}/screens/MainMenu.cpp
     ${LIB}/screens/ReaderScreen.cpp
-    ${LIB}/screens/SettingsScreen.cpp
     ${LIB}/screens/ChapterSelectScreen.cpp
     ${LIB}/screens/LinksScreen.cpp
     ${LIB}/screens/ReaderOptionsScreen.cpp
-    ${LIB}/screens/ConvertAllScreen.cpp
-    ${LIB}/screens/StatsScreen.cpp
     ${LIB}/screens/HiddenBooksMenu.cpp
-    ${LIB}/screens/LyraScreen.cpp
     ${LIB}/screens/LyraExtScreen.cpp
     ${LIB}/screens/RecentBooksScreen.cpp
-    ${LIB}/screens/AlertScreen.cpp
-    ${LIB}/screens/WhatsNewScreen.cpp
     ${LIB}/content/ZipReader.cpp
     ${LIB}/content/XmlReader.cpp
     ${LIB}/content/CssParser.cpp
@@ -38,8 +30,7 @@ set(lib_sources
     ${LIB}/content/mrb/MrbConverter.cpp
     ${LIB}/content/ImageDecoder.cpp
     ${LIB}/content/JpegDecoder.cpp
-    ${LIB}/content/PngDecoder.cpp
-    ${LIB}/content/BmpSleepConverter.cpp)
+    ${LIB}/content/PngDecoder.cpp)
 
 # miniz: vendored in third_party/miniz/. Compiled as C++ via miniz_wrapper.cpp
 # to avoid IDF applying C++-only flags (-fuse-cxa-atexit) to .c files.
@@ -48,7 +39,7 @@ set(MINIZ_DIR ${CMAKE_CURRENT_LIST_DIR}/../../third_party/miniz)
 idf_component_register(
     SRCS ${app_sources} ${lib_sources} ${CMAKE_CURRENT_LIST_DIR}/miniz_wrapper.cpp
          ${CMAKE_CURRENT_LIST_DIR}/assets_embedded.S
-    INCLUDE_DIRS "." "${CMAKE_CURRENT_LIST_DIR}/../../lib" "${MINIZ_DIR}"
+    INCLUDE_DIRS "." "${CMAKE_CURRENT_LIST_DIR}/../.." "${CMAKE_CURRENT_LIST_DIR}/../../lib" "${MINIZ_DIR}"
     REQUIRES fatfs driver wear_levelling)
 
 # IDF 5.x adds -Wno-old-style-declaration (C-only) globally; GCC -Werror rejects

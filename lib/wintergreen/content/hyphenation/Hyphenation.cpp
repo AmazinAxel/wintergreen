@@ -3,15 +3,7 @@
 #include <cstdint>
 #include <cstring>
 
-#include "Liang/hyph-de.trie.h"
 #include "Liang/hyph-en.trie.h"
-#include "Liang/hyph-es.trie.h"
-#include "Liang/hyph-fr.trie.h"
-#include "Liang/hyph-it.trie.h"
-#include "Liang/hyph-nl.trie.h"
-#include "Liang/hyph-pl.trie.h"
-#include "Liang/hyph-pt.trie.h"
-#include "Liang/hyph-ru.trie.h"
 #include "Liang/liang_hyphenation_patterns.h"
 
 // ---------------------------------------------------------------------------
@@ -196,30 +188,6 @@ int hyphenate_word(const char* word, size_t /*len*/, HyphenationLang lang, size_
     case HyphenationLang::English:
       trie = &en_trie;
       break;
-    case HyphenationLang::German:
-      trie = &de_trie;
-      break;
-    case HyphenationLang::French:
-      trie = &fr_trie;
-      break;
-    case HyphenationLang::Spanish:
-      trie = &es_trie;
-      break;
-    case HyphenationLang::Italian:
-      trie = &it_trie;
-      break;
-    case HyphenationLang::Dutch:
-      trie = &nl_trie;
-      break;
-    case HyphenationLang::Portuguese:
-      trie = &pt_trie;
-      break;
-    case HyphenationLang::Polish:
-      trie = &pl_trie;
-      break;
-    case HyphenationLang::Russian:
-      trie = &ru_trie;
-      break;
     default:
       return 0;
   }
@@ -365,24 +333,8 @@ HyphenationLang detect_language(const std::optional<std::string>& lang_tag) {
     return true;
   };
 
-  if (ieq(sv, "de") || ieq(sv, "ger") || ieq(sv, "deu"))
-    return HyphenationLang::German;
   if (ieq(sv, "en") || ieq(sv, "eng"))
     return HyphenationLang::English;
-  if (ieq(sv, "fr") || ieq(sv, "fra"))
-    return HyphenationLang::French;
-  if (ieq(sv, "es") || ieq(sv, "spa"))
-    return HyphenationLang::Spanish;
-  if (ieq(sv, "it") || ieq(sv, "ita"))
-    return HyphenationLang::Italian;
-  if (ieq(sv, "nl") || ieq(sv, "nld"))
-    return HyphenationLang::Dutch;
-  if (ieq(sv, "pt") || ieq(sv, "por"))
-    return HyphenationLang::Portuguese;
-  if (ieq(sv, "pl") || ieq(sv, "pol"))
-    return HyphenationLang::Polish;
-  if (ieq(sv, "ru") || ieq(sv, "rus"))
-    return HyphenationLang::Russian;
 
   return HyphenationLang::None;
 }

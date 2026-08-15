@@ -9,23 +9,15 @@
 #include "ScreenManager.h"
 #include "display/DrawBuffer.h"
 #include "screens/ChapterSelectScreen.h"
-#include "screens/ConvertAllScreen.h"
-#include "screens/GlobalStatsScreen.h"
 #include "screens/HiddenBooksMenu.h"
 #include "screens/IScreen.h"
 #include "screens/LinksScreen.h"
 #include "screens/LyraExtScreen.h"
-#include "screens/LyraScreen.h"
 #include "screens/MainMenu.h"
 #include "screens/RecentBooksScreen.h"
 #include "screens/ReaderOptionsScreen.h"
 #include "screens/ReaderScreen.h"
-#include "screens/SettingsScreen.h"
-#include "screens/StatsScreen.h"
-#include "screens/AlertScreen.h"
-#include "screens/WhatsNewScreen.h"
-#include "screens/demo/BouncingBallDemo.h"
-#include "screens/demo/GrayscaleDemo.h"
+#include "wintergreen_config.h"
 
 namespace wintergreen {
 
@@ -34,21 +26,12 @@ enum class ScreenId : uint8_t {
   None = 0,
   MainMenu,
   Reader,
-  Settings,
   ReaderOptions,
   ChapterSelect,
   Links,
-  ConvertAll,
-  Stats,
   HiddenBooks,
-  GlobalStats,
-  Lyra,
   LyraExt,
   RecentBooks,
-  WhatsNew,
-  BouncingBall,
-  GrayscaleDemo,
-  Alert,
 };
 
 // Maps the rotate_display / rotate_reader setting value (0-3) to the DrawBuffer Rotation enum.
@@ -73,6 +56,9 @@ inline const char* rotation_label(uint8_t v) {
 
 class Application {
  public:
+  // Menu font size index passed to ListMenuScreen: 0=small 1=medium 2=large 3=X-large.
+  static constexpr int kMenuFontSize = 3;
+
   Application() = default;
 
   void set_books_dir(const char* dir) {
@@ -82,7 +68,6 @@ class Application {
   void set_data_dir(const char* dir) {
     data_dir_ = dir;
     reader_.set_data_dir(dir ? dir : "");
-    settings_.set_data_dir(dir);
   }
 
   // Path to data directory for settings/state persistence
@@ -100,7 +85,9 @@ class Application {
   // Load all persistent state from the settings file
   void load_settings_();
   // Common sleep sequence (save state, show sleep image, set running_=false)
-  void do_sleep_(DrawBuffer& buf);
+  // Draws the sleep screen and powers down. wordmark_image=true forces the
+  // embedded wintergreen image instead of the book cover (power long-press).
+  void do_sleep_(DrawBuffer& buf, bool wordmark_image = false);
 
   // Font management. set_reader_font() also propagates to the reader screen.
   void set_reader_font(const BitmapFontSet* fonts) {
@@ -114,7 +101,7 @@ class Application {
     return font_manager_;
   }
 
-  // Optional callback for "Invalidate Font" in the Settings menu (ESP32 only).
+  // Optional callback to drop the cached converted font (ESP32 only).
   void set_invalidate_font_fn(std::function<void()> fn) {
     invalidate_font_fn_ = std::move(fn);
   }
@@ -140,9 +127,6 @@ class Application {
     IScreen* top = screen_mgr_.top();
     return top ? top->name() : "none";
   }
-  SettingsScreen* settings() {
-    return &settings_;
-  }
   ReaderOptionsScreen* reader_options() {
     return &reader_options_;
   }
@@ -155,85 +139,40 @@ class Application {
   MainMenu* main_menu() {
     return &menu_;
   }
-  LyraScreen* lyra_screen() {
-    return &lyra_;
-  }
   LyraExtScreen* lyra_ext_screen() {
     return &lyra_ext_;
   }
   RecentBooksScreen* recent_books_screen() {
     return &recent_books_;
   }
-  ConvertAllScreen* convert_all_screen() {
-    return &convert_all_;
-  }
-  StatsScreen* stats_screen() {
-    return &stats_;
-  }
+  // ── Fixed behaviour ───────────────────────────────────────────────────────
+  // There is no settings menu. Everything below is compile-time constant; the
+  // only tunables live in wintergreen_config.h at the project root.
 
-  bool show_nav_arrows() const { return show_nav_arrows_; }
-  void set_show_nav_arrows(bool v) { show_nav_arrows_ = v; save_settings_(); }
+  // Nav-arrow glyphs under the list, converted-book marker, book images.
+  static constexpr bool show_nav_arrows() { return true; }
+  static constexpr bool show_converted_indicator() { return true; }
+  static constexpr bool show_reader_images() { return true; }
 
-  bool show_sleep_text() const { return show_sleep_text_; }
-  void set_show_sleep_text(bool v) { show_sleep_text_ = v; save_settings_(); }
+  // Sleep screen: book cover, no caption text.
+  static constexpr bool show_sleep_text() { return false; }
 
-  bool show_whats_new_on_update() const { return show_whats_new_on_update_; }
-  void set_show_whats_new_on_update(bool v) { show_whats_new_on_update_ = v; save_settings_(); }
+  static constexpr bool sunlight_fading_fix() { return config::kSunlightFadingFix; }
+  static constexpr uint8_t sleep_timeout_min() { return config::kAutoSleepMinutes; }
 
-  bool show_reader_images() const { return show_reader_images_; }
-  void set_show_reader_images(bool v);
+  // Battery as an icon; lists centred; menu font X-Large.
+  static constexpr uint8_t battery_display() { return 0; }
+  static constexpr uint8_t list_align() { return 0; }
+  static constexpr int menu_font_size() { return kMenuFontSize; }
 
-  bool show_converted_indicator() const { return show_converted_indicator_; }
-  void set_show_converted_indicator(bool v) { show_converted_indicator_ = v; save_settings_(); }
+  // Default button mapping.
+  static constexpr bool invert_menu_buttons() { return false; }
+  static constexpr bool invert_bottom_paging() { return true; }
+  static constexpr bool invert_side_buttons() { return false; }
 
-  bool sunlight_fading_fix() const { return sunlight_fading_fix_; }
-  void set_sunlight_fading_fix(bool v) { sunlight_fading_fix_ = v; save_settings_(); }
-
-  uint8_t battery_display() const { return battery_display_; }
-  void set_battery_display(uint8_t v) { battery_display_ = v <= 2 ? v : 0; save_settings_(); }
-
-  uint8_t list_align() const { return list_align_; }
-  void set_list_align(uint8_t v) { list_align_ = v <= 2 ? v : 0; save_settings_(); }
-
-  uint8_t menu_theme() const { return menu_theme_; }
-  void set_menu_theme(uint8_t v);
-
-  void update_book_read_time(const std::string& path, uint64_t ms,
-                             uint32_t times_opened = 0, uint32_t page_turns = 0,
-                             int progress_pct = 0, uint64_t time_left_ms = 0,
-                             uint16_t chapter_count = 0, uint32_t total_chars = 0);
-
-  uint8_t sleep_timeout_min() const { return sleep_timeout_min_; }
-  void set_sleep_timeout_min(uint8_t v) { sleep_timeout_min_ = v; save_settings_(); }
-
-  bool invert_menu_buttons() const {
-    return invert_menu_buttons_;
-  }
-  void set_invert_menu_buttons(bool v) {
-    invert_menu_buttons_ = v;
-  }
-
-  bool invert_bottom_paging() const {
-    return invert_bottom_paging_;
-  }
-  void set_invert_bottom_paging(bool v) {
-    invert_bottom_paging_ = v;
-  }
-
-  bool invert_side_buttons() const {
-    return invert_side_buttons_;
-  }
-  void set_invert_side_buttons(bool v) {
-    invert_side_buttons_ = v;
-  }
-
-  uint8_t rotate_display() const {
-    return rotate_display_;
-  }
-  void set_rotate_display(uint8_t v) {
-    rotate_display_ = v <= 3 ? v : 0;
-    save_settings_();
-  }
+  // Lists are always portrait. The reader can be flipped to landscape from the
+  // in-book quick menu, so that one stays a runtime value.
+  static constexpr uint8_t rotate_display() { return 0; }
 
   uint8_t rotate_reader() const {
     return rotate_reader_;
@@ -243,47 +182,10 @@ class Application {
     save_settings_();
   }
 
-  int menu_font_size() const {
-    return menu_font_size_;
-  }
-  void set_menu_font_size(int v) {
-    menu_font_size_ = v;
-    ListMenuScreen::set_font_size(v);
-    save_settings_();
-  }
-
-  const std::string& custom_font_path() const {
-    return custom_font_path_;
-  }
-  void set_custom_font_path(const std::string& path) {
-    custom_font_path_ = path;
-    save_settings_();
-  }
-
-  // Empty string = auto-cycle through all images on each sleep.
-  const std::string& sleep_image_path() const {
-    return sleep_image_path_;
-  }
-  void set_sleep_image_path(const std::string& path) {
-    sleep_image_path_ = path;
-    save_settings_();
-  }
-
-  const std::string& installed_font_path() const {
-    return installed_font_path_;
-  }
-  void set_installed_font_path(const std::string& path) {
-    installed_font_path_ = path;
-    save_settings_();
-  }
-
-  BookSortOrder sort_order() const {
-    return menu_.sort_order();
-  }
-  void set_sort_order(BookSortOrder order) {
-    menu_.set_sort_order(order);
-    save_settings_();
-  }
+  void update_book_read_time(const std::string& path, uint64_t ms,
+                             uint32_t times_opened = 0, uint32_t page_turns = 0,
+                             int progress_pct = 0, uint64_t time_left_ms = 0,
+                             uint16_t chapter_count = 0, uint32_t total_chars = 0);
 
   // Called by MainMenu when the user opens a book: updates the open-order
   // counter in the index and persists both the index and settings.
@@ -341,56 +243,25 @@ class Application {
 
   uint32_t inactivity_ms_ = 0;
 
-  bool invert_menu_buttons_ = false;
-  bool invert_bottom_paging_ = true;
-  bool invert_side_buttons_ = false;
-  uint8_t rotate_display_ = 0;  // 0=Portrait(Deg90), 1=Landscape(Deg0), 2=Portrait-Flip(Deg270), 3=Landscape-Flip(Deg180)
   uint8_t rotate_reader_ = 0;   // independent reader rotation, same encoding
 
-  int menu_font_size_ = 2;  // Large default
   uint16_t open_counter_ = 0;  // monotonically increasing; incremented each time a book is opened
 
-  std::string custom_font_path_;
-  std::string installed_font_path_;
-  std::string sleep_image_path_;  // empty = auto-cycle
-  int sleep_image_idx_ = 0;
 
   ScreenManager screen_mgr_;
 
-  bool show_nav_arrows_ = true;
-  bool show_converted_indicator_ = true;
-  bool show_reader_images_ = true;
-  bool show_sleep_text_ = true;
-  bool sunlight_fading_fix_ = false;
-  uint8_t battery_display_ = 0;  // 0=icon, 1=number, 2=both
-  uint8_t list_align_ = 0;       // 0=center, 1=left, 2=right
-  uint8_t sleep_timeout_min_ = 10;  // 0=off, else minutes until auto-sleep
-  uint8_t menu_theme_ = 4;       // 4=Lyra default
 
   std::string last_seen_version_;
-  bool show_whats_new_on_update_ = true;
 
-  LyraScreen lyra_;
   LyraExtScreen lyra_ext_;
   RecentBooksScreen recent_books_;
   MainMenu menu_;
   ReaderScreen reader_;
-  SettingsScreen settings_;
   ReaderOptionsScreen reader_options_;
   ChapterSelectScreen chapter_select_;
   LinksScreen links_screen_;
-  ConvertAllScreen convert_all_;
-  StatsScreen stats_;
-  GlobalStatsScreen global_stats_;
   HiddenBooksMenu hidden_books_;
-  WhatsNewScreen whats_new_;
-  AlertScreen alert_;
   bool font_warning_shown_ = false;
-
-#ifdef WINTERGREEN_ENABLE_DEMOS
-  BouncingBallDemo bouncing_ball_;
-  GrayscaleDemo grayscale_demo_;
-#endif
 
   ScreenId pending_push_ = ScreenId::None;
   ScreenId pending_replace_ = ScreenId::None;
@@ -402,7 +273,6 @@ class Application {
   std::function<void()> invalidate_font_fn_;
 
   IScreen* screen_for_(ScreenId id);
-  void prepare_book_stats_for_sleep_();
 };
 
 }  // namespace wintergreen

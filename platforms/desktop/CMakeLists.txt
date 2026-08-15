@@ -13,8 +13,6 @@ project(wintergreen_desktop C CXX)
 set(CMAKE_CXX_STANDARD 17)
 set(CMAKE_CXX_STANDARD_REQUIRED ON)
 set(CMAKE_EXPORT_COMPILE_COMMANDS ON)
-# Auto-generate version.h
-execute_process(COMMAND python ${CMAKE_CURRENT_SOURCE_DIR}/../../tools/generate_version.py)
 # ---------------------------------------------------------------------------
 # SDL2 – fetched at configure time; static build, no tests, no shared lib.
 # ---------------------------------------------------------------------------
@@ -54,7 +52,6 @@ add_library(wintergreen_content STATIC
     ${CONTENT_DIR}/ImageDecoder.cpp
     ${CONTENT_DIR}/JpegDecoder.cpp
     ${CONTENT_DIR}/PngDecoder.cpp
-    ${CONTENT_DIR}/BmpSleepConverter.cpp
     ${CONTENT_DIR}/Book.cpp
     ${CONTENT_DIR}/BookIndex.cpp
     ${CONTENT_DIR}/TextLayout.cpp
@@ -65,6 +62,7 @@ add_library(wintergreen_content STATIC
 )
 target_include_directories(wintergreen_content PUBLIC
     ${CMAKE_CURRENT_SOURCE_DIR}/../../lib
+    ${CMAKE_CURRENT_SOURCE_DIR}/../..
 )
 target_link_libraries(wintergreen_content PUBLIC miniz)
 
@@ -74,21 +72,17 @@ target_link_libraries(wintergreen_content PUBLIC miniz)
 add_library(wintergreen_core STATIC
     ${CMAKE_CURRENT_SOURCE_DIR}/../../lib/wintergreen/Application.cpp
     ${CMAKE_CURRENT_SOURCE_DIR}/../../lib/wintergreen/Loop.cpp
-    ${CMAKE_CURRENT_SOURCE_DIR}/../../lib/wintergreen/screens/demo/BouncingBallDemo.cpp
-    ${CMAKE_CURRENT_SOURCE_DIR}/../../lib/wintergreen/screens/demo/GrayscaleDemo.cpp
     ${CMAKE_CURRENT_SOURCE_DIR}/../../lib/wintergreen/screens/ListMenuScreen.cpp
     ${CMAKE_CURRENT_SOURCE_DIR}/../../lib/wintergreen/screens/MainMenu.cpp
     ${CMAKE_CURRENT_SOURCE_DIR}/../../lib/wintergreen/screens/ReaderScreen.cpp
-    ${CMAKE_CURRENT_SOURCE_DIR}/../../lib/wintergreen/screens/SettingsScreen.cpp
     ${CMAKE_CURRENT_SOURCE_DIR}/../../lib/wintergreen/screens/ChapterSelectScreen.cpp
     ${CMAKE_CURRENT_SOURCE_DIR}/../../lib/wintergreen/screens/LinksScreen.cpp
     ${CMAKE_CURRENT_SOURCE_DIR}/../../lib/wintergreen/screens/ReaderOptionsScreen.cpp
-    ${CMAKE_CURRENT_SOURCE_DIR}/../../lib/wintergreen/screens/ConvertAllScreen.cpp
-    ${CMAKE_CURRENT_SOURCE_DIR}/../../lib/wintergreen/screens/StatsScreen.cpp
     ${CMAKE_CURRENT_SOURCE_DIR}/../../lib/wintergreen/screens/HiddenBooksMenu.cpp
 )
 target_include_directories(wintergreen_core PUBLIC
     ${CMAKE_CURRENT_SOURCE_DIR}/../../lib
+    ${CMAKE_CURRENT_SOURCE_DIR}/../..
 )
 target_link_libraries(wintergreen_core PUBLIC wintergreen_content)
 

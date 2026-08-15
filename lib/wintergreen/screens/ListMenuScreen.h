@@ -45,11 +45,6 @@ class ListMenuScreen : public IScreen {
   // Declared here; implemented in ListMenuScreen.cpp (which owns the font headers).
   static void apply_ui_font(BitmapFont& out);
 
-  // Global visual theme — affects all ListMenuScreen instances (static).
-  enum class MenuTheme : uint8_t { Chronicle = 0, Minimal = 1, Stele = 2, Codex = 3, Lyra = 4, LyraExt = 5 };
-  static void set_theme(MenuTheme t) { theme_ = t; }
-  static MenuTheme theme() { return theme_; }
-
  protected:
   const char* title_ = nullptr;
   const char* title2_ = nullptr;
@@ -58,11 +53,18 @@ class ListMenuScreen : public IScreen {
   std::string subtitle2_;
   std::string subtitle3_;
 
-  bool force_chronicle_list_ = false;  // use Chronicle-style rows regardless of global theme
+  // Two-line rows (title + subtitle, full-width divider, right-hand column) instead of
+  // the default centred single-line rows. Set by book-list style screens.
+  bool detail_list_ = false;
 
-  // When non-empty and theme is Lyra/LyraExt: used in place of "wintergreen" in the header,
-  // drawn with ui_font_ instead of brand_font_. Leave empty for the normal "wintergreen" logo.
-  std::string lyra_header_override_;
+  // Plain chrome: centred title header and the battery/nav-glyph footer, instead of the
+  // standard "wintergreen" status bar and labelled nav boxes. Used by overlay-style
+  // screens (chapter select, links) that appear on top of the reader.
+  bool plain_list_ = false;
+
+  // When non-empty: used in place of "wintergreen" in the status bar header.
+  // Leave empty for the normal wordmark.
+  std::string header_override_;
 
   // 0 = center (default), 1 = left, 2 = right
   void set_list_align(uint8_t align) {
@@ -127,9 +129,6 @@ class ListMenuScreen : public IScreen {
   // Returns true if the cursor may land on this item. Default: not a separator.
   // Override to additionally exclude theme-irrelevant items.
   virtual bool is_item_focusable(int index) const { return !is_separator(index); }
-  // Returns true if this item represents a converted book (Stele divider width).
-  // Default: false. Override in MainMenu.
-  virtual bool is_item_converted(int index) const { return false; }
   virtual int count() const {
     return static_cast<int>(labels_.size());
   }
@@ -142,19 +141,19 @@ class ListMenuScreen : public IScreen {
     return {};
   }
 
-  // Nous theme: secondary line below the item label (e.g. author, read time, setting value).
+  // secondary line below the item label (e.g. author, read time, setting value).
   // Default returns empty (no subtitle). Override per screen.
   virtual std::string_view get_item_subtitle(int index) const { return {}; }
 
-  // Chronicle theme: right-aligned text on the title line (e.g. read time, "–").
+  // detail_list_ rows: right-aligned text on the title line (e.g. read time, "–").
   // Default returns empty (no right column). Override per screen.
   virtual std::string_view get_item_right(int index) const { return {}; }
 
-  // Nous theme: left side of the top bar header (e.g. "X books", "Settings").
+  // left side of the top bar header (e.g. "X books", "Settings").
   // Default returns title_ if set. Override per screen.
   virtual std::string wintergreen_header_left() const { return title_ ? title_ : ""; }
 
-  // Nous theme: section title drawn in header_font_ below the status bar.
+  // section title drawn in header_font_ below the status bar.
   // Empty = no section title row. Override in screens that need a page heading.
   virtual std::string wintergreen_section_title() const { return {}; }
 
@@ -172,10 +171,7 @@ class ListMenuScreen : public IScreen {
   BitmapFont header_font_;
   BitmapFont subtitle_font_;   // always small; used for item subtitles and tight labels
   BitmapFont section_font_;    // one step below ui_font_; use for APPEARANCE/NAVIGATE etc.
-  BitmapFont brand_font_;        // "wintergreen" logotype, sized to match ui_font_
-  BitmapFont brand_header_font_; // "wintergreen" logotype, sized to match header_font_
   static int font_size_idx_;  // 0=Normal, 1=Large, 2=XLarge
-  static MenuTheme theme_;
 
   void request_redraw() {
     force_redraw_ = true;
@@ -226,10 +222,10 @@ class ListMenuScreen : public IScreen {
   //    where list items may start).
   int draw_header_(DrawBuffer& buf, int W, int H, std::optional<uint8_t> battery_pct = {}) const;
 
-  // Nous theme: height of one list item slot (title + subtitle + padding + divider).
+  // height of one list item slot (title + subtitle + padding + divider).
   int wintergreen_slot_h_() const;
 
-  // Nous theme: how many items are visible starting at scroll_off given available_h pixels.
+  // how many items are visible starting at scroll_off given available_h pixels.
   // Accounts for separator items being shorter than regular slots.
   int wintergreen_visible_from_(int scroll_off, int available_h) const;
 

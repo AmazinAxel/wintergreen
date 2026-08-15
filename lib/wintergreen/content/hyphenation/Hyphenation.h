@@ -9,17 +9,11 @@
 
 namespace wintergreen {
 
+// Only English patterns are shipped; every other language tag falls back to
+// None (no hyphenation).
 enum class HyphenationLang {
   None,
-  English,     // en
-  German,      // de
-  French,      // fr
-  Spanish,     // es
-  Italian,     // it
-  Dutch,       // nl
-  Portuguese,  // pt
-  Polish,      // pl
-  Russian,     // ru
+  English,  // en
 };
 
 // Hyphenate a word. Returns the number of valid hyphen positions written to
