@@ -31,7 +31,6 @@ NAME_LEN = 32
 ENTRY_SIZE = NAME_LEN + 12  # name + offset + length + crc32 == 44
 HEADER_FIXED = 16  # magic + version + count + total_size
 
-
 def build(project_dir: str, out_path: str, assets=DEFAULT_ASSETS) -> int:
     files = []
     for name, rel in assets:

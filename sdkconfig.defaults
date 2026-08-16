@@ -1,9 +1,12 @@
 CONFIG_ESPTOOLPY_FLASHSIZE_16MB=y
 CONFIG_ESPTOOLPY_FLASHSIZE="16MB"
 
-# QIO: double the flash read bandwidth of dio. Revert to CONFIG_ESPTOOLPY_FLASHMODE_DIO
-# if the board won't boot — not every module straps the extra flash pins.
-CONFIG_ESPTOOLPY_FLASHMODE_QIO=y
+# DIO, not QIO. QIO doubles flash read bandwidth on paper but the X4 does not
+# boot with it — the bootloader's quad-mode upgrade fails on this board. Tried
+# and reverted; do not "optimize" this back to QIO without a board to test on.
+# 80 MHz DIO is 2 bits x 80 MHz = 20 MB/s, the same bandwidth as QIO at 40 MHz.
+CONFIG_ESPTOOLPY_FLASHMODE_DIO=y
+CONFIG_ESPTOOLPY_FLASHFREQ_80M=y
 
 # FAT Long File Name support for .epub filenames
 CONFIG_FATFS_LFN_HEAP=y

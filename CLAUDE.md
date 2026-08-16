@@ -30,10 +30,32 @@ in sync when adding or removing core `.cpp` files. The `esp32c3-qemu` env is
 currently **broken**: it references `sdkconfig.qemu`, which does not exist, and
 `tools/run_qemu.py` is gone too. Either restore both or delete the env.
 
-Flash is QIO (`CONFIG_ESPTOOLPY_FLASHMODE_QIO` in `sdkconfig.defaults`). The image
-header still reports `dio` — that is by design, the bootloader upgrades itself to
-quad mode during init. Don't "fix" it. If a board won't boot, switch to
-`CONFIG_ESPTOOLPY_FLASHMODE_DIO`.
+Flash is **DIO at 80 MHz** (`sdkconfig.defaults`). QIO was tried and **bricks the
+boot** on the X4 — the header byte looks the same either way (IDF deliberately
+writes `dio` for QIO images), but the bootloader's quad-mode self-upgrade during
+init never completes on this board. DIO@80 MHz gives 20 MB/s, identical to
+QIO@40 MHz. `board_build.flash_mode` in `platformio.ini` is inert under the espidf
+framework; only the sdkconfig option matters. Don't re-enable QIO without a board
+in hand to test on.
+
+The SD clock (`platforms/esp32/sdcard.h`) comes off the 80 MHz APB through an
+integer divider, so the only rates available are 80 / 40 / 26.7 / 20 MHz.
+**40 MHz does not work** — the card fails to read. The e-ink panel does run the
+same SPI2 bus at 40 MHz, but that path is write-only (CLK+MOSI); SD reads need the
+MISO round trip, and a 12.5 ns half-period is under the 14 ns output delay the SD
+spec already grants the card. Host/board timing, not card quality — a better card
+does not fix it, and the C3 has no SDMMC peripheral to fall back to.
+
+**26.67 MHz does not work either** (tested on hardware — the book list comes up
+empty). 20 MHz is the ceiling; there is no rung between 20 and 26.7. Don't spend
+another flash cycle on the SD clock, and don't reach for the card's `input_delay`
+either — IDF doesn't expose it through `sdspi_device_config_t`, so it would mean
+patching the framework in-place, which is exactly what `patch_ffconf.py` was
+deleted for.
+
+If a build ever seems to ignore an `sdkconfig.defaults` change, delete the
+generated `sdkconfig.esp32c3` — IDF keeps existing values and does not re-apply
+defaults over them.
 
 `CONFIG_FATFS_CODEPAGE_437` matters: the dynamic codepage links every OEM table,
 including the four CJK ones, for 478 KB of flash. Long filenames go through the

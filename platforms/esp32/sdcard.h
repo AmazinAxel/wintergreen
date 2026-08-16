@@ -71,7 +71,13 @@ inline bool sd_init() {
 
   sdmmc_host_t host = SDSPI_HOST_DEFAULT();
   host.slot = handle;
-  host.max_freq_khz = 20000;  // 20 MHz — reliable for most SD cards
+  // 20 MHz, and this is the ceiling. The clock divides off the 80 MHz APB, so the
+  // only rates available are 80/40/26.7/20; both 40 and 26.7 were tested and the
+  // card fails to read. The panel drives the shared SPI2 bus at 40 MHz, but that
+  // path is write-only (CLK+MOSI) — SD reads need the MISO round trip, and the
+  // card's own spec-allowed output delay eats the sampling window. Host/board
+  // timing, not card quality; a better card does not fix it.
+  host.max_freq_khz = SDMMC_FREQ_DEFAULT;
 
   esp_vfs_fat_mount_config_t mnt{};
   mnt.format_if_mount_failed = false;
@@ -85,7 +91,7 @@ inline bool sd_init() {
   }
 
   float mb = (float)sd_card_->csd.capacity * sd_card_->csd.sector_size / (1024.0f * 1024.0f);
-  ESP_LOGI(kSdTag, "SD mounted at %s (%.0f MB)", SD_MOUNT, mb);
+  ESP_LOGI(kSdTag, "SD mounted at %s (%.0f MB, %d kHz)", SD_MOUNT, mb, sd_card_->max_freq_khz);
   return true;
 }
 
