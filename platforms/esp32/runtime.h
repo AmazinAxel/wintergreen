@@ -21,7 +21,7 @@
 class Esp32Runtime final : public wintergreen::IRuntime {
  public:
   explicit Esp32Runtime(uint32_t frame_time_ms, adc_oneshot_unit_handle_t adc_handle)
-      : frame_time_ms_(frame_time_ms), frame_start_ms_(0), adc1_handle_(adc_handle) {
+      : target_frame_ms_(frame_time_ms), last_frame_ms_(frame_time_ms), frame_start_ms_(0), adc1_handle_(adc_handle) {
     init_battery_adc();
   }
 
@@ -35,20 +35,25 @@ class Esp32Runtime final : public wintergreen::IRuntime {
     return true;
   }
 
+  // Measured duration of the last frame, not the target — Application uses it as
+  // dt for the auto-sleep countdown, which drifts if the nominal value is returned.
   uint32_t frame_time_ms() const override {
-    return frame_time_ms_;
+    return last_frame_ms_;
   }
 
   void wait_next_frame() override {
     const uint32_t now = millis();
     if (frame_start_ms_ != 0) {
       const uint32_t elapsed = now - frame_start_ms_;
-      if (elapsed < frame_time_ms_)
-        vTaskDelay(pdMS_TO_TICKS(frame_time_ms_ - elapsed));
+      if (elapsed < target_frame_ms_)
+        vTaskDelay(pdMS_TO_TICKS(target_frame_ms_ - elapsed));
       else
-        vTaskDelay(pdMS_TO_TICKS(1));
+        vTaskDelay(1);  // 1 tick; pdMS_TO_TICKS(1) rounds to 0 and only yields
     }
-    frame_start_ms_ = millis();
+    const uint32_t frame_end = millis();
+    if (frame_start_ms_ != 0)
+      last_frame_ms_ = frame_end - frame_start_ms_;
+    frame_start_ms_ = frame_end;
   }
 
   std::optional<uint8_t> battery_percentage() const override {
@@ -124,7 +129,8 @@ class Esp32Runtime final : public wintergreen::IRuntime {
   // at least this many percentage points away from the last displayed value.
   static constexpr int kHysteresisPercent = 3;
 
-  uint32_t frame_time_ms_;
+  uint32_t target_frame_ms_;
+  uint32_t last_frame_ms_;
   uint32_t frame_start_ms_;
   adc_oneshot_unit_handle_t adc1_handle_ = nullptr;
   adc_cali_handle_t adc_cali_handle_ = nullptr;

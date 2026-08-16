@@ -1,10 +1,7 @@
 CONFIG_ESPTOOLPY_FLASHSIZE_16MB=y
 CONFIG_ESPTOOLPY_FLASHSIZE="16MB"
 
-# DIO, not QIO. QIO doubles flash read bandwidth on paper but the X4 does not
-# boot with it — the bootloader's quad-mode upgrade fails on this board. Tried
-# and reverted; do not "optimize" this back to QIO without a board to test on.
-# 80 MHz DIO is 2 bits x 80 MHz = 20 MB/s, the same bandwidth as QIO at 40 MHz.
+# DIO, not QIO — QIO does not boot on the X4. See CLAUDE.md before changing.
 CONFIG_ESPTOOLPY_FLASHMODE_DIO=y
 CONFIG_ESPTOOLPY_FLASHFREQ_80M=y
 
@@ -16,9 +13,7 @@ CONFIG_FATFS_LFN_HEAP=y
 CONFIG_FATFS_USE_FASTSEEK=y
 CONFIG_FATFS_USE_LABEL=y
 
-# Codepage 437, not dynamic. Dynamic links every OEM table including the four
-# CJK ones (932/936/949/950) — 478 KB of flash. Only affects 8.3 short names;
-# long filenames still go through the UTF-8 LFN path.
+# Codepage 437, not dynamic — dynamic costs 478 KB of flash. See CLAUDE.md.
 CONFIG_FATFS_CODEPAGE_437=y
 
 # Main task needs enough stack for EPUB parsing (ZIP + XML + CSS) and
@@ -26,7 +21,45 @@ CONFIG_FATFS_CODEPAGE_437=y
 # IDF default is 3584 which is far too tight.
 CONFIG_ESP_MAIN_TASK_STACK_SIZE=16384
 
-# --- RAM optimizations ---
+# Note: automatic light sleep (CONFIG_PM_ENABLE + FREERTOS_USE_TICKLESS_IDLE) is
+# deliberately absent — it breaks the ADC-ladder buttons. See CLAUDE.md "Idle power".
+
+# --- Boot speed ---
+# Deep-sleep wake is a full boot here, so anything on the boot path runs on every
+# single wake. Battery life comes from making wake cheap enough that a short
+# kAutoSleepMinutes is tolerable. See CLAUDE.md "Idle power".
+
+# Don't re-verify the app image SHA-256 when waking from deep sleep — that reads
+# and hashes the whole image every time. Cold boot still validates, so genuine
+# flash corruption is still caught on power-on. Revisit if OTA is ever added.
+CONFIG_BOOTLOADER_SKIP_VALIDATE_IN_DEEP_SLEEP=y
+
+# No bootloader console output: ~900 characters at 115200 baud is ~78 ms of
+# every boot, spent entirely on log lines nobody reads.
+CONFIG_BOOTLOADER_LOG_LEVEL_NONE=y
+CONFIG_BOOTLOADER_LOG_LEVEL=0
+
+# RTC_SLOW_CLK calibration runs at every startup; 1024 cycles of a 150 kHz clock
+# is ~6.8 ms. Its precision only matters for timer-based deep-sleep wake, and we
+# wake on GPIO, so this is accuracy we never spend.
+CONFIG_RTC_CLK_CAL_CYCLES=256
+
+# --- Logging ---
+# Silent by default so no boot time goes into UART, but still *compiled in*:
+# flash is not scarce (~4.7 MB free in app0) and esp_log_level_set() can turn any
+# tag back on at runtime. Compiling logging out would save flash we don't need
+# and cost the ability to debug a device that is misbehaving in the field.
+CONFIG_LOG_DEFAULT_LEVEL_NONE=y
+CONFIG_LOG_DEFAULT_LEVEL=0
+
+# --- Dead weight ---
+# Error-code-to-string table, and JTAG-debugger awareness checks on every
+# assert/abort path. Neither is reachable in a shipped build.
+CONFIG_ESP_ERR_TO_NAME_LOOKUP=n
+CONFIG_ESP_DEBUG_OCDAWARE=n
+CONFIG_FREERTOS_DEBUG_OCDAWARE=n
+
+# RAM optimizations
 # Optimize for performance (-O2) — faster CPU-bound inflate/XML parsing
 CONFIG_COMPILER_OPTIMIZATION_PERF=y
 CONFIG_COMPILER_OPTIMIZATION_DEBUG=n

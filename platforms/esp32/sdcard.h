@@ -71,12 +71,7 @@ inline bool sd_init() {
 
   sdmmc_host_t host = SDSPI_HOST_DEFAULT();
   host.slot = handle;
-  // 20 MHz, and this is the ceiling. The clock divides off the 80 MHz APB, so the
-  // only rates available are 80/40/26.7/20; both 40 and 26.7 were tested and the
-  // card fails to read. The panel drives the shared SPI2 bus at 40 MHz, but that
-  // path is write-only (CLK+MOSI) — SD reads need the MISO round trip, and the
-  // card's own spec-allowed output delay eats the sampling window. Host/board
-  // timing, not card quality; a better card does not fix it.
+  // 20 MHz is the ceiling — 40 and 26.7 were both tested and fail. See CLAUDE.md.
   host.max_freq_khz = SDMMC_FREQ_DEFAULT;
 
   esp_vfs_fat_mount_config_t mnt{};

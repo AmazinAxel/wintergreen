@@ -94,7 +94,8 @@ extern "C" void app_main(void) {
 
   static Esp32InputSource input;
   static EInkDisplay epd;
-  static Esp32Runtime runtime(50, input.get_adc_handle());
+  // 25 ms UI frame (40 Hz) — see CLAUDE.md "Idle power" for the timing rationale.
+  static Esp32Runtime runtime(25, input.get_adc_handle());
   static wintergreen::Application app;
   static wintergreen::DrawBuffer buf(epd);
 

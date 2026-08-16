@@ -441,11 +441,13 @@ void benchmark_epub_conversion(Book& book, const char* tmp_path, long open_ms, u
     snprintf(wr_path, sizeof(wr_path), "%s.wr", tmp_path);
     FILE* wf = fopen(wr_path, "wb");
     if (wf) {
-      static uint8_t dummy[4096];
+      // Source bytes are arbitrary — this measures write throughput, not content.
+      // Reuse work_buf rather than a static: it is already allocated, always at
+      // least this large, and BENCH_BUILD is done with it.
       t = esp_timer_get_time();
       for (long rem = out_bytes; rem > 0;) {
         int want = rem < 4096 ? (int)rem : 4096;
-        fwrite(dummy, 1, (size_t)want, wf);
+        fwrite(work_buf, 1, (size_t)want, wf);
         rem -= want;
       }
       fclose(wf);

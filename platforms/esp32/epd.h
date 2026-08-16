@@ -414,7 +414,7 @@ class EInkDisplay : public wintergreen::IDisplay {
   void waitWhileBusy(const char* comment = nullptr) {
     uint32_t start = millis();
     while (gpio_get_level(EPD_BUSY) == 1) {
-      vTaskDelay(pdMS_TO_TICKS(1));
+      vTaskDelay(1);  // 1 tick; pdMS_TO_TICKS(1) rounds to 0 and busy-spins
       if (millis() - start > 10000) {
         ESP_LOGW("epd", "waitWhileBusy timeout%s", comment ? comment : "");
         break;

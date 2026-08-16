@@ -12,7 +12,8 @@ Some goals:
 - Bluetooth clicker support with auto pair (only supports reprogammable clickers with left/right arrow for page navigation)
 - Nix-first building!!
 - NO settings menu!! Everything is hardcoded for performance with very sane defaults so you don't have to think twice. Just flash and start reading!
-- No unnecessary UI, stat tracking or other extra features. It's meant for very fast and productive reading for quick moments, and nothing else to distract you from that. This is about as lightweight and optimized of a cfw as you'd get!!
+- No unnecessary UI, stat tracking or other extra features. It's meant for very fast and productive reading for quick moments, and nothing else to distract you from that.
+- The best possible performance and battery life possible from an X4! This is about as lightweight and optimized of a cfw as you'd get.
 
 ## Flashing this
 
@@ -20,3 +21,20 @@ Some goals:
 
 This project uses Platformio, so you can simply run `pio run -t upload` to build and upload the firmware to the device over USB!
 
+Paste and fill the following settings into the `WintergreenConfig.h` file in your project root!
+
+```c
+#pragma once
+
+namespace wintergreen::config {
+  // Wifi syncing
+  inline constexpr const char* kWifiSsid = "";
+  inline constexpr const char* kWifiPassword = "";
+
+  // General settings
+  inline constexpr bool kSunlightFadingFix = false;
+  inline constexpr uint8_t kAutoSleepMinutes = 1;
+}
+```
+
+If you use a white Xteink in the sun, I recommend enabling the fading fix, but it can cause more full screen refreshes. Auto sleep should be set to as low a value as comfortably possible. I personally recommend 1-2 minutes, depending on your reading speed.

@@ -5,3 +5,6 @@ assets_embedded.S
 firmware.bin
 assets.bin
 sdkconfig.esp32c3
+
+# DO NOT COMMIT YOUR WIFI PASSWORD!!
+WintergreenConfig.h

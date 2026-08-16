@@ -17,7 +17,7 @@
 #include "screens/RecentBooksScreen.h"
 #include "screens/ReaderOptionsScreen.h"
 #include "screens/ReaderScreen.h"
-#include "wintergreen_config.h"
+#include "WintergreenConfig.h"
 
 namespace wintergreen {
 
@@ -147,7 +147,7 @@ class Application {
   }
   // ── Fixed behaviour ───────────────────────────────────────────────────────
   // There is no settings menu. Everything below is compile-time constant; the
-  // only tunables live in wintergreen_config.h at the project root.
+  // only tunables live in WintergreenConfig.h at the project root.
 
   // Nav-arrow glyphs under the list, converted-book marker, book images.
   static constexpr bool show_nav_arrows() { return true; }
