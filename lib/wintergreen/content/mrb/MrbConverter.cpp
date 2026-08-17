@@ -64,7 +64,7 @@ static constexpr size_t kRunHeaderBytes = 12;
 static size_t estimated_body_size(const TextParagraph& text) {
   size_t sz = kParaHeaderBytes;
   for (const auto& run : text.runs)
-    sz += kRunHeaderBytes + run.text.size() + (run.href.empty() ? 0 : 2 + run.href.size());
+    sz += kRunHeaderBytes + run.text.size();
   return sz;
 }
 
@@ -117,7 +117,7 @@ bool write_split_paragraph(MrbWriter& writer, Paragraph& para) {
 
   for (size_t i = 0; i < total_runs; ++i) {
     const Run& run = runs[i];
-    const size_t run_cost = kRunHeaderBytes + run.text.size() + (run.href.empty() ? 0 : 2 + run.href.size());
+    const size_t run_cost = kRunHeaderBytes + run.text.size();
 
     // If a single run exceeds the budget on its own, flush whatever we have first,
     // then emit it as its own chunk (rare — would require >8KB of text in one run).
@@ -331,17 +331,46 @@ bool convert_epub_to_mrb_streaming(Book& book, const char* output_path, uint8_t*
     spine_files.push_back(std::move(basename));
   }
 
+  // --- Embed the image bytes -------------------------------------------------
+  // v12: the MRB carries its images, so a converted book needs no EPUB at read
+  // time. The bytes go in verbatim — they are already JPEG/PNG, so re-deflating
+  // them would cost size and force an inflate pass on the device for nothing.
+  {
+    std::vector<uint8_t> img_bytes;
+    for (const auto& m : image_map) {
+      if (writer.image_has_data(m.mrb_idx))
+        continue;  // the same EPUB entry can back several image refs
+      if (m.zip_key >= zip.entry_count())
+        continue;
+      const ZipEntry& e = zip.entry(m.zip_key);
+      img_bytes.clear();
+      const ZipError err = zip.extract(book.file(), e, img_bytes);
+      if (err != ZipError::Ok || img_bytes.empty())
+        continue;  // leave data_size 0; the reader renders blank for that image
+      writer.set_image_data(m.mrb_idx, std::move(img_bytes));
+      img_bytes = std::vector<uint8_t>();
+    }
+  }
+
   bool ok = writer.finish(book.metadata(), toc_work, spine_files);
   writer.close();  // explicit close so fclose() happens before we return
 
-  // Extract cover image alongside the MRB file if the EPUB has one.
+  // Extract both covers alongside the MRB if the EPUB has one. The device
+  // cannot generate these itself for a converted book — there is no EPUB on the
+  // card — so anything not written here is simply absent.
+  //   cover.bin        160x240, book list and home screen
+  //   cover_sleep.bin  480x786, sleep screen
   if (ok) {
-    std::string cover_path(output_path);
-    const size_t pos = cover_path.rfind("book.mrb");
+    const std::string base(output_path);
+    const size_t pos = base.rfind("book.mrb");
     if (pos != std::string::npos) {
-      cover_path.replace(pos, 8, "cover.bin");
-      book.write_cover_bin(cover_path.c_str(), 160, 240, work_buf,
-                           work_buf ? (ZipEntryInput::kDecompSize + ZipEntryInput::kDictSize + 1024) : 0);
+      const size_t work_sz = work_buf ? (ZipEntryInput::kDecompSize + ZipEntryInput::kDictSize + 1024) : 0;
+      std::string p = base;
+      p.replace(pos, 8, "cover.bin");
+      book.write_cover_bin(p.c_str(), 160, 240, work_buf, work_sz);
+      p = base;
+      p.replace(pos, 8, "cover_sleep.bin");
+      book.write_cover_bin(p.c_str(), 480, 786, work_buf, work_sz);
     }
   }
 

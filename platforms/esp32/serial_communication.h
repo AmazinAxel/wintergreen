@@ -6,11 +6,10 @@
 //   0xDEADBEEF  LUT frame     â†’ applied to the EPD
 //   "EPUB"      file upload   â†’ /sdcard/books/
 //   "SIMG"      file upload   â†’ /sdcard/sleep/
-//   "SDFN"      file upload   â†’ /sdcard/fonts/
 //   "FONT"      font upload   â†’ raw spiffs partition
 //   "CMND"      command frame â†’ see handle_serial_cmd()
 //
-// File upload format (EPUB/SIMG/SDFN):
+// File upload format (EPUB/SIMG):
 //   [4B] magic
 //   [2B LE] filename length
 //   [N B]   filename
@@ -34,13 +33,8 @@
 
 #include "wintergreen/content/BookIndex.h"
 
-#ifdef QEMU_BUILD
-#include "driver/uart.h"
-#include "driver/uart_vfs.h"
-#else
 #include "driver/usb_serial_jtag.h"
 #include "driver/usb_serial_jtag_vfs.h"
-#endif
 #include "esp_log.h"
 #include "esp_rom_crc.h"
 #include "font_partition.h"
@@ -53,9 +47,7 @@ static constexpr const char* kCmdTag = "cmd";  // also used by request_index_op 
 static constexpr uint8_t kLutMagic[4] = {0xDE, 0xAD, 0xBE, 0xEF};
 static constexpr uint8_t kEpubMagic[4] = {'E', 'P', 'U', 'B'};
 static constexpr uint8_t kSimgMagic[4] = {'S', 'I', 'M', 'G'};
-static constexpr uint8_t kSdFntMagic[4] = {'S', 'D', 'F', 'N'};
 static constexpr uint8_t kCmdMagic[4] = {'C', 'M', 'N', 'D'};
-static constexpr uint8_t kFontMagic[4] = {'F', 'O', 'N', 'T'};
 static constexpr uint32_t kLutSize = 112;
 static constexpr uint32_t kLutFrameSize = 113;  // 1 byte type + 112 bytes LUT
 static constexpr uint8_t kAck = 0x06;           // flow-control ACK between chunks
@@ -74,18 +66,13 @@ volatile uint8_t g_serial_buttons = 0;
 enum class SerialCmdType : uint8_t {
   None = 0,
   Open,
-  Bench,
-  ImgBench,
-  ImgDecode,
   FlashBench,
-  InvalidateFont,
   RenderBench
 };
 static char g_cmd_path[256];
 static volatile SerialCmdType g_cmd_type = SerialCmdType::None;
 
 // Set when a font has been uploaded to the partition and needs re-mmap.
-static volatile bool g_font_uploaded = false;
 
 // Single-slot SPSC queue for index mutations triggered by serial commands
 // (upload via 'W' magic-EPUB, delete via 'R', rename via 'N'). The receiver
@@ -121,7 +108,7 @@ inline void request_index_op(SerialIndexOp op, const char* a, const char* b = nu
   g_index_op = op;  // commit
 }
 
-// Set while a chunked file upload (EPUB/SDFN/SIMG/FONT/CMND-W) is in
+// Set while a chunked file upload (EPUB/SIMG/CMND-W) is in
 // progress. The main loop skips app.update() when this is true to prevent
 // display SPI traffic (SPI2_HOST) from contending with SD-card fwrite()
 // (also SPI2_HOST). We also silence esp_log during this window so no log
@@ -166,11 +153,7 @@ static bool serial_read_exact(uint8_t* buf, size_t n, uint32_t timeout_ms) {
     const TickType_t now = xTaskGetTickCount();
     if ((int32_t)(deadline - now) <= 0)
       return false;
-#ifdef QEMU_BUILD
-    const int r = uart_read_bytes(UART_NUM_0, buf + received, n - received, deadline - now);
-#else
     const int r = usb_serial_jtag_read_bytes(buf + received, n - received, deadline - now);
-#endif
     if (r > 0)
       received += r;
   }
@@ -178,19 +161,11 @@ static bool serial_read_exact(uint8_t* buf, size_t n, uint32_t timeout_ms) {
 }
 
 static void serial_write(const char* msg) {
-#ifdef QEMU_BUILD
-  uart_write_bytes(UART_NUM_0, msg, strlen(msg));
-#else
   usb_serial_jtag_write_bytes((const uint8_t*)msg, strlen(msg), pdMS_TO_TICKS(1000));
-#endif
 }
 
 static void serial_write_raw(const uint8_t* buf, size_t n) {
-#ifdef QEMU_BUILD
-  uart_write_bytes(UART_NUM_0, buf, n);
-#else
   usb_serial_jtag_write_bytes(buf, n, pdMS_TO_TICKS(1000));
-#endif
 }
 
 // ---------------------------------------------------------------------------
@@ -355,113 +330,6 @@ static void handle_simg_upload() {
   handle_file_upload("/sdcard/sleep");
 }
 
-static void handle_sdfnt_upload() {
-  handle_file_upload("/sdcard/fonts");
-}
-
-// ---------------------------------------------------------------------------
-// Handle a FONT upload â€” write directly to the spiffs partition (raw flash).
-// Protocol:
-//   [4B] "FONT" magic (already consumed)
-//   [4B] file_size (LE)
-//   payload in 2KB chunks with ACK flow control (same as EPUB)
-//   [4B] CRC32 (LE)
-// ---------------------------------------------------------------------------
-static void handle_font_upload() {
-  // Read file size (4 bytes LE).
-  uint8_t sz_buf[4];
-  if (!serial_read_exact(sz_buf, 4, 2000)) {
-    serial_write("ERR:size\n");
-    return;
-  }
-  uint32_t file_size = sz_buf[0] | (sz_buf[1] << 8) | (sz_buf[2] << 16) | (sz_buf[3] << 24);
-
-  const esp_partition_t* part = FontPartition::find();
-  if (!part) {
-    serial_write("ERR:no_partition\n");
-    return;
-  }
-  if (kFontPartHeaderSize + file_size > part->size) {
-    serial_write("ERR:too_large\n");
-    return;
-  }
-
-  ESP_LOGI(kUpTag, "receiving font (%lu bytes) â†’ spiffs partition", (unsigned long)file_size);
-
-  // Erase needed sectors BEFORE signaling READY, so the host doesn't
-  // start sending while we're busy erasing.
-  size_t total = kFontPartHeaderSize + file_size;
-  size_t erase_size = (total + 0xFFF) & ~0xFFF;
-  if (esp_partition_erase_range(part, 0, erase_size) != ESP_OK) {
-    serial_write("ERR:erase\n");
-    return;
-  }
-
-  // Write the header first (magic + size).
-  uint8_t header[kFontPartHeaderSize];
-  memcpy(header, kFontMagic, 4);
-  memcpy(header + 4, sz_buf, 4);
-  if (esp_partition_write(part, 0, header, sizeof(header)) != ESP_OK) {
-    serial_write("ERR:write_hdr\n");
-    return;
-  }
-
-  // Now signal the host to start sending data.
-  serial_write("READY\n");
-
-  g_upload_in_progress = true;
-  esp_log_level_set("*", ESP_LOG_NONE);
-
-  uint32_t crc = 0;
-  uint32_t remaining = file_size;
-  uint32_t flash_offset = kFontPartHeaderSize;
-  uint8_t chunk[2048];
-
-  while (remaining > 0) {
-    size_t want = remaining < sizeof(chunk) ? remaining : sizeof(chunk);
-    if (!serial_read_exact(chunk, want, 30000)) {
-      g_upload_in_progress = false;
-      esp_log_level_set("*", ESP_LOG_INFO);
-      ESP_LOGE(kUpTag, "font upload timeout, %lu remaining", (unsigned long)remaining);
-      serial_write("ERR:timeout\n");
-      return;
-    }
-    crc = esp_rom_crc32_le(crc, chunk, want);
-
-    if (esp_partition_write(part, flash_offset, chunk, want) != ESP_OK) {
-      g_upload_in_progress = false;
-      esp_log_level_set("*", ESP_LOG_INFO);
-      serial_write("ERR:write\n");
-      return;
-    }
-    flash_offset += want;
-    remaining -= want;
-    serial_write_raw(&kAck, 1);
-  }
-
-  // Verify CRC.
-  uint8_t crc_buf[4];
-  if (!serial_read_exact(crc_buf, 4, 2000)) {
-    g_upload_in_progress = false;
-    esp_log_level_set("*", ESP_LOG_INFO);
-    serial_write("ERR:crc_missing\n");
-    return;
-  }
-  uint32_t expected = crc_buf[0] | (crc_buf[1] << 8) | (crc_buf[2] << 16) | (crc_buf[3] << 24);
-  if (crc != expected) {
-    g_upload_in_progress = false;
-    esp_log_level_set("*", ESP_LOG_INFO);
-    ESP_LOGE(kUpTag, "font CRC mismatch: got 0x%08lx expected 0x%08lx", (unsigned long)crc, (unsigned long)expected);
-    serial_write("ERR:crc\n");
-    return;
-  }
-
-  g_upload_in_progress = false;
-  esp_log_level_set("*", ESP_LOG_INFO);
-  ESP_LOGI(kUpTag, "font saved to partition (%lu bytes, CRC OK)", (unsigned long)file_size);
-  g_font_uploaded = true;
-  serial_write("OK\n");
-}
 
 // ---------------------------------------------------------------------------
 // Handle a serial command (after "CMND" magic has been matched).
@@ -488,7 +356,6 @@ static void handle_font_upload() {
 //       + 4B size + data
 //       + 4B CRC32            â†’ write file (chunked + 0x06 ACKs)
 //   'X' + 2B path_len + path  â†’ EPUB conversion benchmark
-//   'Y'                       â†’ clear /sdcard/fonts/
 //   'Z'                       â†’ clear /sdcard/sleep/
 // ---------------------------------------------------------------------------
 
@@ -698,28 +565,6 @@ static void handle_serial_cmd() {
       ESP_LOGI(kCmdTag, "cleared %d sleep images", count);
       break;
     }
-    case 'Y': {
-      const char* fonts_dir = "/sdcard/fonts";
-      DIR* dir = opendir(fonts_dir);
-      int count = 0;
-      if (dir) {
-        struct dirent* ent;
-        char fpath[300];
-        while ((ent = readdir(dir)) != nullptr) {
-          if (ent->d_name[0] == '.')
-            continue;
-          snprintf(fpath, sizeof(fpath), "%s/%s", fonts_dir, ent->d_name);
-          if (remove(fpath) == 0)
-            ++count;
-        }
-        closedir(dir);
-      }
-      char buf[64];
-      snprintf(buf, sizeof(buf), "CLEARED_SDFONTS:%d\n", count);
-      serial_write(buf);
-      ESP_LOGI(kCmdTag, "cleared %d SD fonts", count);
-      break;
-    }
     case 'R': {
       if (!read_cmd_path("rm"))
         return;
@@ -741,36 +586,10 @@ static void handle_serial_cmd() {
       }
       break;
     }
-    case 'X': {
-      if (!read_cmd_path("bench"))
-        return;
-      g_cmd_type = SerialCmdType::Bench;
-      serial_write("OK\n");
-      break;
-    }
-    case 'I': {
-      if (!read_cmd_path("imgbench"))
-        return;
-      g_cmd_type = SerialCmdType::ImgBench;
-      serial_write("OK\n");
-      break;
-    }
-    case 'D': {
-      if (!read_cmd_path("imgdecode"))
-        return;
-      g_cmd_type = SerialCmdType::ImgDecode;
-      serial_write("OK\n");
-      break;
-    }
     case 'G': {
       // Flash erase+write benchmark â€” no path argument.
       g_cmd_type = SerialCmdType::FlashBench;
       serial_write("OK\n");
-      break;
-    }
-    case 'F': {
-      g_cmd_type = SerialCmdType::InvalidateFont;
-      serial_write("FONT_INVALIDATED\n");
       break;
     }
     case 'P': {
@@ -1014,19 +833,13 @@ static void serial_receiver_task(void* /*arg*/) {
   uint8_t lut_pos = 0;   // progress matching kLutMagic
   uint8_t epub_pos = 0;  // progress matching kEpubMagic
   uint8_t simg_pos = 0;  // progress matching kSimgMagic
-  uint8_t sdfn_pos = 0;  // progress matching kSdFntMagic
   uint8_t cmd_pos = 0;   // progress matching kCmdMagic
-  uint8_t font_pos = 0;  // progress matching kFontMagic
 
-  ESP_LOGI(kLutRxTag, "receiver ready (LUT + EPUB + SIMG + SDFN + CMD + FONT)");
+  ESP_LOGI(kLutRxTag, "receiver ready (LUT + EPUB + SIMG + CMD)");
 
   while (true) {
     uint8_t byte;
-#ifdef QEMU_BUILD
-    if (uart_read_bytes(UART_NUM_0, &byte, 1, pdMS_TO_TICKS(50)) != 1)
-#else
     if (usb_serial_jtag_read_bytes(&byte, 1, pdMS_TO_TICKS(50)) != 1)
-#endif
       continue;
 
     // Match LUT magic.
@@ -1035,9 +848,7 @@ static void serial_receiver_task(void* /*arg*/) {
         lut_pos = 0;
         epub_pos = 0;
         simg_pos = 0;
-        sdfn_pos = 0;
         cmd_pos = 0;
-        font_pos = 0;
         handle_lut_frame();
         continue;
       }
@@ -1051,9 +862,7 @@ static void serial_receiver_task(void* /*arg*/) {
         lut_pos = 0;
         epub_pos = 0;
         simg_pos = 0;
-        sdfn_pos = 0;
         cmd_pos = 0;
-        font_pos = 0;
         handle_epub_upload();
         continue;
       }
@@ -1067,30 +876,12 @@ static void serial_receiver_task(void* /*arg*/) {
         lut_pos = 0;
         epub_pos = 0;
         simg_pos = 0;
-        sdfn_pos = 0;
         cmd_pos = 0;
-        font_pos = 0;
         handle_simg_upload();
         continue;
       }
     } else {
       simg_pos = (byte == kSimgMagic[0]) ? 1 : 0;
-    }
-
-    // Match SDFN magic.
-    if (byte == kSdFntMagic[sdfn_pos]) {
-      if (++sdfn_pos == 4) {
-        lut_pos = 0;
-        epub_pos = 0;
-        simg_pos = 0;
-        sdfn_pos = 0;
-        cmd_pos = 0;
-        font_pos = 0;
-        handle_sdfnt_upload();
-        continue;
-      }
-    } else {
-      sdfn_pos = (byte == kSdFntMagic[0]) ? 1 : 0;
     }
 
     // Match CMND magic.
@@ -1099,56 +890,23 @@ static void serial_receiver_task(void* /*arg*/) {
         lut_pos = 0;
         epub_pos = 0;
         simg_pos = 0;
-        sdfn_pos = 0;
         cmd_pos = 0;
-        font_pos = 0;
         handle_serial_cmd();
         continue;
       }
     } else {
       cmd_pos = (byte == kCmdMagic[0]) ? 1 : 0;
     }
-
-    // Match FONT magic.
-    if (byte == kFontMagic[font_pos]) {
-      if (++font_pos == 4) {
-        lut_pos = 0;
-        epub_pos = 0;
-        simg_pos = 0;
-        sdfn_pos = 0;
-        cmd_pos = 0;
-        font_pos = 0;
-        handle_font_upload();
-        continue;
-      }
-    } else {
-      font_pos = (byte == kFontMagic[0]) ? 1 : 0;
-    }
   }
 }
 
-// Call once from app_main before the main loop.
+// Call once from app_main before the main loop
 inline void serial_start() {
-#ifdef QEMU_BUILD
-  // QEMU simulates UART0; route the binary protocol over it.
-  const uart_config_t uart_cfg = {
-      .baud_rate = 115200,
-      .data_bits = UART_DATA_8_BITS,
-      .parity = UART_PARITY_DISABLE,
-      .stop_bits = UART_STOP_BITS_1,
-      .flow_ctrl = UART_HW_FLOWCTRL_DISABLE,
-      .source_clk = UART_SCLK_DEFAULT,
-  };
-  uart_param_config(UART_NUM_0, &uart_cfg);
-  uart_driver_install(UART_NUM_0, 4096, 0, 0, nullptr, 0);
-  uart_vfs_dev_use_driver(0);
-#else
   usb_serial_jtag_driver_config_t cfg = {
-      .tx_buffer_size = 2048,  // must be >= chunk size (2048) to send a full chunk in one call
-      .rx_buffer_size = 4096,
+    .tx_buffer_size = 2048,  // must be >= chunk size (2048) to send a full chunk in one call
+    .rx_buffer_size = 4096,
   };
   usb_serial_jtag_driver_install(&cfg);
   usb_serial_jtag_vfs_register();
-#endif
   xTaskCreate(serial_receiver_task, "serial_rx", 8192, nullptr, 3, nullptr);
 }

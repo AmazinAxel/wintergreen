@@ -8,16 +8,7 @@
 #include "../content/BookIndex.h"
 
 namespace wintergreen {
-constexpr uint16_t ReaderSettings::kHPaddingPresets[];
-constexpr uint16_t ReaderSettings::kVPaddingPresets[];
-constexpr uint16_t ReaderSettings::kSpacingPercents[];
-constexpr uint8_t ReaderSettings::kNumAlignPresets;
-constexpr uint8_t ReaderSettings::kNumSpacingPresets;
 constexpr uint8_t ReaderSettings::kNumFontSizePresets;
-constexpr const char* ReaderSettings::kHPaddingNames[];
-constexpr const char* ReaderSettings::kVPaddingNames[];
-constexpr const char* ReaderSettings::kAlignNames[];
-constexpr const char* ReaderSettings::kSpacingNames[];
 constexpr const char* ReaderSettings::kFontSizeNames[];
 
 // ---------------------------------------------------------------------------
@@ -42,14 +33,7 @@ void ReaderOptionsScreen::populate(const TableOfContents& toc, uint16_t current_
 
   book_progress_pct_ = book_progress_pct;
   chapter_progress_pct_ = chapter_progress_pct;
-  if (app_) {
-    if (!toc_->entries.empty()) {
-      app_->chapter_select()->populate(*toc_, current_chapter, current_para);
-    } else if (chapter_count > 1) {
-      app_->chapter_select()->set_chapter_count(chapter_count, current_chapter);
-    }
-    app_->chapter_select()->clear_pending();
-  }
+  has_pending_ = false;
 }
 
 // Build a "Label: Value" string into a fixed buffer.
@@ -72,20 +56,10 @@ std::string ReaderOptionsScreen::wintergreen_header_left() const {
 
 void ReaderOptionsScreen::start(DrawBuffer& buf, IRuntime& runtime) {
   buf_ = &buf;
-  // Capture current selection and Links position before the base class
-  // calls on_start(), which rebuilds the list.
+  // Capture current selection before the base class calls on_start(), which
+  // rebuilds the list.
   prev_selected_ = selected_index();
-  prev_idx_links_ = idx_links_;
   ListMenuScreen::start(buf, runtime);
-}
-
-void ReaderOptionsScreen::set_page_links(const std::vector<PageLink>& links,
-                                         const std::vector<std::string>& spine_files, const MrbReader& mrb) {
-  page_links_ = links;
-  // Populate the links screen now while the MrbReader is still open.
-  // (ReaderScreen::stop() will close mrb before we get to on_select.)
-  if (app_)
-    app_->links_screen()->populate(links, spine_files, mrb);
 }
 
 void ReaderOptionsScreen::on_start() {
@@ -206,13 +180,9 @@ void ReaderOptionsScreen::on_start() {
     }
   }
 
-  // Compute cumulative read time and look up author in one BookIndex pass.
-  // reading_ms_total() already includes all historical sessions (loaded from .pos),
-  // so we must NOT add e.read_time_ms here — that would double-count prior sessions.
-  subtitle3_ = "< 1m read";
+  // Author for the details card. Reading statistics are not tracked.
   std::string_view author_sv;
   if (app_ && app_->reader()) {
-    uint64_t ms = app_->reader()->reading_ms_total();
     const std::string cur_path = app_->reader()->get_path();
     for (const auto& e : BookIndex::instance().entries()) {
       if (e.path.view(BookIndex::instance().pool()) == cur_path) {
@@ -220,56 +190,20 @@ void ReaderOptionsScreen::on_start() {
         break;
       }
     }
-    const uint64_t total_min = ms / 60000;
-    if (total_min >= 60) {
-      const unsigned hours = static_cast<unsigned>(total_min / 60);
-      const unsigned mins  = static_cast<unsigned>(total_min % 60);
-      char tbuf[20];
-      std::snprintf(tbuf, sizeof(tbuf), "%uh %um read", hours, mins);
-      subtitle3_ = tbuf;
-    } else if (total_min >= 1) {
-      char tbuf[12];
-      std::snprintf(tbuf, sizeof(tbuf), "%um read", static_cast<unsigned>(total_min));
-      subtitle3_ = tbuf;
-    }
   }
 
-  // Book-details card (unified across all themes): author, book%, read time.
   subtitle_ = std::string(author_sv);
   char pct_buf[16];
   snprintf(pct_buf, sizeof(pct_buf), "Book %d%%", book_progress_pct_);
   subtitle2_ = pct_buf;
-  // subtitle3_ stays as the read time string
 
   clear_items();
-  idx_justify_ = idx_padding_h_ = idx_padding_v_ = idx_line_spacing_ = idx_font_size_ = idx_progress_ = idx_progress_scope_ =
-      idx_chapters_ = idx_pub_fonts_ = idx_hyphenation_ = idx_rotate_display_ = idx_reader_rotate_display_ = idx_links_ = -1;
+  idx_font_size_ = idx_rotate_display_ = idx_reader_rotate_display_ = -1;
+  first_chapter_ = -1;
 
   char tmp[40];
 
-
-  bool has_toc = toc_ && !toc_->entries.empty();
-  bool has_chapters = has_toc || chapter_count_ > 1;
-  const bool has_nav = has_chapters || !page_links_.empty();
-
-  if (has_nav) {
-    add_separator("NAVIGATE");
-    if (app_ && has_chapters) {
-      idx_chapters_ = count();
-      add_item("Chapters");
-    }
-    if (!page_links_.empty()) {
-      idx_links_ = count();
-      char link_label[40];
-      snprintf(link_label, sizeof(link_label), "Links (%d)", static_cast<int>(page_links_.size()));
-      add_item(link_label);
-    }
-  }
-
-  if (settings_) {
-    add_separator("SETTINGS");
-  }
-
+  // Flat list, no section headers: the two settings, then Chapters.
   if (settings_) {
     idx_font_size_ = count();
     if (app_ && app_->font_manager() && app_->font_manager()->valid()) {
@@ -293,58 +227,29 @@ void ReaderOptionsScreen::on_start() {
       add_item(fmt_setting(tmp, sizeof(tmp), "Font Size", ReaderSettings::kFontSizeNames[settings_->font_size_idx]));
     }
 
-    idx_pub_fonts_ = count();
-    add_item(fmt_setting(tmp, sizeof(tmp), "Publisher Sizes", settings_->override_publisher_fonts ? "Off" : "On"));
-
-    idx_line_spacing_ = count();
-    add_item(fmt_setting(tmp, sizeof(tmp), "Line spacing",
-                         ReaderSettings::kSpacingNames[static_cast<uint8_t>(settings_->spacing_override)]));
-
-    idx_justify_ = count();
-    add_item(fmt_setting(tmp, sizeof(tmp), "Alignment",
-                         ReaderSettings::kAlignNames[static_cast<uint8_t>(settings_->align_override)]));
-
-    idx_hyphenation_ = count();
-    add_item(fmt_setting(tmp, sizeof(tmp), "Hyphenation", settings_->hyphenation_enabled ? "On" : "Off"));
-
-    add_separator();
-
-    idx_padding_h_ = count();
-    add_item(fmt_setting(tmp, sizeof(tmp), "H-Margin", ReaderSettings::kHPaddingNames[settings_->padding_h_idx]));
-
-    idx_padding_v_ = count();
-    add_item(fmt_setting(tmp, sizeof(tmp), "V-Margin", ReaderSettings::kVPaddingNames[settings_->padding_v_idx]));
-
-    add_separator();
-
-    idx_progress_ = count();
-    const char* prog_name = settings_->progress_style == ProgressStyle::None         ? "None"
-                            : settings_->progress_style == ProgressStyle::Percentage ? "Percent"
-                                                                                     : "Bar";
-    add_item(fmt_setting(tmp, sizeof(tmp), "Progress", prog_name));
-
-    if (settings_->progress_style != ProgressStyle::None) {
-      idx_progress_scope_ = count();
-      add_item(fmt_setting(tmp, sizeof(tmp), "Progress Scope",
-                           settings_->progress_scope == ProgressScope::Chapter ? "Chapter" : "Book"));
-    }
-
-
     idx_reader_rotate_display_ = count();
     add_item(fmt_setting(tmp, sizeof(tmp), "Reader Display", rotation_label(app_ ? app_->rotate_reader() : 0)));
   }
 
-  // Restore selection, adjusting for Links appearing or disappearing.
-  int sel = prev_selected_;
-  if (prev_idx_links_ == -1 && idx_links_ != -1) {
-    // Links appeared: everything at idx_links_ and below shifted down by 1.
-    if (sel >= idx_links_)
-      sel++;
-  } else if (prev_idx_links_ != -1 && idx_links_ == -1) {
-    // Links disappeared: cursor was on Links or below it — move up by 1.
-    if (sel >= prev_idx_links_)
-      sel--;
+  // Chapters, inline below the settings. Nested TOC entries keep their depth as
+  // an indent; a book with no TOC falls back to numbered spine chapters.
+  const bool has_toc = toc_ && !toc_->entries.empty();
+  if (has_toc) {
+    first_chapter_ = count();
+    for (const auto& entry : toc_->entries)
+      add_item_view(entry.label.view(toc_->pool), entry.depth);
+  } else if (chapter_count_ > 1) {
+    first_chapter_ = count();
+    char cbuf[20];
+    for (uint16_t i = 0; i < chapter_count_; ++i) {
+      snprintf(cbuf, sizeof(cbuf), "Chapter %u", static_cast<unsigned>(i + 1));
+      add_item(cbuf);
+    }
   }
+
+  // Restore selection. The item list is now fixed for a given book, so no
+  // shift correction is needed.
+  int sel = prev_selected_;
   int max_sel = count() - 1;
   if (max_sel >= 0) {
     if (sel < 0)
@@ -357,8 +262,7 @@ void ReaderOptionsScreen::on_start() {
 
 void ReaderOptionsScreen::refresh_items_(int restore_selection) {
   prev_selected_ = restore_selection;
-  prev_idx_links_ = idx_links_;
-  on_start();  // on_start() applies shift correction and calls set_selected().
+  on_start();  // on_start() calls set_selected().
 }
 
 int ReaderOptionsScreen::get_visible_count_(int H, int scroll_off) const {
@@ -374,13 +278,11 @@ int ReaderOptionsScreen::get_visible_count_(int H, int scroll_off) const {
   if (!chapter_title_.empty()) list_top += ui_font_.y_advance() + 3;
   list_top += ui_font_.y_advance() + 10 + 1;  // stats row + rule
   const int available_h = H - list_top;
-  int h = 0, cnt = 0, n = count();
+  int h = 0, cnt = 0;
+  const int n = count();
   for (int i = scroll_off; i < n; ++i) {
-    const int item_h = is_separator(i)
-        ? (8 + (!get_item_label(i).empty() && section_font_.valid() ? section_font_.y_advance() : 0) + 4)
-        : kRowH;
-    if (h + item_h > available_h) break;
-    h += item_h;
+    if (h + kRowH > available_h) break;
+    h += kRowH;
     cnt++;
   }
   return cnt;
@@ -451,11 +353,6 @@ void ReaderOptionsScreen::draw_all_(DrawBuffer& buf, std::optional<uint8_t> batt
              book_progress_pct_, chapter_progress_pct_);
     buf.draw_text_proportional(kLM, y + ui_font_.baseline(),
                                stats_l, std::strlen(stats_l), ui_font_, false);
-    if (!subtitle3_.empty()) {
-      const int rw = ui_font_.word_width(subtitle3_.c_str(), subtitle3_.size(), FontStyle::Regular);
-      buf.draw_text_proportional(W - kRM - rw, y + ui_font_.baseline(),
-                                 subtitle3_.c_str(), subtitle3_.size(), ui_font_, false);
-    }
     y += ui_font_.y_advance() + 10;
   }
 
@@ -465,52 +362,35 @@ void ReaderOptionsScreen::draw_all_(DrawBuffer& buf, std::optional<uint8_t> batt
   // ── Item list ────────────────────────────────────────────────────────────
   const int n = count();
   // Compute total content height to decide whether scrolling is needed.
-  int total_h = 0;
-  for (int i = 0; i < n; ++i) {
-    if (is_separator(i))
-      total_h += 8 + (!get_item_label(i).empty() && section_font_.valid() ? section_font_.y_advance() : 0) + 4;
-    else
-      total_h += kRowH;
-  }
+  const int total_h = n * kRowH;
   const int so = (total_h <= H - y) ? 0 : scroll_offset();
 
   for (int i = so; i < n && y < H; ++i) {
     const bool sel = (i == selected());
 
-    if (is_separator(i)) {
-      const std::string_view hdr = get_item_label(i);
-      y += 8;
-      if (!hdr.empty()) {
-        buf.draw_text_proportional(kLM, y + section_font_.baseline(),
-                                   hdr.data(), hdr.size(), section_font_, false);
-        y += section_font_.y_advance();
-      }
-      y += 4;
-      continue;
-    }
-
     const std::string_view label = get_item_label(i);
+    const bool is_chapter = (first_chapter_ >= 0 && i >= first_chapter_);
+
+    // Only a settings row is "Label: Value". Chapter titles legitimately contain
+    // ": " ("Chapter 1: The Beginning") and must never be split into columns.
     std::string_view display_label = label;
     std::string_view display_value;
-    const auto pos = label.find(": ");
-    if (pos != std::string_view::npos) {
-      display_label = label.substr(0, pos);
-      display_value = label.substr(pos + 2);
+    if (!is_chapter) {
+      const auto pos = label.find(": ");
+      if (pos != std::string_view::npos) {
+        display_label = label.substr(0, pos);
+        display_value = label.substr(pos + 2);
+      }
     }
-
-    const bool is_nav = (i == idx_chapters_ || i == idx_links_);
 
     if (sel)
       buf.fill_rect(0, y, W, kRowH, false);
 
     const int text_y = y + (kRowH - ui_font_.y_advance()) / 2 + ui_font_.baseline();
-    buf.draw_text_proportional(kLM, text_y, display_label.data(), display_label.size(), ui_font_, sel);
+    const int text_x = kLM + (is_chapter ? get_item_indent(i) * 12 : 0);
+    buf.draw_text_proportional(text_x, text_y, display_label.data(), display_label.size(), ui_font_, sel);
 
-    if (is_nav) {
-      static const char kArrow[] = ">";
-      const int aw = ui_font_.word_width(kArrow, 1, FontStyle::Regular);
-      buf.draw_text_proportional(W - kRM - aw, text_y, kArrow, 1, ui_font_, sel);
-    } else if (!display_value.empty()) {
+    if (!display_value.empty()) {
       const int vw = ui_font_.word_width(display_value.data(), display_value.size(), FontStyle::Regular);
       buf.draw_text_proportional(W - kRM - vw, text_y, display_value.data(), display_value.size(), ui_font_, sel);
     }
@@ -520,30 +400,23 @@ void ReaderOptionsScreen::draw_all_(DrawBuffer& buf, std::optional<uint8_t> batt
 }
 
 void ReaderOptionsScreen::on_select(int index) {
-  if (!settings_) {
-    if (index == idx_chapters_) {
-      app_->push_screen(ScreenId::ChapterSelect);
-      return;
+  if (first_chapter_ >= 0 && index >= first_chapter_) {
+    const int ch = index - first_chapter_;
+    if (toc_ && !toc_->entries.empty()) {
+      pending_chapter_ = toc_->entries[ch].file_idx;
+      pending_para_index_ = toc_->entries[ch].para_index;
+    } else {
+      pending_chapter_ = static_cast<uint16_t>(ch);
+      pending_para_index_ = 0;
     }
+    has_pending_ = true;
+    app_->pop_screen();
     return;
   }
 
-  if (index == idx_justify_) {
-    settings_->align_override = static_cast<AlignOverride>((static_cast<uint8_t>(settings_->align_override) + 1) %
-                                                           ReaderSettings::kNumAlignPresets);
-    refresh_items_(index);
+  if (!settings_)
     return;
-  }
-  if (index == idx_hyphenation_) {
-    settings_->hyphenation_enabled = !settings_->hyphenation_enabled;
-    refresh_items_(index);
-    return;
-  }
-  if (index == idx_pub_fonts_) {
-    settings_->override_publisher_fonts = !settings_->override_publisher_fonts;
-    refresh_items_(index);
-    return;
-  }
+
   if (index == idx_font_size_) {
     uint8_t max_idx = ReaderSettings::kNumFontSizePresets;
     if (app_ && app_->font_manager() && app_->font_manager()->valid()) {
@@ -555,47 +428,12 @@ void ReaderOptionsScreen::on_select(int index) {
     refresh_items_(index);
     return;
   }
-  if (index == idx_padding_h_) {
-    settings_->padding_h_idx = static_cast<uint8_t>((settings_->padding_h_idx + 1) % ReaderSettings::kNumPresets);
-    refresh_items_(index);
-    return;
-  }
-  if (index == idx_padding_v_) {
-    settings_->padding_v_idx = static_cast<uint8_t>((settings_->padding_v_idx + 1) % ReaderSettings::kNumPresets);
-    refresh_items_(index);
-    return;
-  }
-  if (index == idx_line_spacing_) {
-    settings_->spacing_override = static_cast<SpacingOverride>((static_cast<uint8_t>(settings_->spacing_override) + 1) %
-                                                               ReaderSettings::kNumSpacingPresets);
-    refresh_items_(index);
-    return;
-  }
-  if (index == idx_progress_) {
-    settings_->progress_style = static_cast<ProgressStyle>((static_cast<uint8_t>(settings_->progress_style) + 1) % 3);
-    refresh_items_(index);
-    return;
-  }
-  if (index == idx_progress_scope_) {
-    settings_->progress_scope =
-        settings_->progress_scope == ProgressScope::Book ? ProgressScope::Chapter : ProgressScope::Book;
-    refresh_items_(index);
-    return;
-  }
   if (index == idx_reader_rotate_display_) {
     if (app_) {
       uint8_t v = static_cast<uint8_t>((app_->rotate_reader() + 1) % 4);
       app_->set_rotate_reader(v);
       refresh_items_(index);
     }
-    return;
-  }
-  if (index == idx_chapters_) {
-    app_->push_screen(ScreenId::ChapterSelect);
-    return;
-  }
-  if (index == idx_links_) {
-    app_->push_screen(ScreenId::Links);
     return;
   }
   return;

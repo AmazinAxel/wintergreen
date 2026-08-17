@@ -28,11 +28,6 @@ class MainMenu final : public ListMenuScreen {
     initial_selection_ = path ? path : "";
   }
 
-  // The full path of the most recently selected (opened) book.
-  const std::string& last_selected_book_path() const {
-    return last_selected_path_;
-  }
-
   // The full path of the currently highlighted entry (even if not yet opened).
   const std::string& current_book_path() const {
     int idx = entries_index_for(selected());
@@ -62,7 +57,6 @@ class MainMenu final : public ListMenuScreen {
 
   std::string_view get_item_label(int index) const override;
   std::string_view get_item_subtitle(int index) const override;
-  std::string_view get_item_right(int index) const override;
   std::string wintergreen_header_left() const override;
   bool is_separator(int index) const override;
   int count() const override;
@@ -84,7 +78,6 @@ class MainMenu final : public ListMenuScreen {
  private:
   const char* books_dir_ = nullptr;
   std::string initial_selection_;   // path to pre-select after scan
-  std::string last_selected_path_;  // path of the most recently opened book
   DrawBuffer* buf_ = nullptr;
   bool needs_scan_ = false;
   // Cached BookIndex::generation() value from the last populate_list_(). When
@@ -98,13 +91,11 @@ class MainMenu final : public ListMenuScreen {
     StringRef title_ref;
     StringRef author_ref;
     uint32_t last_open_order = 0;
-    uint64_t read_time_ms = 0;
     bool mrb_exists = false;
   };
   std::vector<BookEntry> entries_;
   mutable std::string label_buf_;
   mutable std::string subtitle_buf_;
-  mutable std::string right_buf_;
 
   // Labeled section separators: {visual_index, label}.
   // Inserted by populate_list_() for LastOpened sort ("Recents", "All Books").

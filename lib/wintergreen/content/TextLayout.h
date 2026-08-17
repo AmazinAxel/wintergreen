@@ -27,7 +27,6 @@ struct LayoutWord {
   uint8_t size_pct = 100;
   VerticalAlign vertical_align = VerticalAlign::Baseline;
   bool continues_prev = false;  // true if placed adjacent to previous word (no inter-word gap)
-  const char* href = nullptr;   // hyperlink target (pointer into Run.href; nullptr = no link)
 };
 
 struct LayoutLine {
@@ -68,13 +67,11 @@ struct PageLine {
 
 struct LayoutOptions {
   uint16_t width = 300;  // available line width in pixels
-  std::optional<Alignment> align_override;
   uint16_t first_line_extra_indent = 0;  // extra left indent for inline images on first line
   HyphenationLang hyphenation_lang = HyphenationLang::None;
-  bool override_publisher_fonts = false;
 
   LayoutOptions() = default;
-  LayoutOptions(uint16_t w, std::optional<Alignment> a = std::nullopt) : width(w), align_override(a) {}
+  explicit LayoutOptions(uint16_t w) : width(w) {}
 };
 
 // ---------------------------------------------------------------------------
@@ -160,29 +157,19 @@ struct PageOptions {
   uint16_t padding_right = 10;
   uint16_t padding_bottom = 10;
   uint16_t padding_left = 10;
-  uint16_t para_spacing = 8;                    // pixels between paragraphs (fallback when CSS spacing_before not set)
-  uint16_t line_height_multiplier_percent = 0;  // 0 = use CSS/Book default. Otherwise scale by this percent.
-  std::optional<Alignment> align_override;
-  bool center_text = false;  // vertically center text content within the padded area
-  bool override_publisher_fonts = false;
+  uint16_t para_spacing = 8;  // pixels between paragraphs (fallback when CSS spacing_before not set)
+  bool center_text = false;   // vertically center text content within the padded area
 
   PageOptions() = default;
   // Uniform padding constructor: sets all four sides to pad.
-  PageOptions(uint16_t w, uint16_t h, uint16_t pad = 10, uint16_t ps = 8, std::optional<Alignment> a = std::nullopt)
-      : width(w),
-        height(h),
-        padding_top(pad),
-        padding_right(pad),
-        padding_bottom(pad),
-        padding_left(pad),
-        para_spacing(ps),
-        align_override(a) {}
+  PageOptions(uint16_t w, uint16_t h, uint16_t pad = 10, uint16_t ps = 8)
+      : width(w), height(h), padding_top(pad), padding_right(pad), padding_bottom(pad), padding_left(pad),
+        para_spacing(ps) {}
 
   bool operator==(const PageOptions& o) const {
     return width == o.width && height == o.height && padding_top == o.padding_top && padding_right == o.padding_right &&
            padding_bottom == o.padding_bottom && padding_left == o.padding_left && para_spacing == o.para_spacing &&
-           line_height_multiplier_percent == o.line_height_multiplier_percent && align_override == o.align_override &&
-           center_text == o.center_text && override_publisher_fonts == o.override_publisher_fonts;
+           center_text == o.center_text;
   }
 };
 

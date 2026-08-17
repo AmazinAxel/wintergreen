@@ -1173,10 +1173,6 @@ class BodyParser {
   // This prevents the bullet from landing in its own paragraph when <li> contains <p>.
   std::string pending_list_prefix_;
 
-  // Hyperlink tracking: href for the innermost <a href="..."> element.
-  std::string current_href_;  // empty = no active link
-  uint8_t href_depth_ = 0;    // depth at which the <a> was opened
-
   // page-break-after tracking: emit a page break when these depths close
   std::vector<uint8_t> page_break_after_depths_;
 
@@ -1239,8 +1235,6 @@ class BodyParser {
       r.vertical_align = vertical_align_;
       r.margin_left = margin_left_;
       r.margin_right = margin_right_;
-      if (!current_href_.empty())
-        r.href = current_href_;
       // On ESP32: if runs_ is at capacity, emit the accumulated runs as a partial
       // paragraph now rather than letting the vector double in size (which may fail
       // on a fragmented heap). The capacity >= 16 guard prevents splitting tiny
@@ -1595,24 +1589,8 @@ static EpubError parse_xhtml_events(XmlReader& reader, const CssStylesheet* inli
         continue;
       }
 
-      // Hyperlink: capture href attribute for inline link annotation.
-      // Only track the outermost <a> (nested <a> is invalid HTML, ignore inner ones).
-      if (sv_eq(ev.name, "a") && parser.current_href_.empty()) {
-        auto href_sv = ev.attrs.get("href");
-        if (!href_sv.empty() && !(href_sv.length > 0 && href_sv.data[0] == '#')) {
-          // Flush any text accumulated before this <a> so it gets no href.
-          parser.flush_text(false);
-          std::string resolved = Epub::resolve_path(base_dir, sv_to_string(href_sv));
-          // Strip the fragment (everything from '#' onwards) for the stored href.
-          // We keep the full resolved path so the reader can map filename → chapter index.
-          auto frag_pos = resolved.find('#');
-          std::string path_part = (frag_pos != std::string::npos) ? resolved.substr(0, frag_pos) : resolved;
-          std::string frag_part = (frag_pos != std::string::npos) ? resolved.substr(frag_pos + 1) : "";
-          // Store as "path|fragment" (fragment may be empty).
-          parser.current_href_ = path_part + "|" + frag_part;
-          parser.href_depth_ = parser.depth + 1;  // depth after the push below
-        }
-      }
+      // <a> elements are not special-cased: links are not parsed at all, so an
+      // anchor contributes only its text, styled like any other inline run.
 
       // Get CSS rule (before block flush, so we can check for float)
       auto id_sv = ev.attrs.get("id");
@@ -1877,12 +1855,6 @@ static EpubError parse_xhtml_events(XmlReader& reader, const CssStylesheet* inli
       if (parser.depth > 0)
         parser.depth--;
 
-      // Clear hyperlink context when the <a> element closes.
-      if (!parser.current_href_.empty() && parser.depth < parser.href_depth_) {
-        parser.flush_text(false);  // flush any pending text before clearing href
-        parser.current_href_.clear();
-        parser.href_depth_ = 0;
-      }
       while (!parser.italic_stack_.empty() && parser.depth < parser.italic_stack_.back().depth) {
         parser.set_italic(parser.italic_stack_.back().prev_value);
         parser.italic_stack_.pop_back();

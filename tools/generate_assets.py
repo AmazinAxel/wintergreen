@@ -13,13 +13,13 @@ esp32_dir = os.path.join(project_dir, "platforms", "esp32")
 bin_path = os.path.join(esp32_dir, "assets.bin")
 asm_path = os.path.join(esp32_dir, "assets_embedded.S")
 
-# WG_NO_EMBED_FONT drops Literata (726 KB) from the blob for iterative dev
-# uploads. The device keeps using whatever is already in the font partition,
+# WG_NO_EMBED_FONT drops the reader font (~290 KB) from the blob for iterative
+# dev uploads. The device keeps using whatever is already in the font partition,
 # so a board must have been flashed once with a full build first.
 skip_font = any("WG_NO_EMBED_FONT" in str(f) for f in env.get("CPPDEFINES", []) + env.get("BUILD_FLAGS", []))
-assets = [a for a in build_assets.DEFAULT_ASSETS if not (skip_font and a[0] == "Literata.bin")]
+assets = [a for a in build_assets.DEFAULT_ASSETS if not (skip_font and a[0] == build_assets.FONT_ASSET)]
 if skip_font:
-    print("[generate_assets] WG_NO_EMBED_FONT: omitting Literata.bin from the blob")
+    print(f"[generate_assets] WG_NO_EMBED_FONT: omitting {build_assets.FONT_ASSET} from the blob")
 
 build_assets.build(project_dir, bin_path, assets)
 print(f"[generate_assets] assets.bin written ({os.path.getsize(bin_path):,} bytes)")

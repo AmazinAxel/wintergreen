@@ -1,2 +1,3 @@
 #pragma once
 #define WINTERGREEN_SD_DIR "@WINTERGREEN_SD_DIR@"
+#define WINTERGREEN_REPO_ROOT "@REPO_ROOT@"

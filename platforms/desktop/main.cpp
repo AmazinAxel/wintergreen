@@ -3,6 +3,8 @@
 #include <iostream>
 #include <vector>
 
+#include "miniz.h"
+
 #include "desktop_config.h"
 #include "display.h"
 #include "input.h"
@@ -32,61 +34,49 @@ static std::vector<uint8_t> load_file(const char* path) {
   return data;
 }
 
+// Must match kFontAsset in platforms/esp32/font_manager.h.
+static constexpr const char* kFontAsset = "AtkinsonHyperlegible.bin";
+
 class DesktopFontManager : public wintergreen::FontManager {
  public:
   explicit DesktopFontManager(wintergreen::Application& app) : app_(app) {}
 
   void ensure_ready(wintergreen::DrawBuffer&) override {
-    const std::string& custom_font = app_.custom_font_path();
+    if (font_set_.valid())
+      return;  // already loaded — there is only one font
 
-    if (custom_font == currently_loaded_path_ && font_set_.valid())
-      return;  // already loaded
+    // Same asset the device ships: [uint32 uncompressed size][zlib stream]
+    // wrapping the FNTS v2 bundle. See tools/make_font.py.
+    static const std::string path =
+        (std::filesystem::path(WINTERGREEN_REPO_ROOT) / "resources" / kFontAsset).string();
 
-    static const std::string fonts_dir = (std::filesystem::path(WINTERGREEN_SD_DIR) / "fonts").string();
-
-    std::string path = custom_font;
-    if (path.empty()) {
-      path = fonts_dir + "/Literata.mfb";
-    } else {
-      // Map built-in name from ESP32 to local .mfb file
-      if (path == "Literata")
-        path = "Literata.mfb";
-
-      // Allow relative paths inside sd/fonts/ for testing,
-      // or absolute paths if provided.
-      if (!std::filesystem::exists(path) && path.find('/') == std::string::npos) {
-        path = fonts_dir + "/" + path;
-      }
+    const std::vector<uint8_t> packed = load_file(path.c_str());
+    if (packed.size() < 4) {
+      fprintf(stderr, "[font] cannot read %s\n", path.c_str());
+      return;
     }
 
-    std::vector<uint8_t> new_bundle = load_file(path.c_str());
-    if (!new_bundle.empty()) {
-      bundle_data_ = std::move(new_bundle);
+    const uint32_t raw_size = static_cast<uint32_t>(packed[0]) | (static_cast<uint32_t>(packed[1]) << 8) |
+                              (static_cast<uint32_t>(packed[2]) << 16) | (static_cast<uint32_t>(packed[3]) << 24);
+    bundle_data_.assign(raw_size, 0);
+    mz_ulong out_len = raw_size;
+    if (mz_uncompress(bundle_data_.data(), &out_len, packed.data() + 4,
+                      static_cast<mz_ulong>(packed.size() - 4)) != MZ_OK ||
+        out_len != raw_size) {
+      fprintf(stderr, "[font] failed to decompress %s\n", path.c_str());
+      bundle_data_.clear();
+      return;
+    }
 
-      // Clear fonts first
-      for (int i = 0; i < wintergreen::kMaxFontSizes; i++) {
-        prop_fonts_[i] = wintergreen::BitmapFont();
-      }
-      font_set_ = wintergreen::BitmapFontSet();
-      num_fonts_ = 0;
-
-      if (load_bundle(bundle_data_.data(), bundle_data_.size())) {
-        printf("[font] Loaded bundle: %s (%zu bytes)\n", path.c_str(), bundle_data_.size());
-        app_.set_installed_font_path(custom_font);
-        currently_loaded_path_ = custom_font;
-        app_.set_reader_font(font_set());
-      } else {
-        printf("[font] Invalid bundle file: %s\n", path.c_str());
-      }
-    } else {
-      printf("[font] Could not load bundle file: %s\n", path.c_str());
+    if (load_bundle(bundle_data_.data(), bundle_data_.size())) {
+      printf("[font] Loaded %s (%u bytes)\n", kFontAsset, static_cast<unsigned>(bundle_data_.size()));
+      app_.set_reader_font(font_set());
     }
   }
 
  private:
   wintergreen::Application& app_;
   std::vector<uint8_t> bundle_data_;
-  std::string currently_loaded_path_;
 };
 
 int main() {
@@ -106,8 +96,6 @@ int main() {
 
     // Data directory for converted books, settings, reading state.
     static std::string data_path = (std::filesystem::absolute(WINTERGREEN_SD_DIR) / ".wintergreen").string();
-    std::filesystem::create_directories(data_path + "/cache");
-    std::filesystem::create_directories(data_path + "/data");
     app.set_data_dir(data_path.c_str());
 
     DesktopFontManager font_mgr(app);

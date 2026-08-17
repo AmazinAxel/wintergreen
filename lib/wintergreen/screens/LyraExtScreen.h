@@ -8,9 +8,12 @@
 
 namespace wintergreen {
 
-// Home-screen theme for Lyra Extended Like.
-// Shows up to 3 recent books (covers + titles) and nav items.
-// Long-press back → Hidden Books; short press → no-op.
+// Home screen: a carousel of the most recently opened books.
+//
+// One book at a time — large cover, title and author, and a row of dots showing
+// where it sits among the recents. Up/Down move between them, Select opens the
+// book, Back opens the full book list (there is no separate Recents screen), and
+// a long Back press opens Hidden Books.
 class LyraExtScreen final : public ListMenuScreen {
  public:
   LyraExtScreen() = default;
@@ -28,30 +31,32 @@ class LyraExtScreen final : public ListMenuScreen {
   void on_back() override {}
 
  private:
-  static constexpr int kMaxBooks = 3;
+  static constexpr int kMaxBooks = 5;
 
   struct BookSlot {
     std::string path;
     std::string title;
-    std::vector<uint8_t> cover_data;
-    uint16_t cover_w = 0, cover_h = 0;
-    bool cover_loaded = false;
-    bool cover_needs_extract = false;
+    std::string author;
     std::string bin_path;
   };
 
   BookSlot slots_[kMaxBooks];
   int num_books_ = 0;
 
-  int idx_books_[kMaxBooks]  = {-1, -1, -1};
-  int idx_all_books_         = -1;
-  int idx_recent_books_      = -1;
+  // Cover of the selected book only — loaded on demand from draw_all_(), so it
+  // is ready in the same frame the selection changes.
+  mutable std::vector<uint8_t> cover_data_;
+  mutable uint16_t cover_w_ = 0, cover_h_ = 0;
+  mutable int cover_slot_ = -1;  // slot cover_data_ belongs to; -1 = nothing loaded
 
-  static constexpr int kHiddenHoldFrames = 15;
+  BitmapFont author_font_;
+
+  static constexpr int kHiddenHoldFrames = 60;  // ~1.5 s at a 25 ms frame
   int  back_hold_frames_ = 0;
   bool back_was_down_    = false;
 
-  void load_cover_(int slot_idx);
+  // Scales the slot's cover into a box_w × box_h box, preserving aspect.
+  void load_cover_(int slot_idx, int box_w, int box_h) const;
 };
 
 }  // namespace wintergreen

@@ -17,22 +17,6 @@ namespace fs = std::filesystem;
 
 namespace wintergreen {
 
-// Returns a view into `path` pointing at the bare filename without extension.
-static std::string_view filename_sv(const std::string& path) {
-  const char* name = path.c_str();
-  const char* sep = std::strrchr(name, '/');
-#ifdef _WIN32
-  const char* bsep = std::strrchr(name, '\\');
-  if (bsep && (!sep || bsep > sep))
-    sep = bsep;
-#endif
-  if (sep)
-    name = sep + 1;
-  const char* dot = std::strrchr(name, '.');
-  size_t len = dot ? static_cast<size_t>(dot - name) : std::strlen(name);
-  return {name, len};
-}
-
 static bool ci_less(std::string_view a, std::string_view b) {
   size_t min_len = std::min(a.size(), b.size());
 #ifdef _WIN32
@@ -54,7 +38,12 @@ void MainMenu::on_start() {
 
   std::string index_path = std::string(app_->data_dir_) + "/book_index.dat";
 
-  if (BookIndex::instance().load(index_path)) {
+  // An index that parses but holds no books is not a useful cached result — it
+  // is indistinguishable from "never scanned". Treating it as authoritative is
+  // a trap: the card gets books added, the empty index still loads fine, and
+  // nothing ever rescans, so the library stays permanently empty.
+  const bool loaded = BookIndex::instance().load(index_path);
+  if (loaded && !BookIndex::instance().entries().empty()) {
     populate_list_();
     needs_scan_ = false;
   } else {
@@ -118,19 +107,15 @@ void MainMenu::update(const ButtonState& buttons, DrawBuffer& buf, IRuntime& run
 void MainMenu::on_select(int index) {
   if (is_separator(index)) return;
   int real = entries_index_for(index);
-  last_selected_path_ = entries_[real].path;
   app_->record_book_opened(entries_[real].path);
-  app_->ensure_cover_bin(entries_[real].path);
   app_->reader()->set_path(entries_[real].path.c_str());
   app_->push_screen(ScreenId::Reader);
 }
 
 void MainMenu::stop() {
   const std::string& cur = current_book_path();
-  if (!cur.empty()) {
+  if (!cur.empty())
     initial_selection_ = cur;
-    last_selected_path_ = cur;
-  }
 
   { std::vector<BookEntry> tmp; entries_.swap(tmp); }
   free_items_storage();
@@ -204,28 +189,6 @@ std::string MainMenu::wintergreen_header_left() const {
   return buf;
 }
 
-std::string_view MainMenu::get_item_right(int index) const {
-  if (is_separator(index)) return {};
-  int real = entries_index_for(index);
-  if (real < 0 || real >= static_cast<int>(entries_.size())) return {};
-  const BookEntry& e = entries_[real];
-
-  if (e.read_time_ms >= 60000) {
-    const uint64_t total_min = e.read_time_ms / 60000;
-    const unsigned hours = static_cast<unsigned>(total_min / 60);
-    const unsigned mins  = static_cast<unsigned>(total_min % 60);
-    char tbuf[16];
-    if (hours > 0)
-      std::snprintf(tbuf, sizeof(tbuf), "%uh %um", hours, mins);
-    else
-      std::snprintf(tbuf, sizeof(tbuf), "%um", mins);
-    right_buf_ = tbuf;
-  } else {
-    right_buf_ = "\xe2\x80\x93";  // en dash –
-  }
-  return right_buf_;
-}
-
 void MainMenu::populate_list_() {
   clear_items();
   entries_.clear();
@@ -240,16 +203,19 @@ void MainMenu::populate_list_() {
     e.title_ref = idx.title;
     e.author_ref = idx.author;
     e.last_open_order = idx.last_open_order;
-    e.read_time_ms = idx.read_time_ms;
     if (check_mrb) {
-      const char* name = e.path.c_str();
-      const char* sep = std::strrchr(name, '/');
-      if (sep) name = sep + 1;
-      const char* dot = std::strrchr(name, '.');
-      std::string stem(name, dot ? static_cast<size_t>(dot - name) : std::strlen(name));
-      std::string mrb_path = std::string(app_->data_dir_) + "/cache/" + stem + "/book.mrb";
-      FILE* mf = std::fopen(mrb_path.c_str(), "rb");
-      if (mf) { std::fclose(mf); e.mrb_exists = true; }
+      if (BookIndex::is_mrb_path(e.path.c_str())) {
+        e.mrb_exists = true;  // already converted — that is what the file is
+      } else {
+        const char* name = e.path.c_str();
+        const char* sep = std::strrchr(name, '/');
+        if (sep) name = sep + 1;
+        const char* dot = std::strrchr(name, '.');
+        std::string stem(name, dot ? static_cast<size_t>(dot - name) : std::strlen(name));
+        std::string mrb_path = std::string(app_->data_dir_) + "/cache/" + stem + "/book.mrb";
+        FILE* mf = std::fopen(mrb_path.c_str(), "rb");
+        if (mf) { std::fclose(mf); e.mrb_exists = true; }
+      }
     }
     entries_.push_back(std::move(e));
   }

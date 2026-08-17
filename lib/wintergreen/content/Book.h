@@ -1,5 +1,7 @@
 #pragma once
 
+#include "CoverPaths.h"
+
 #include <memory>
 #include <string>
 
@@ -34,8 +36,7 @@ class Book {
   // Uses ~15-20KB less RAM than full open().
   bool open_zip_only(const char* path);
 
-  // Release all resources (file handle, parsed EPUB data).
-  void close();
+  void close(); // release resources
 
   bool is_open() const {
     return file_open_;
@@ -55,7 +56,6 @@ class Book {
     return epub_.chapter_count();
   }
 
-  // Load a chapter by index (0-based).
   EpubError load_chapter(size_t index, Chapter& out);
 
   // Stream-parse a chapter: paragraphs emitted via callback, ~37KB working memory.
@@ -69,7 +69,6 @@ class Book {
   // work_buf: optional caller-provided scratch (>= ZipEntryInput::kMinWorkBufSize).
   //   On ESP32, pass queue.scratch_buf1() to avoid a 45 KB heap allocation.
   //   If nullptr (or too small), the buffer is heap-allocated internally.
-  // Returns UnsupportedFormat if images_enabled is false.
   ImageError decode_image(uint16_t entry_index, DecodedImage& out, uint16_t max_w = 0, uint16_t max_h = 0,
                           uint8_t* work_buf = nullptr, size_t work_buf_size = 0);
 
@@ -112,10 +111,8 @@ class Book {
 
 // Derive the cover.bin path for an epub file (small display thumbnail).
 // Returns: {data_dir}/cache/{epub_stem}/cover.bin
-std::string cover_bin_path(const char* epub_path, const char* data_dir);
 
 // Derive the cover_sleep.bin path for an epub file (full-res sleep screen).
 // Returns: {data_dir}/cache/{epub_stem}/cover_sleep.bin
-std::string cover_sleep_bin_path(const char* epub_path, const char* data_dir);
 
 }  // namespace wintergreen

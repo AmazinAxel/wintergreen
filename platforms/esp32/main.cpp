@@ -15,9 +15,7 @@
 #include "wintergreen/Application.h"
 #include "wintergreen/HeapLog.h"
 #include "wintergreen/Loop.h"
-#include "wintergreen/content/Book.h"
 #include "wintergreen/content/BookIndex.h"
-#include "wintergreen/content/mrb/MrbConverter.h"
 #include "wintergreen/display/DrawBuffer.h"
 #include "runtime.h"
 #include "sdcard.h"
@@ -42,7 +40,6 @@ static constexpr gpio_num_t kPowerPin = GPIO_NUM_3;
 static constexpr uint32_t kPowerWakeupMs = 250;
 
 static void verify_wakeup_press() {
-#ifndef QEMU_BUILD
   // If USB is connected (GPIO20/U0RXD reads HIGH), boot immediately.
   gpio_set_direction(GPIO_NUM_20, GPIO_MODE_INPUT);
   if (gpio_get_level(GPIO_NUM_20) == 1)
@@ -81,7 +78,6 @@ static void verify_wakeup_press() {
   ESP_LOGI("pwr", "Short press on wakeup (held %lu ms) â€” returning to sleep", (unsigned long)held_ms);
   esp_sleep_enable_gpio_wakeup_on_hp_periph_powerdown(1ULL << kPowerPin, ESP_GPIO_WAKEUP_GPIO_LOW);
   esp_deep_sleep_start();
-#endif
 }
 
 extern "C" void app_main(void) {
@@ -99,12 +95,10 @@ extern "C" void app_main(void) {
   static wintergreen::Application app;
   static wintergreen::DrawBuffer buf(epd);
 
-#ifndef QEMU_BUILD
   // After a software reset (post-flash) wait briefly for the serial monitor.
   if (esp_reset_reason() == ESP_RST_SW) {
     vTaskDelay(pdMS_TO_TICKS(3000));
   }
-#endif
 
   // --- Memory audit: log heap at every stage ---
   ESP_LOGI("mem", "after static init (DrawBuffer+App etc): free=%lu largest=%lu",
@@ -112,14 +106,10 @@ extern "C" void app_main(void) {
 
   MR_LOGI("app", "Booting up...");
 
-#ifndef QEMU_BUILD
   epd.begin();
 
   ESP_LOGI("mem", "after epd.begin: free=%lu largest=%lu", (unsigned long)esp_get_free_heap_size(),
            (unsigned long)heap_caps_get_largest_free_block(MALLOC_CAP_8BIT));
-#else
-  ESP_LOGI("app", "QEMU build: skipping epd.begin()");
-#endif
 
   // Mount SD card (shares SPI bus with display).
   if (sd_init()) {
@@ -130,8 +120,6 @@ extern "C" void app_main(void) {
 
     // Data directory for converted books, settings, reading state.
     mkdir("/sdcard/.wintergreen", 0775);
-    mkdir("/sdcard/.wintergreen/cache", 0775);
-    mkdir("/sdcard/.wintergreen/data", 0775);
 
     // Register the books directory for the selection screen.
     app.set_books_dir("/sdcard");
@@ -152,8 +140,6 @@ extern "C" void app_main(void) {
   ESP_LOGI("mem", "after font init: free=%lu largest=%lu", (unsigned long)esp_get_free_heap_size(),
            (unsigned long)heap_caps_get_largest_free_block(MALLOC_CAP_8BIT));
 
-  app.set_invalidate_font_fn([]() { FontPartition::invalidate(); });
-
   app.start(buf, runtime);
 
   ESP_LOGI("mem", "after app.start: free=%lu largest=%lu", (unsigned long)esp_get_free_heap_size(),
@@ -164,16 +150,8 @@ extern "C" void app_main(void) {
 
   while (runtime.should_continue() && app.running()) {
     // Suppress auto-sleep while a PC is connected over USB.
-#ifndef QEMU_BUILD
     if (usb_serial_jtag_is_connected()) {
       app.keep_awake();
-    }
-#endif
-
-    // Check if a new font was uploaded via serial.
-    if (g_font_uploaded) {
-      g_font_uploaded = false;
-      font_mgr.on_serial_upload();
     }
 
     // Process pending index mutation (upload via EPUB magic or 'W' command,
@@ -268,40 +246,10 @@ extern "C" void app_main(void) {
           // has its own buf.full_refresh() after auto_open_book returns).
           buf.refresh();
           break;
-        case SerialCmdType::Bench: {
-          wintergreen::Book book;
-          uint8_t* work_buf = buf.scratch_buf1();
-          uint8_t* xml_buf = buf.scratch_buf2();
-          int64_t t_open = esp_timer_get_time();
-          wintergreen::EpubError err = book.open(cmd_path, work_buf, xml_buf);
-          long open_ms = (long)((esp_timer_get_time() - t_open) / 1000);
-          ESP_LOGI("bench", "open() returned err %d", (int)err);
-          wintergreen::benchmark_epub_conversion(book, "/sdcard/bench_tmp.mrb", open_ms, work_buf, xml_buf);
-          buf.reset_after_scratch();
-          break;
-        }
-        case SerialCmdType::ImgBench: {
-          wintergreen::Book book;
-          book.open(cmd_path);
-          wintergreen::benchmark_image_size_read(book, buf.scratch_buf1());
-          buf.reset_after_scratch();
-          break;
-        }
-        case SerialCmdType::ImgDecode: {
-          wintergreen::Book book;
-          book.open(cmd_path);
-          wintergreen::benchmark_image_decode(book, buf.scratch_buf1());
-          buf.reset_after_scratch();
-          break;
-        }
         case SerialCmdType::FlashBench: {
           // Use scratch_buf1 (48 KB) as the write pattern buffer.
           FontPartition::bench_flash(buf.scratch_buf1(), wintergreen::DrawBuffer::kBufSize);
           buf.reset_after_scratch();
-          break;
-        }
-        case SerialCmdType::InvalidateFont: {
-          app.invalidate_font();
           break;
         }
         case SerialCmdType::RenderBench: {
@@ -328,9 +276,13 @@ extern "C" void app_main(void) {
 
   MR_LOGI("app", "Shutting down, entering deep sleep...");
 
-#ifndef QEMU_BUILD
+  // Hold-to-sleep leaves the power button still down, and the wake source is
+  // level-triggered on LOW — sleeping now would wake instantly. Wait for the
+  // release (bounded, in case the pin is stuck).
+  for (uint32_t waited = 0; waited < 5000 && gpio_get_level(kPowerPin) == 0; waited += 10)
+    vTaskDelay(pdMS_TO_TICKS(10));
+
   // Enter deep sleep; wake on power button press (active LOW, GPIO 3).
   esp_sleep_enable_gpio_wakeup_on_hp_periph_powerdown(1ULL << kPowerPin, ESP_GPIO_WAKEUP_GPIO_LOW);
   esp_deep_sleep_start();
-#endif  // QEMU_BUILD
 }

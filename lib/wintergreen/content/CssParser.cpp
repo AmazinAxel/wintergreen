@@ -688,41 +688,6 @@ void CssStylesheet::extend_from_mut_sheet(char* css, size_t length) {
   }
 }
 
-// Check if a whitespace-separated class string contains a specific class.
-static bool class_list_contains(const char* cls, const std::string& target) {
-  if (!cls || target.empty())
-    return false;
-  size_t tlen = target.size();
-  const char* p = cls;
-  while (*p) {
-    while (*p && std::isspace(static_cast<unsigned char>(*p)))
-      ++p;
-    const char* start = p;
-    while (*p && !std::isspace(static_cast<unsigned char>(*p)))
-      ++p;
-    size_t len = static_cast<size_t>(p - start);
-    if (len == tlen && std::memcmp(start, target.c_str(), len) == 0)
-      return true;
-  }
-  return false;
-}
-
-// Match a selector against element/id/class without allocating vectors.
-static bool selector_matches_raw(const CssStylesheet::Selector& sel, const char* element, const char* id,
-                                 const char* cls) {
-  if (!sel.element.empty() && (element == nullptr || sel.element != element))
-    return false;
-  if (!sel.id.empty()) {
-    if (id == nullptr || sel.id != id)
-      return false;
-  }
-  for (const auto& c : sel.classes) {
-    if (!class_list_contains(cls, c))
-      return false;
-  }
-  return true;
-}
-
 // Length-based class list check: does whitespace-separated cls contain target?
 static bool class_list_contains_n(const char* cls, size_t cls_len, const std::string& target) {
   if (!cls || cls_len == 0 || target.empty())

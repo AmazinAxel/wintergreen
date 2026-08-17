@@ -1,6 +1,7 @@
 #include "MrbReader.h"
 
 #include <cstring>
+#include <vector>
 
 namespace wintergreen {
 
@@ -25,36 +26,42 @@ bool MrbReader::open(const char* path) {
     close();
     return false;
   }
+  // Both tables are read in a single fread each and parsed from memory. One
+  // fread per entry costs a FATFS+SPI round trip apiece, and a long book has
+  // hundreds of chapters — this is the bulk of open() time.
   chapters_.resize(header_.chapter_count);
   if (header_.chapter_count > 0) {
+    std::vector<uint8_t> raw(static_cast<size_t>(header_.chapter_count) * 16);
     fseek(f_, static_cast<long>(header_.chapter_offset), SEEK_SET);
+    if (!read_bytes(raw.data(), raw.size())) {
+      close();
+      return false;
+    }
     for (uint16_t i = 0; i < header_.chapter_count; ++i) {
-      uint8_t buf[16];
-      if (!read_bytes(buf, 16)) {
-        close();
-        return false;
-      }
-      chapters_[i].para_table_offset = mrb_read_u32(buf);
-      chapters_[i].reserved = mrb_read_u32(buf + 4);
-      chapters_[i].paragraph_count = mrb_read_u16(buf + 8);
-      chapters_[i].reserved1 = mrb_read_u16(buf + 10);
-      chapters_[i].char_count = mrb_read_u32(buf + 12);
+      const uint8_t* b = raw.data() + static_cast<size_t>(i) * 16;
+      chapters_[i].para_table_offset = mrb_read_u32(b);
+      chapters_[i].reserved = mrb_read_u32(b + 4);
+      chapters_[i].paragraph_count = mrb_read_u16(b + 8);
+      chapters_[i].reserved1 = mrb_read_u16(b + 10);
+      chapters_[i].char_count = mrb_read_u32(b + 12);
     }
   }
 
   // Read image ref table
   images_.resize(header_.image_count);
   if (header_.image_count > 0) {
+    std::vector<uint8_t> raw(static_cast<size_t>(header_.image_count) * 12);
     fseek(f_, static_cast<long>(header_.image_offset), SEEK_SET);
+    if (!read_bytes(raw.data(), raw.size())) {
+      close();
+      return false;
+    }
     for (uint16_t i = 0; i < header_.image_count; ++i) {
-      uint8_t buf[8];
-      if (!read_bytes(buf, 8)) {
-        close();
-        return false;
-      }
-      images_[i].local_header_offset = mrb_read_u32(buf);
-      images_[i].width = mrb_read_u16(buf + 4);
-      images_[i].height = mrb_read_u16(buf + 6);
+      const uint8_t* b = raw.data() + static_cast<size_t>(i) * 12;
+      images_[i].data_offset = mrb_read_u32(b);
+      images_[i].data_size = mrb_read_u32(b + 4);
+      images_[i].width = mrb_read_u16(b + 8);
+      images_[i].height = mrb_read_u16(b + 10);
     }
   }
 
@@ -84,24 +91,11 @@ bool MrbReader::open(const char* path) {
     }
   }
 
-  // v9+: Read spine file table (chapter filename → index mapping for href resolution).
-  {
-    uint8_t sc_buf[2];
-    if (read_bytes(sc_buf, 2)) {
-      uint16_t spine_count = mrb_read_u16(sc_buf);
-      spine_files_.resize(spine_count);
-      for (uint16_t i = 0; i < spine_count; ++i)
-        spine_files_[i] = read_string();
-    }
-  }
-
-  // v10+: Read anchor table header (count only; entries are seeked on demand).
-  anchor_offset_ = header_.anchor_offset;
-  if (anchor_offset_ != 0) {
-    uint8_t ac_buf[2];
-    if (fseek(f_, static_cast<long>(anchor_offset_), SEEK_SET) == 0 && read_bytes(ac_buf, 2))
-      anchor_count_ = mrb_read_u16(ac_buf);
-  }
+  // The spine-filename and anchor tables that follow are NOT read. Both existed
+  // only to resolve hyperlinks, which are no longer parsed. Skipping the spine
+  // table also drops a std::string per chapter from RAM. Files still contain
+  // both sections; nothing after this point is read sequentially, so ignoring
+  // them is safe.
 
   return true;
 }
@@ -118,9 +112,6 @@ void MrbReader::close() {
   header_ = {};
   metadata_ = {};
   toc_ = {};
-  spine_files_.clear();
-  anchor_offset_ = 0;
-  anchor_count_ = 0;
 }
 
 uint32_t MrbReader::chapter_para_table_offset(uint16_t chapter_idx) const {
@@ -146,35 +137,6 @@ uint64_t MrbReader::total_char_count() const {
   for (const auto& ch : chapters_)
     total += ch.char_count;
   return total;
-}
-
-bool MrbReader::find_anchor(uint16_t chapter_idx, const char* fragment, size_t frag_len, uint16_t& para_idx) const {
-  if (!f_ || anchor_count_ == 0 || frag_len == 0 || frag_len > 255)
-    return false;
-
-  // Anchor table layout: [count:u16] then entries:
-  //   [chapter_idx:u16][para_idx:u16][id_len:u8][id_bytes]
-  // anchor_offset_ points to the count field; entries start 2 bytes later.
-  if (fseek(f_, static_cast<long>(anchor_offset_ + 2), SEEK_SET) != 0)
-    return false;
-
-  char id_buf[256];
-  for (uint16_t i = 0; i < anchor_count_; ++i) {
-    uint8_t hdr_buf[5];
-    if (fread(hdr_buf, 1, 5, f_) != 5)
-      return false;
-    uint16_t ch_idx = mrb_read_u16(hdr_buf);
-    uint16_t para = mrb_read_u16(hdr_buf + 2);
-    uint8_t id_len = hdr_buf[4];
-    if (fread(id_buf, 1, id_len, f_) != id_len)
-      return false;
-    if (ch_idx == chapter_idx && id_len == static_cast<uint8_t>(frag_len) &&
-        std::memcmp(id_buf, fragment, frag_len) == 0) {
-      para_idx = para;
-      return true;
-    }
-  }
-  return false;
 }
 
 MrbReader::LoadResult MrbReader::load_paragraph(uint32_t file_offset, Paragraph& out) {
@@ -335,7 +297,10 @@ bool MrbReader::deserialize_text(const uint8_t* data, size_t size, Paragraph& ou
     run.text.assign(reinterpret_cast<const char*>(data + pos), text_len);
     pos += text_len;
 
-    // v9+: href string follows text bytes when flags bit 0x02 is set.
+    // v9+: an href string follows the text bytes when flags bit 0x02 is set.
+    // Links are no longer parsed, but MRB caches written before that change
+    // still carry them, so the bytes must still be skipped or every run after
+    // this one would be misread.
     if (flags & 0x02) {
       if (pos + 2 > size)
         return false;
@@ -343,7 +308,6 @@ bool MrbReader::deserialize_text(const uint8_t* data, size_t size, Paragraph& ou
       pos += 2;
       if (pos + href_len > size)
         return false;
-      run.href.assign(reinterpret_cast<const char*>(data + pos), href_len);
       pos += href_len;
     }
   }

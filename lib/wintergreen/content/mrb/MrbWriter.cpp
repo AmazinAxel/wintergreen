@@ -148,6 +148,7 @@ void MrbWriter::close() {
   paragraph_count_ = 0;
   chapters_.clear();
   images_.clear();
+  image_data_.clear();
   in_chapter_ = false;
   chapter_para_count_ = 0;
   chapter_char_count_ = 0;
@@ -254,11 +255,17 @@ bool MrbWriter::write_paragraph(const Paragraph& para) {
 uint16_t MrbWriter::add_image_ref(uint32_t local_header_offset, uint16_t width, uint16_t height) {
   uint16_t idx = static_cast<uint16_t>(images_.size());
   MrbImageRef ref{};
-  ref.local_header_offset = local_header_offset;
+  (void)local_header_offset;  // v12: the EPUB offset is no longer persisted
   ref.width = width;
   ref.height = height;
   images_.push_back(ref);
+  image_data_.emplace_back();
   return idx;
+}
+
+void MrbWriter::set_image_data(uint16_t idx, std::vector<uint8_t>&& data) {
+  if (idx < image_data_.size())
+    image_data_[idx] = std::move(data);
 }
 
 void MrbWriter::update_image_size(uint16_t idx, uint16_t width, uint16_t height) {
@@ -301,14 +308,33 @@ bool MrbWriter::finish(const EpubMetadata& meta, const TableOfContents& toc,
       return false;
   }
 
-  // --- Write image ref table ---
+  // --- Write image blob, then the ref table that points into it ---
+  // Blob first so the refs can carry final offsets. The images are contiguous
+  // and in index order, and stored verbatim: the device seeks straight to the
+  // bytes with no inflate and no ZIP walk.
+  for (size_t i = 0; i < images_.size(); ++i) {
+    if (image_data_[i].empty()) {
+      images_[i].data_offset = 0;
+      images_[i].data_size = 0;
+      continue;
+    }
+    images_[i].data_offset = bw_.tell();
+    images_[i].data_size = static_cast<uint32_t>(image_data_[i].size());
+    if (!write_bytes(image_data_[i].data(), image_data_[i].size()))
+      return false;
+    // Free as we go — a book can carry several MB of images and the ESP32
+    // conversion path has no room to hold them all at once.
+    std::vector<uint8_t>().swap(image_data_[i]);
+  }
+
   uint32_t image_offset = bw_.tell();
   for (const auto& img : images_) {
-    uint8_t buf[8];
-    mrb_write_u32(buf, img.local_header_offset);
-    mrb_write_u16(buf + 4, img.width);
-    mrb_write_u16(buf + 6, img.height);
-    if (!write_bytes(buf, 8))
+    uint8_t buf[12];
+    mrb_write_u32(buf, img.data_offset);
+    mrb_write_u32(buf + 4, img.data_size);
+    mrb_write_u16(buf + 8, img.width);
+    mrb_write_u16(buf + 10, img.height);
+    if (!write_bytes(buf, 12))
       return false;
   }
 
@@ -421,8 +447,6 @@ bool MrbWriter::write_text_paragraph(const TextParagraph& meta, uint16_t spacing
   size_t body_size = kBodyHdrSize;
   for (size_t i = 0; i < run_count; ++i) {
     body_size += kRunHdrSize + runs[i].text.size();
-    if (!runs[i].href.empty())
-      body_size += 2 + runs[i].href.size();
   }
 
   // Write outer header: [type(1)][body_size(4)]
@@ -472,10 +496,8 @@ bool MrbWriter::write_text_paragraph(const TextParagraph& meta, uint16_t spacing
     rhdr[0] = static_cast<uint8_t>(run.style);
     rhdr[1] = run.size_pct;
     rhdr[2] = static_cast<uint8_t>(run.vertical_align);
-    uint8_t flags = run.breaking ? 0x01 : 0x00;
-    if (!run.href.empty())
-      flags |= 0x02;
-    rhdr[3] = flags;
+    // Bit 0x02 (href present) is never set: links are not parsed.
+    rhdr[3] = run.breaking ? 0x01 : 0x00;
     mrb_write_u16(rhdr + 4, run.margin_left);
     mrb_write_u16(rhdr + 6, run.margin_right);
     mrb_write_u32(rhdr + 8, static_cast<uint32_t>(run.text.size()));
@@ -483,14 +505,6 @@ bool MrbWriter::write_text_paragraph(const TextParagraph& meta, uint16_t spacing
       return false;
     if (!run.text.empty() && !write_bytes(run.text.data(), run.text.size()))
       return false;
-    if (!run.href.empty()) {
-      uint8_t hlen[2];
-      mrb_write_u16(hlen, static_cast<uint16_t>(run.href.size()));
-      if (!write_bytes(hlen, 2))
-        return false;
-      if (!write_bytes(run.href.data(), run.href.size()))
-        return false;
-    }
   }
 
   ++chapter_para_count_;

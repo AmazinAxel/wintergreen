@@ -6,6 +6,7 @@
 #include <string>
 
 #include "../Application.h"
+#include "../content/BookIndex.h"
 
 #ifdef ESP_PLATFORM
 #include <dirent.h>
@@ -92,10 +93,14 @@ void HiddenBooksMenu::on_start() {
   for (const auto& p : paths_) {
     std::string label;
     if (check_mrb) {
-      std::string s = path_stem(p);
-      std::string mrb = std::string(app_->data_dir_) + "/cache/" + s + "/book.mrb";
-      FILE* f = std::fopen(mrb.c_str(), "rb");
-      if (f) { std::fclose(f); label = "* "; }
+      if (BookIndex::is_mrb_path(p.c_str())) {
+        label = "* ";  // already converted — that is what the file is
+      } else {
+        std::string s = path_stem(p);
+        std::string mrb = std::string(app_->data_dir_) + "/cache/" + s + "/book.mrb";
+        FILE* f = std::fopen(mrb.c_str(), "rb");
+        if (f) { std::fclose(f); label = "* "; }
+      }
     }
     label += path_stem(p);
     add_item(label);
@@ -105,7 +110,6 @@ void HiddenBooksMenu::on_start() {
 void HiddenBooksMenu::on_select(int index) {
   if (paths_.empty() || index < 0 || index >= static_cast<int>(paths_.size()))
     return;
-  app_->ensure_cover_bin(paths_[index]);
   app_->reader()->set_path(paths_[index]);
   app_->push_screen(ScreenId::Reader);
 }

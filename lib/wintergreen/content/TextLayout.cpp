@@ -246,18 +246,11 @@ static std::vector<LayoutLine> layout_para_lines(const IFont& font, const Layout
   const uint16_t max_width = opts.width;
   const uint16_t space_width = font.char_width(' ', FontStyle::Regular);
 
-  Alignment align = para.alignment.value_or(Alignment::Start);
-  if (opts.align_override.has_value()) {
-    // Structural alignments (Center/End) from the book should not be overridden by normal body text settings
-    // (Left/Justify)
-    if (opts.align_override.value() == Alignment::Start || opts.align_override.value() == Alignment::Justify) {
-      if (align != Alignment::Center && align != Alignment::End) {
-        align = opts.align_override.value();
-      }
-    } else {
-      align = opts.align_override.value();  // Force Center or Right on everything if the user explicitly chose that
-    }
-  }
+  // Alignment always comes from the book's own CSS — there is no user override.
+  // When the book says nothing, justify: that is the convention for body text,
+  // and align_line() leaves the last line of each paragraph ragged anyway, so a
+  // one-line paragraph (a bare heading, say) is unaffected.
+  const Alignment align = para.alignment.value_or(Alignment::Justify);
 
   const int16_t indent = para.indent.value_or(0);
 
@@ -288,10 +281,9 @@ static std::vector<LayoutLine> layout_para_lines(const IFont& font, const Layout
   };
 
   for (const auto& run : para.runs) {
-    uint8_t eff_size_pct = opts.override_publisher_fonts ? 100 : run.size_pct;
+    uint8_t eff_size_pct = run.size_pct;
     const char* text = run.text.c_str();
     const size_t text_len = run.text.size();
-    const char* run_href = run.href.empty() ? nullptr : run.href.c_str();
     const uint16_t line_width = (run.margin_right < max_width) ? (max_width - run.margin_right) : max_width;
     cur_line_width = line_width;
 
@@ -346,7 +338,6 @@ static std::vector<LayoutLine> layout_para_lines(const IFont& font, const Layout
             x += space_width;
           current.words.push_back(LayoutWord{word_ptr, word_len, x, run.style, eff_size_pct, run.vertical_align,
                                              !needs_space && !current.words.empty()});
-          current.words.back().href = run_href;
           x += word_w;
           break;
         }
@@ -381,11 +372,9 @@ static std::vector<LayoutLine> layout_para_lines(const IFont& font, const Layout
               x += space_width;
             current.words.push_back(LayoutWord{word_ptr, static_cast<uint16_t>(split), x, run.style, eff_size_pct,
                                                run.vertical_align, false});
-            current.words.back().href = run_href;
             x += prefix_w;
             if (!prefix_has_hyphen) {
               current.words.push_back(LayoutWord{"-", 1, x, run.style, eff_size_pct, run.vertical_align, true});
-              current.words.back().href = run_href;
               x += hyphen_w;
             }
             current.hyphenated = true;
@@ -407,7 +396,6 @@ static std::vector<LayoutLine> layout_para_lines(const IFont& font, const Layout
           // No hyphenation and line is empty — force placement to avoid infinite loop.
           current.words.push_back(
               LayoutWord{word_ptr, word_len, x, run.style, eff_size_pct, run.vertical_align, false});
-          current.words.back().href = run_href;
           x += word_w;
           break;
         }
@@ -573,8 +561,6 @@ const TextLayout::LaidOutParagraph& TextLayout::get_laid_out_(size_t pi) const {
       slot.inline_img = img;
       LayoutOptions lo;
       lo.width = cw;
-      lo.align_override = opts.align_override;
-      lo.override_publisher_fonts = opts.override_publisher_fonts;
       if (img.has_image && img.width > 0 && img.height > 0 && !img.promoted)
         lo.first_line_extra_indent = img.width + 4;
 #ifdef ESP_PLATFORM
@@ -590,9 +576,7 @@ const TextLayout::LaidOutParagraph& TextLayout::get_laid_out_(size_t pi) const {
       slot.line_heights.resize(slot.lines.size());
       slot.line_baselines.resize(slot.lines.size());
       for (size_t i = 0; i < slot.lines.size(); ++i) {
-        uint16_t pct =
-            opts.line_height_multiplier_percent != 0 ? opts.line_height_multiplier_percent : para.text.line_height_pct;
-        slot.line_heights[i] = compute_line_height(font, slot.lines[i], pct);
+        slot.line_heights[i] = compute_line_height(font, slot.lines[i], para.text.line_height_pct);
         uint16_t bl = line_baseline(font, slot.lines[i]);
         // Clamp baseline to the line height so pending_desc = height - baseline never underflows.
         slot.line_baselines[i] = std::min(bl, slot.line_heights[i]);

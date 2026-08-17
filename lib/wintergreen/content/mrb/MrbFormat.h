@@ -31,7 +31,7 @@ namespace wintergreen {
 // ---------------------------------------------------------------------------
 
 static constexpr uint8_t kMrbMagic[4] = {'M', 'R', 'B', '1'};
-static constexpr uint16_t kMrbVersion = 11;  // v11: large paragraphs split at conversion time (≤4KB text each)
+static constexpr uint16_t kMrbVersion = 12;  // v12: image bytes embedded in the MRB (no EPUB needed at runtime)
 
 // ---------------------------------------------------------------------------
 // Header (32 bytes, fixed)
@@ -68,12 +68,16 @@ static_assert(sizeof(MrbChapterEntry) == 16, "MrbChapterEntry must be 16 bytes")
 // Image reference entry (8 bytes each)
 // ---------------------------------------------------------------------------
 
+// v12+: image bytes live in the MRB itself, stored verbatim (already-compressed
+// JPEG/PNG), so the device needs neither the EPUB nor an inflate pass to draw
+// them. data_offset/data_size address the blob section directly.
 struct MrbImageRef {
-  uint32_t local_header_offset;  // offset to local file header in EPUB ZIP
+  uint32_t data_offset;  // offset of the image bytes within this MRB
+  uint32_t data_size;    // length of those bytes
   uint16_t width;
   uint16_t height;
 };
-static_assert(sizeof(MrbImageRef) == 8, "MrbImageRef must be 8 bytes");
+static_assert(sizeof(MrbImageRef) == 12, "MrbImageRef must be 12 bytes");
 
 // ---------------------------------------------------------------------------
 // Paragraph type tags (match ParagraphType enum values)

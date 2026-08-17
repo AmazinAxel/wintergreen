@@ -75,9 +75,17 @@ class MrbWriter {
   // Call after writing all paragraphs for a chapter.
   void end_chapter();
 
-  // Add an image reference (dimensions pre-resolved from EPUB).
-  // Returns the image index to use in paragraph image refs.
+  // Add an image reference. Returns the index to use in paragraph image refs.
+  // The bytes themselves are attached later with set_image_data(), once the
+  // whole EPUB entry has been read.
   uint16_t add_image_ref(uint32_t local_header_offset, uint16_t width, uint16_t height);
+
+  // Store `size` bytes of already-compressed image data (JPEG/PNG exactly as it
+  // appeared in the EPUB) for image `idx`, to be emitted into the blob section.
+  void set_image_data(uint16_t idx, std::vector<uint8_t>&& data);
+  bool image_has_data(uint16_t idx) const {
+    return idx < image_data_.size() && !image_data_[idx].empty();
+  }
 
   // Update the size of an existing image ref (used by MRB converter after
   // lazy resolution).  No-op if idx is out of range.
@@ -101,6 +109,7 @@ class MrbWriter {
   uint32_t paragraph_count_ = 0;
   std::vector<MrbChapterEntry> chapters_;
   std::vector<MrbImageRef> images_;
+  std::vector<std::vector<uint8_t>> image_data_;  // parallel to images_
   bool in_chapter_ = false;
 
   // Per-chapter state

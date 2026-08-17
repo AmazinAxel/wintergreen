@@ -72,13 +72,8 @@ class MrbReader {
   const TableOfContents& toc() const {
     return toc_;
   }
-  const std::vector<std::string>& spine_files() const {
-    return spine_files_;
-  }
 
-  // Find the paragraph index for a fragment anchor (element id) within a chapter.
   // Returns true and sets para_idx if found; returns false if not found.
-  bool find_anchor(uint16_t chapter_idx, const char* fragment, size_t frag_len, uint16_t& para_idx) const;
 
  private:
   FILE* f_ = nullptr;
@@ -87,9 +82,6 @@ class MrbReader {
   std::vector<MrbImageRef> images_;
   EpubMetadata metadata_;
   TableOfContents toc_;
-  std::vector<std::string> spine_files_;
-  uint32_t anchor_offset_ = 0;  // file offset of anchor table
-  uint16_t anchor_count_ = 0;   // number of anchor entries
 
   bool read_bytes(void* buf, size_t size);
   bool read_at(uint32_t offset, void* buf, size_t size);
@@ -212,16 +204,16 @@ class MrbChapterSource : public IParagraphSource {
 // Scales to fit max_w preserving aspect ratio. Results are cached.
 // Mirrors the logic in ReaderScreen::resolve_image_size_().
 // ---------------------------------------------------------------------------
-inline ImageSizeQuery make_image_size_query(const MrbReader& mrb, const std::string& epub_path, uint16_t max_w) {
+inline ImageSizeQuery make_image_size_query(const MrbReader& mrb, const std::string& mrb_path, uint16_t max_w) {
   struct Cache {
     std::vector<uint16_t> w, h;
     const MrbReader* mrb;
-    std::string epub_path;
+    std::string mrb_path;
     uint16_t max_w;
   };
   auto cache = std::make_shared<Cache>();
   cache->mrb = &mrb;
-  cache->epub_path = epub_path;
+  cache->mrb_path = mrb_path;
   cache->max_w = max_w;
   cache->w.assign(mrb.image_count(), 0);
   cache->h.assign(mrb.image_count(), 0);
@@ -237,12 +229,19 @@ inline ImageSizeQuery make_image_size_query(const MrbReader& mrb, const std::str
     const auto& ref = cache->mrb->image_ref(key);
     uint16_t src_w = ref.width, src_h = ref.height;
     if (src_w == 0 || src_h == 0) {
+      // v12: sniff the dimensions out of the blob embedded in the MRB. Same
+      // trick as ReaderScreen — describe it as a stored ZIP entry so the
+      // existing streaming reader works with no inflate and no EPUB.
+      if (ref.data_offset == 0 || ref.data_size == 0)
+        return false;
       StdioZipFile file;
-      if (!file.open(cache->epub_path.c_str()))
+      if (!file.open(cache->mrb_path.c_str()))
         return false;
       ZipEntry entry;
-      if (ZipReader::read_local_entry(file, ref.local_header_offset, entry) != ZipError::Ok)
-        return false;
+      entry.compression = 0;
+      entry.data_offset = ref.data_offset;
+      entry.compressed_size = ref.data_size;
+      entry.uncompressed_size = ref.data_size;
       uint8_t small_buf[256];
       ZipEntryInput inp;
       std::unique_ptr<uint8_t[]> heap_buf;

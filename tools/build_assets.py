@@ -21,10 +21,12 @@ import struct
 import sys
 import zlib
 
+FONT_ASSET = "AtkinsonHyperlegible.bin"
+
 # (manifest_name, source_path_relative_to_project_dir)
 DEFAULT_ASSETS = [
-    ("Literata.bin", "resources/fonts/Literata.bin"),
-    ("sleep_0.mgr", "resources/sleep/sleep_0.mgr"),
+    (FONT_ASSET, f"resources/{FONT_ASSET}"),
+    ("sleep.mgr", "resources/sleep.mgr"),
 ]
 
 NAME_LEN = 32

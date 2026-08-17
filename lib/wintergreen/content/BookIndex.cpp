@@ -1,5 +1,6 @@
 #include "BookIndex.h"
 
+#include <algorithm>
 #include <cctype>
 #include <cstdio>
 #include <cstring>
@@ -10,7 +11,7 @@
 
 #include "../HeapLog.h"
 #include "../display/DrawBuffer.h"
-#include "Book.h"
+#include "mrb/MrbReader.h"
 
 #ifdef ESP_PLATFORM
 #include <dirent.h>
@@ -33,24 +34,51 @@ BookIndex& BookIndex::instance() {
   return instance;
 }
 
+// Case-insensitive suffix test.
+static bool ends_with_ci(const char* name, size_t name_len, const char* ext, size_t ext_len) {
+  if (name_len <= ext_len)
+    return false;
+  const char* p = name + name_len - ext_len;
+  for (size_t i = 0; i < ext_len; ++i)
+    if (std::tolower(static_cast<unsigned char>(p[i])) != ext[i])
+      return false;
+  return true;
+}
+
+// A book is a .mrb produced by tools/epub2mrb. EPUBs are not recognised: the
+// device has no converter, so listing one would only offer a book that cannot
+// be opened.
+static bool has_book_extension(const char* name, size_t name_len) {
+  return ends_with_ci(name, name_len, ".mrb", 4);
+}
+
+// Name of the directory containing `path`, used as a title fallback.
+static std::string folder_name_of(const std::string& path) {
+  const size_t last = path.find_last_of('/');
+  if (last == std::string::npos || last == 0)
+    return path;
+  const size_t prev = path.find_last_of('/', last - 1);
+  return path.substr(prev == std::string::npos ? 0 : prev + 1, last - (prev == std::string::npos ? 0 : prev + 1));
+}
+
+bool BookIndex::is_mrb_path(const char* path) {
+  if (!path)
+    return false;
+  const char* slash = std::strrchr(path, '/');
+  const char* name = slash ? slash + 1 : path;
+  return ends_with_ci(name, std::strlen(name), ".mrb", 4);
+}
+
 bool BookIndex::is_book_path(const char* path) {
   if (!path) return false;
   const char* slash = std::strrchr(path, '/');
   const char* name = slash ? slash + 1 : path;
   const size_t name_len = std::strlen(name);
-  if (name_len <= 5) return false;
-  const char* ext = name + name_len - 5;
-  char ext_lower[5];
-  for (int i = 0; i < 5; ++i)
-    ext_lower[i] = static_cast<char>(std::tolower(static_cast<unsigned char>(ext[i])));
-  return std::memcmp(ext_lower, ".epub", 5) == 0;
+  return has_book_extension(name, name_len);
 }
 
 bool BookIndex::add_entry(std::string_view path, std::string_view title, std::string_view author,
-                          uint32_t last_open_order, uint64_t read_time_ms,
-                          uint32_t times_opened, uint32_t page_turns,
-                          uint16_t progress_pct, uint16_t chapter_count, uint64_t time_left_ms,
-                          uint32_t total_chars) {
+                          uint32_t last_open_order) {
   if (static_cast<int>(entries_.size()) >= MAX_BOOKS)
     return false;
   BookIndexEntry entry;
@@ -58,13 +86,6 @@ bool BookIndex::add_entry(std::string_view path, std::string_view title, std::st
   entry.title = pool_.add(title);
   entry.author = pool_.add(author);
   entry.last_open_order = last_open_order;
-  entry.read_time_ms = read_time_ms;
-  entry.times_opened = times_opened;
-  entry.page_turns = page_turns;
-  entry.progress_pct = progress_pct;
-  entry.chapter_count = chapter_count;
-  entry.time_left_ms = time_left_ms;
-  entry.total_chars = total_chars;
   entries_.push_back(entry);
   return true;
 }
@@ -114,57 +135,16 @@ bool BookIndex::load(const std::string& index_file) {
       continue;
     *sep2 = '\0';
 
-    // Optional fields 4-11: last_open_order, read_time_ms, times_opened, page_turns,
-    //                        progress_pct, chapter_count, time_left_ms, total_chars
+    // Optional field 4: last_open_order. Older files appended reading statistics
+    // after it; those are no longer tracked, and strtoul stops at the separator
+    // so the extra columns are simply ignored.
     uint32_t order = 0;
-    uint64_t read_time_ms = 0;
-    uint32_t times_opened = 0;
-    uint32_t page_turns = 0;
-    uint16_t progress_pct = 0;
-    uint16_t chapter_count = 0;
-    uint64_t time_left_ms = 0;
-    uint32_t total_chars = 0;
     char* sep3 = std::strchr(sep2 + 1, '|');
     if (sep3) {
       *sep3 = '\0';
       order = static_cast<uint32_t>(std::strtoul(sep3 + 1, nullptr, 10));
-      char* sep4 = std::strchr(sep3 + 1, '|');
-      if (sep4) {
-        *sep4 = '\0';
-        read_time_ms = static_cast<uint64_t>(std::strtoull(sep4 + 1, nullptr, 10));
-        char* sep5 = std::strchr(sep4 + 1, '|');
-        if (sep5) {
-          *sep5 = '\0';
-          times_opened = static_cast<uint32_t>(std::strtoul(sep5 + 1, nullptr, 10));
-          char* sep6 = std::strchr(sep5 + 1, '|');
-          if (sep6) {
-            *sep6 = '\0';
-            page_turns = static_cast<uint32_t>(std::strtoul(sep6 + 1, nullptr, 10));
-            char* sep7 = std::strchr(sep6 + 1, '|');
-            if (sep7) {
-              *sep7 = '\0';
-              progress_pct = static_cast<uint16_t>(std::strtoul(sep7 + 1, nullptr, 10));
-              char* sep8 = std::strchr(sep7 + 1, '|');
-              if (sep8) {
-                *sep8 = '\0';
-                chapter_count = static_cast<uint16_t>(std::strtoul(sep8 + 1, nullptr, 10));
-                char* sep9 = std::strchr(sep8 + 1, '|');
-                if (sep9) {
-                  *sep9 = '\0';
-                  time_left_ms = static_cast<uint64_t>(std::strtoull(sep9 + 1, nullptr, 10));
-                  char* sep10 = std::strchr(sep9 + 1, '|');
-                  if (sep10) {
-                    total_chars = static_cast<uint32_t>(std::strtoul(sep10 + 1, nullptr, 10));
-                  }
-                }
-              }
-            }
-          }
-        }
-      }
     }
-    add_entry(line, sep1 + 1, sep2 + 1, order, read_time_ms, times_opened, page_turns,
-              progress_pct, chapter_count, time_left_ms, total_chars);
+    add_entry(line, sep1 + 1, sep2 + 1, order);
   }
 
   std::fclose(f);
@@ -185,18 +165,11 @@ bool BookIndex::save(const std::string& index_file) const {
     auto path_v = entry.path.view(pool_);
     auto title_v = entry.title.view(pool_);
     auto author_v = entry.author.view(pool_);
-    std::fprintf(f, "%.*s|%.*s|%.*s|%u|%llu|%u|%u|%u|%u|%llu|%u\n",
+    std::fprintf(f, "%.*s|%.*s|%.*s|%u\n",
                  static_cast<int>(path_v.size()), path_v.data(),
                  static_cast<int>(title_v.size()), title_v.data(),
                  static_cast<int>(author_v.size()), author_v.data(),
-                 static_cast<unsigned>(entry.last_open_order),
-                 static_cast<unsigned long long>(entry.read_time_ms),
-                 static_cast<unsigned>(entry.times_opened),
-                 static_cast<unsigned>(entry.page_turns),
-                 static_cast<unsigned>(entry.progress_pct),
-                 static_cast<unsigned>(entry.chapter_count),
-                 static_cast<unsigned long long>(entry.time_left_ms),
-                 static_cast<unsigned>(entry.total_chars));
+                 static_cast<unsigned>(entry.last_open_order));
   }
 
   if (std::fclose(f) != 0) {
@@ -206,6 +179,9 @@ bool BookIndex::save(const std::string& index_file) const {
 
   // Atomic replace — no backup copies. The index is rebuildable from the books
   // on the SD card, and rename() already prevents a half-written file.
+  // See Application::save_settings_: FatFs rename does not replace an existing
+  // destination, so it must be removed first.
+  std::remove(index_file.c_str());
   std::rename(tmp_path.c_str(), index_file.c_str());
   return true;
 }
@@ -226,16 +202,26 @@ void BookIndex::ensure_loaded_(const std::string& index_path) {
 }
 
 bool BookIndex::index_file(const std::string& path, const std::string& index_path, DrawBuffer& buf) {
-  Book book;
-  if (book.open(path.c_str(), buf.scratch_buf1(), buf.scratch_buf2(), false) != EpubError::Ok) {
-    MR_LOGW("index", "index_file: Book::open failed for '%s'", path.c_str());
-    return false;
+  (void)buf;  // metadata comes from the MRB itself — no scratch buffers needed
+  std::string title, author;
+  {
+    MrbReader r;
+    if (!r.open(path.c_str())) {
+      MR_LOGW("index", "index_file: MrbReader::open failed for '%s'", path.c_str());
+      return false;
+    }
+    title = r.metadata().title;
+    author = r.metadata().author.value_or("");
+    r.close();
+    // A book whose EPUB had no usable title would otherwise show as an empty
+    // row; fall back to the folder name, which the converter takes from the
+    // original filename.
+    if (title.empty() || title == "none")
+      title = folder_name_of(path);
   }
-  auto meta = book.metadata();
-  const std::string author = meta.author.value_or("");
   ensure_loaded_(index_path);
   remove_entry(path);
-  add_entry(path, meta.title, author);
+  add_entry(path, title, author);
   MR_LOGI("index", "index_file: added '%s' (entries=%zu)", path.c_str(), entries_.size());
   ++generation_;
   return save(index_path);
@@ -275,96 +261,70 @@ void BookIndex::remove_entry(std::string_view path) {
     entries_.erase(it);
 }
 
-void BookIndex::set_last_opened(std::string_view path, uint32_t order) {
+void BookIndex::mark_opened(std::string_view path) {
+  uint32_t next = 0;
+  for (const auto& entry : entries_)
+    next = std::max(next, entry.last_open_order);
+  ++next;
   for (auto& entry : entries_) {
     if (entry.path.view(pool_) == path) {
-      entry.last_open_order = order;
-      return;
-    }
-  }
-}
-
-void BookIndex::update_reading_stats(std::string_view path, uint64_t read_time_ms,
-                                     uint32_t times_opened, uint32_t page_turns,
-                                     uint16_t progress_pct, uint16_t chapter_count, uint64_t time_left_ms,
-                                     const std::string& index_path, uint32_t total_chars) {
-  ensure_loaded_(index_path);
-  for (auto& e : entries_) {
-    if (e.path.view(pool_) == path) {
-      e.read_time_ms = read_time_ms;
-      e.times_opened = times_opened;
-      e.page_turns = page_turns;
-      e.progress_pct = progress_pct;
-      e.chapter_count = chapter_count;
-      e.time_left_ms = time_left_ms;
-      if (total_chars > 0) e.total_chars = total_chars;
-      ++generation_;
-      save(index_path);
+      entry.last_open_order = next;
       return;
     }
   }
 }
 
 void BookIndex::build_index(const std::string& root_dir, DrawBuffer& buf) {
+  // Preserve open order across a rescan so the most-recently-read sort survives.
   struct OldStats {
     std::string key;
-    uint32_t order; uint64_t read_time_ms;
-    uint32_t times_opened; uint32_t page_turns;
-    uint16_t progress_pct; uint16_t chapter_count; uint64_t time_left_ms;
-    uint32_t total_chars;
+    uint32_t order;
   };
   std::vector<OldStats> old_stats;
   for (const auto& e : entries_)
-    if (e.last_open_order > 0 || e.read_time_ms > 0)
-      old_stats.push_back({e.title.to_string(pool_) + '\x01' + e.author.to_string(pool_),
-                           e.last_open_order, e.read_time_ms,
-                           e.times_opened, e.page_turns,
-                           e.progress_pct, e.chapter_count, e.time_left_ms,
-                           e.total_chars});
+    if (e.last_open_order > 0)
+      old_stats.push_back({e.title.to_string(pool_) + '\x01' + e.author.to_string(pool_), e.last_open_order});
 
   entries_.clear();
   pool_.reset();
-  buf.show_loading("Scanning...", 0);
-  // Process epub files as we find them to avoid storing all paths in memory.
+  (void)buf;
+  // Process books as we find them to avoid storing all paths in memory.
   int done = 0;
   int total = 0;
 
-  // Reuse one Book instance across all iterations so the ZipReader's internal
-  // vectors (entries_, name_blob_) retain their allocated capacity — repeated
-  // alloc/free of same-sized buffers fragments the heap on ESP32.
-  Book book;
-
-  // Helper to process a single epub path (keeps peak memory low)
   auto process_path = [&](const std::string& path) {
     if (static_cast<int>(entries_.size()) >= MAX_BOOKS)
       return;
-    buf.show_loading("Indexing...", total > 0 ? 10 + (done * 90 / total) : 10);
-    book.close();
-    if (book.open(path.c_str(), buf.scratch_buf1(), buf.scratch_buf2(), false) == EpubError::Ok) {
-      auto meta = book.metadata();
-      const std::string author = meta.author.value_or("");
-      add_entry(path, meta.title, author);
-      const std::string key = std::string(meta.title) + '\x01' + author;
+
+    std::string title, author;
+    bool ok = false;
+    {
+      MrbReader r;
+      if (r.open(path.c_str())) {
+        title = r.metadata().title;
+        author = r.metadata().author.value_or("");
+        r.close();
+        if (title.empty() || title == "none")
+          title = folder_name_of(path);
+        ok = true;
+      }
+    }
+
+    if (ok) {
+      add_entry(path, title, author);
+      const std::string key = title + '\x01' + author;
       for (const auto& old : old_stats) {
         if (old.key == key) {
           entries_.back().last_open_order = old.order;
-          entries_.back().read_time_ms    = old.read_time_ms;
-          entries_.back().times_opened    = old.times_opened;
-          entries_.back().page_turns      = old.page_turns;
-          entries_.back().progress_pct    = old.progress_pct;
-          entries_.back().chapter_count   = old.chapter_count;
-          entries_.back().time_left_ms    = old.time_left_ms;
-          entries_.back().total_chars     = old.total_chars;
           break;
         }
       }
     }
-    book.close();
     done++;
   };
 
-  // Single iterator helper: calls `cb(path)` for each .epub found
-  auto iterate_epubs = [&](const std::function<void(const std::string&)>& cb) {
+  // Single iterator helper: calls `cb(path)` for each book found
+  auto iterate_books = [&](const std::function<void(const std::string&)>& cb) {
     std::queue<std::string> q;
     q.push(root_dir);
     while (!q.empty()) {
@@ -375,16 +335,8 @@ void BookIndex::build_index(const std::string& root_dir, DrawBuffer& buf) {
       auto visit = [&](const char* name, bool is_dir, const std::string& fullpath) {
         if (name[0] == '.') return;
         if (is_dir) { q.push(fullpath); return; }
-        size_t len = std::strlen(name);
-        if (len > 5) {
-          const char* ext = name + len - 5;
-          char ext_lower[6];
-          for (int i = 0; i < 5; i++)
-            ext_lower[i] = static_cast<char>(std::tolower(static_cast<unsigned char>(ext[i])));
-          ext_lower[5] = '\0';
-          if (std::strcmp(ext_lower, ".epub") == 0)
-            cb(fullpath);
-        }
+        if (has_book_extension(name, std::strlen(name)))
+          cb(fullpath);
       };
 
 #ifdef ESP_PLATFORM
@@ -409,17 +361,15 @@ void BookIndex::build_index(const std::string& root_dir, DrawBuffer& buf) {
     }
   };
 
-  iterate_epubs([&](const std::string& p) { total++; });
+  iterate_books([&](const std::string& p) { total++; });
   MR_LOGI("index", "Found %d epub(s), indexing...", total);
-  iterate_epubs(process_path);
+  iterate_books(process_path);
   MR_LOGI("index", "Indexed %d book(s)", done);
 
   // build_index is a structural mutation — bump so observers (MainMenu) refresh
   // even if the call doesn't go through index_file/remove_path/rename_in_place.
   ++generation_;
 
-  if (done > 0)
-    buf.show_loading("Indexing...", 100);
 }
 
 }  // namespace wintergreen

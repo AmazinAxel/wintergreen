@@ -22,7 +22,7 @@ class FontManager : public wintergreen::FontManager {
   // The one and only reader font. There is no font picker — this bundle is
   // baked into the asset blob and provisioned into the font partition on first
   // boot after a firmware update.
-  static constexpr const char* kFontAsset = "Literata.bin";
+  static constexpr const char* kFontAsset = "AtkinsonHyperlegible.bin";
 
 
   void init() {
@@ -89,17 +89,6 @@ class FontManager : public wintergreen::FontManager {
     } else {
       ESP_LOGE("font", "font provisioning failed");
       buf.show_loading("Font install failed!", 0);
-    }
-  }
-
-  // Call in the main loop when g_font_uploaded is true (serial upload).
-  void on_serial_upload() {
-    if (font_part_.mmap()) {
-      load_fonts_();
-      if (font_set_.valid()) {
-        ESP_LOGI("font", "re-loaded fonts after upload");
-        app_.set_reader_font(font_set());
-      }
     }
   }
 

@@ -34,7 +34,21 @@ namespace wintergreen::config {
   // General settings
   inline constexpr bool kSunlightFadingFix = false;
   inline constexpr uint8_t kAutoSleepMinutes = 1;
+  inline constexpr uint32_t kPowerHoldSleepMs = 400;
 }
 ```
 
 If you use a white Xteink in the sun, I recommend enabling the fading fix, but it can cause more full screen refreshes. Auto sleep should be set to as low a value as comfortably possible. I personally recommend 1-2 minutes, depending on your reading speed.
+
+The prebuilt binaries ship with the default config from above! If you want to modify those values, you'd have to build it from scratch.
+
+## Some design choices
+
+This is a VERY opinionated custom firmware! I want people to flash this firmware and start reading without a second thought and without any sort of setup needed. That being said, I have made some very sensible design choices and I'm listing them and their reasons here:
+
+| What | Why |
+| No progress bar/battery when reading! | It's distracting. You should focus on the book, not things about the book or the device. If you want to see this information, it's just a short button press away. |
+| Iosevka & Atkinson Hyperlegible ONLY | Don't take |
+| English only | This cfw is made only for English and some special characters. This firmware will not be internationalized or support other languages. |
+| No stats | You don't *really* need stats. It's a nice-to-have but also unnecessary and distracting. There is no other menus than the homescreen and book menu, and I want to keep it that way! |
+| Just chapter control | There is no link support. It keeps book builds faster and this a mostly unused feature for many books. Chapters get first class support! |

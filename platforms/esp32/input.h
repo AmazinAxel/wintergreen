@@ -42,8 +42,7 @@ class Esp32InputSource final : public wintergreen::IInputSource {
     cfg.intr_type = GPIO_INTR_DISABLE;
     gpio_config(&cfg);
 
-    // Initialise ADC1 in oneshot mode, 12 dB attenuation (full 0â€“3.3 V range)
-#ifndef QEMU_BUILD
+    // Initialise ADC1 in oneshot mode, 12 dB attenuation (full 0-3.3 V range).
     adc_oneshot_unit_init_cfg_t unit_cfg{};
     unit_cfg.unit_id = ADC_UNIT_1;
     adc_oneshot_new_unit(&unit_cfg, &adc_handle_);
@@ -54,14 +53,14 @@ class Esp32InputSource final : public wintergreen::IInputSource {
     adc_oneshot_config_channel(adc_handle_, ADC_CHANNEL_1, &ch_cfg);  // GPIO1
     adc_oneshot_config_channel(adc_handle_, ADC_CHANNEL_2, &ch_cfg);  // GPIO2
 
-    // Start periodic timer for continuous button sampling
+    // Start the periodic sampler. Without this nothing ever calls sample(), so
+    // debounced_ stays 0 and no button — including power — can register.
     esp_timer_create_args_t timer_args{};
     timer_args.callback = sample_timer_cb;
     timer_args.arg = this;
     timer_args.dispatch_method = ESP_TIMER_TASK;
     esp_timer_create(&timer_args, &sample_timer_);
     esp_timer_start_periodic(sample_timer_, kSampleIntervalUs);
-#endif  // !QEMU_BUILD
   }
 
   // Returns accumulated button press history since last poll (in arrival order),

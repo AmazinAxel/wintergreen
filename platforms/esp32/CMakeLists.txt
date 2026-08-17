@@ -10,24 +10,16 @@ set(lib_sources
     ${LIB}/screens/ListMenuScreen.cpp
     ${LIB}/screens/MainMenu.cpp
     ${LIB}/screens/ReaderScreen.cpp
-    ${LIB}/screens/ChapterSelectScreen.cpp
-    ${LIB}/screens/LinksScreen.cpp
     ${LIB}/screens/ReaderOptionsScreen.cpp
     ${LIB}/screens/HiddenBooksMenu.cpp
     ${LIB}/screens/LyraExtScreen.cpp
-    ${LIB}/screens/RecentBooksScreen.cpp
+    ${LIB}/content/CoverPaths.cpp
     ${LIB}/content/ZipReader.cpp
-    ${LIB}/content/XmlReader.cpp
-    ${LIB}/content/CssParser.cpp
-    ${LIB}/content/HtmlEntities.cpp
-    ${LIB}/content/EpubParser.cpp
     ${LIB}/content/TextLayout.cpp
     ${LIB}/content/hyphenation/Hyphenation.cpp
-    ${LIB}/content/Book.cpp
     ${LIB}/content/BookIndex.cpp
     ${LIB}/content/mrb/MrbWriter.cpp
     ${LIB}/content/mrb/MrbReader.cpp
-    ${LIB}/content/mrb/MrbConverter.cpp
     ${LIB}/content/ImageDecoder.cpp
     ${LIB}/content/JpegDecoder.cpp
     ${LIB}/content/PngDecoder.cpp)

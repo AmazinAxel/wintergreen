@@ -26,12 +26,9 @@ void ListMenuScreen::apply_ui_font(BitmapFont& out) {
 
 static constexpr int kHeaderY = 15;         // top padding before the title text
 static constexpr int kHeaderBottomGap = 4;  // gap between last header line and first list item
-// The hint row (nav glyphs + battery bar) is centred on a line kHintCenterY pixels above the
-// screen bottom.  kBottomEdgePad is the gap from that centre line to the absolute screen edge.
-// kBottomAreaH (= centre + pad) is the total reserved strip; the list stays above it.
-static constexpr int kHintCenterY = 8;     // px from screen bottom to centre of the hint row
-static constexpr int kBottomEdgePad = 11;  // px from hint centre to absolute screen edge
-static constexpr int kBottomAreaH = kHintCenterY + kBottomEdgePad;
+// Nothing is drawn at the bottom of a list any more — only a breathing margin so
+// the last row isn't flush against the panel edge.
+static constexpr int kBottomPad = 8;
 static constexpr int kSubtitleGap = 3;      // gap between bottom of title block and first subtitle
 static constexpr int kSubtitleSpacing = 6;  // extra pixels between consecutive subtitles (added to y_advance)
 static constexpr int kItemSpacing = 6;      // vertical gap between list item rows
@@ -100,22 +97,14 @@ int ListMenuScreen::wintergreen_visible_from_(int scroll_off, int available_h) c
 
 int ListMenuScreen::get_visible_count_(int H, int scroll_off) const {
   const int header_h = compute_header_h_();
-  if (!plain_list_ && subtitle_font_.valid() && subtitle_.empty()) {
-    int bot_h = 0;
-    if (section_font_.valid()) {
-      static constexpr int kBotPad = 5, kBotMargin = 10;
-      bot_h = 1 + kBotPad + section_font_.y_advance() + kBotPad + kBotMargin;
-    }
-    return wintergreen_visible_from_(scroll_off, H - header_h - bot_h);
-  }
-  if (detail_list_ && subtitle_font_.valid() && subtitle_.empty())
-    return wintergreen_visible_from_(scroll_off, H - header_h - kBottomAreaH);
   if (!subtitle_.empty() && subtitle_font_.valid()) {
     static constexpr int kBarPadY = 6;
     return wintergreen_visible_from_(scroll_off, H - header_h - (kBarPadY + subtitle_font_.y_advance() + kBarPadY + 1));
   }
+  if (subtitle_font_.valid() && (!plain_list_ || detail_list_))
+    return wintergreen_visible_from_(scroll_off, H - header_h - kBottomPad);
   const int line_h = ui_font_.y_advance() + kItemSpacing;
-  const int avail = H - header_h - kBottomAreaH;
+  const int avail = H - header_h - kBottomPad;
   return avail > 0 ? (avail + kItemSpacing) / line_h : 0;
 }
 
@@ -191,8 +180,6 @@ int ListMenuScreen::compute_header_h_() const {
       subtitle_h += ui_font_.y_advance() + kSubtitleSpacing;
     if (!subtitle2_.empty())
       subtitle_h += ui_font_.y_advance() + kSubtitleSpacing;
-    if (!subtitle3_.empty())
-      subtitle_h += ui_font_.y_advance() + kSubtitleSpacing;
   }
   const int hfh = header_font_.valid() ? header_font_.y_advance() : 0;
   const int t2h = (title2_ && header_font_.valid()) ? header_font_.y_advance() : 0;
@@ -217,7 +204,7 @@ int ListMenuScreen::draw_header_(DrawBuffer& buf, int W, int H, std::optional<ui
     int y = bar_h + 1;
     if (header_font_.valid() && subtitle_font_.valid()) {
       static constexpr int kCardPadT = 10, kCardPadB = 10, kTitleGap = 4, kLineGap = 6;
-      static constexpr int kLM = 14, kRM = 14;
+      static constexpr int kRM = 14;
       y += kCardPadT;
       if (title_) {
         const size_t tlen = std::strlen(title_);
@@ -238,11 +225,9 @@ int ListMenuScreen::draw_header_(DrawBuffer& buf, int W, int H, std::optional<ui
                                    subtitle_.c_str(), subtitle_.size(), subtitle_font_, false);
         y += subtitle_font_.y_advance() + kLineGap;
       }
-      // Stats: read time left (subtitle3_), book progress right (subtitle2_)
+      // Book progress, right-aligned.
       {
         const int stats_y = y + subtitle_font_.baseline();
-        if (!subtitle3_.empty())
-          buf.draw_text_proportional(kLM, stats_y, subtitle3_.c_str(), subtitle3_.size(), subtitle_font_, false);
         if (!subtitle2_.empty()) {
           const int rw = subtitle_font_.word_width(subtitle2_.c_str(), subtitle2_.size(), FontStyle::Regular);
           buf.draw_text_proportional(W - kRM - rw, stats_y,
@@ -306,7 +291,6 @@ int ListMenuScreen::draw_header_(DrawBuffer& buf, int W, int H, std::optional<ui
   };
   draw_subtitle(subtitle_);
   draw_subtitle(subtitle2_);
-  draw_subtitle(subtitle3_);
 
   const int hfh = header_font_.valid() ? header_font_.y_advance() : 0;
   const int t2h = (title2_ && header_font_.valid()) ? header_font_.y_advance() : 0;
@@ -314,48 +298,10 @@ int ListMenuScreen::draw_header_(DrawBuffer& buf, int W, int H, std::optional<ui
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
-// 3. draw_bottom_: draws the battery bar and navigation-button hint glyphs.
+// 3. draw_bottom_: draws the book-details footer, if there is one.
 //    Returns bottom_h = pixels reserved at the bottom (list must stay above).
 // ─────────────────────────────────────────────────────────────────────────────
 int ListMenuScreen::draw_bottom_(DrawBuffer& buf, int W, int H, std::optional<uint8_t> battery_pct) const {
-  if (!plain_list_ && section_font_.valid()) {
-    const BitmapFont& sf = section_font_;
-    const bool inv = app_ && app_->invert_menu_buttons();
-
-    static constexpr int kBotPad    = 5;
-    static constexpr int kBotMargin = 10;
-    static constexpr int kBoxLX     = 53;
-    static constexpr int kBoxW      = 176;
-    static constexpr int kBoxRX     = kBoxLX + kBoxW + 22;
-    static constexpr int kLDiv      = kBoxLX + kBoxW / 2;
-    static constexpr int kRDiv      = kBoxRX + kBoxW / 2;
-
-    const int box_h  = kBotPad + sf.y_advance() + kBotPad;
-    const int bot_h  = 1 + box_h + kBotMargin;
-    const int box_y  = H - bot_h;
-    const int text_y = box_y + kBotPad + sf.baseline();
-
-    auto draw_box = [&](int bx) {
-      buf.fill_rect(bx,             box_y,             kBoxW, 1,     false);
-      buf.fill_rect(bx,             box_y + box_h - 1, kBoxW, 1,     false);
-      buf.fill_rect(bx,             box_y,             1,     box_h, false);
-      buf.fill_rect(bx + kBoxW - 1, box_y,             1,     box_h, false);
-    };
-    draw_box(kBoxLX);
-    buf.fill_rect(kLDiv, box_y, 1, box_h, false);
-    draw_box(kBoxRX);
-    buf.fill_rect(kRDiv, box_y, 1, box_h, false);
-
-    const char* labels[4] = {"Back", "Select", inv ? "Up" : "Down", inv ? "Down" : "Up"};
-    const int centers[4]  = {kBoxLX + kBoxW / 4, kBoxLX + 3 * kBoxW / 4,
-                              kBoxRX + kBoxW / 4, kBoxRX + 3 * kBoxW / 4};
-    for (int i = 0; i < 4; ++i) {
-      const int tw = static_cast<int>(sf.word_width(labels[i], std::strlen(labels[i]), FontStyle::Regular));
-      buf.draw_text_proportional(centers[i] - tw / 2, text_y, labels[i], std::strlen(labels[i]), sf, false);
-    }
-
-    return bot_h;
-  }
   if (!subtitle_.empty()) {
     if (!subtitle_font_.valid()) return 0;
     static constexpr int kBarPadY = 6;
@@ -375,49 +321,12 @@ int ListMenuScreen::draw_bottom_(DrawBuffer& buf, int W, int H, std::optional<ui
     }
     return bottom_h;
   }
-  const uint8_t bat_mode = (app_ && battery_pct.has_value()) ? app_->battery_display() : 0;
-  if (battery_pct.has_value()) {
-    const int bat_pct = battery_pct.value();
-    if (bat_mode == 0 || bat_mode == 2) {
-      const int kBarW = 26;
-      const int kBarH = 8;
-      const int kBarX = (W - kBarW) / 2;
-      const int kBarY = H - kHintCenterY - kBarH / 2;
-
-      buf.fill_rect(kBarX + 1, kBarY, kBarW - 2, 1, false);
-      buf.fill_rect(kBarX + 1, kBarY + kBarH - 1, kBarW - 2, 1, false);
-      buf.fill_rect(kBarX, kBarY + 1, 1, kBarH - 2, false);
-      buf.fill_rect(kBarX + kBarW - 1, kBarY + 1, 1, kBarH - 2, false);
-
-      const int max_fill = kBarW - 4;
-      const int filled = (bat_pct * max_fill) / 100;
-      if (filled > 0) {
-        buf.fill_row(kBarY + 5, kBarX + 2, kBarX + 2 + std::min(filled + 3, max_fill), false);
-        buf.fill_row(kBarY + 4, kBarX + 2, kBarX + 2 + std::min(filled + 2, max_fill), false);
-        buf.fill_row(kBarY + 3, kBarX + 2, kBarX + 2 + std::min(filled + 1, max_fill), false);
-        buf.fill_row(kBarY + 2, kBarX + 2, kBarX + 2 + std::min(filled, max_fill), false);
-      }
-
-      if (bat_mode == 2 && ui_font_.valid()) {
-        char num_buf[8];
-        const int nlen = std::snprintf(num_buf, sizeof(num_buf), "%d%%", bat_pct);
-        const int nx = kBarX + kBarW + 4;
-        const int ny = H - kHintCenterY - (ui_font_.y_advance() + 1) / 2 + ui_font_.baseline();
-        buf.draw_text_proportional(nx, ny, num_buf, static_cast<size_t>(nlen), ui_font_, false);
-      }
-    } else if (bat_mode == 1 && ui_font_.valid()) {
-      char num_buf[8];
-      const int nlen = std::snprintf(num_buf, sizeof(num_buf), "%d%%", bat_pct);
-      const int nw = ui_font_.word_width(num_buf, static_cast<size_t>(nlen), FontStyle::Regular);
-      const int nx = (W - nw) / 2;
-      const int ny = H - kHintCenterY - (ui_font_.y_advance() + 1) / 2 + ui_font_.baseline();
-      buf.draw_text_proportional(nx, ny, num_buf, static_cast<size_t>(nlen), ui_font_, false);
-    }
-  }
-
-  if (!app_ || app_->show_nav_arrows())
-    draw_button_hints_(buf);
-  return kBottomAreaH;
+  // Nothing else is drawn at the bottom: no nav glyphs, no battery icon. The
+  // battery percentage lives in the header (draw_header_).
+  (void)W;
+  (void)H;
+  (void)battery_pct;
+  return kBottomPad;
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
@@ -684,7 +593,7 @@ void ListMenuScreen::draw_list_(DrawBuffer& buf, int W, int H, int header_h, int
   // ── Layout metrics ────────────────────────────────────────────────────────
   const int line_h = ui_font_.y_advance() + kItemSpacing;  // height per item slot
   const int baseline = ui_font_.baseline();
-  const int available_h = H - header_h - bottom_h;  // bottom_h == kBottomAreaH
+  const int available_h = H - header_h - bottom_h;
   // N items need N*y_advance + (N-1)*kItemSpacing = N*line_h - kItemSpacing pixels.
   // Rearranging: N = (available_h + kItemSpacing) / line_h.
   const int visible = available_h > 0 ? (available_h + kItemSpacing) / line_h : 0;
@@ -825,48 +734,6 @@ void ListMenuScreen::draw_list_(DrawBuffer& buf, int W, int H, int header_h, int
     buf.fill_rect(sb_x + 1, thumb_y, sb_w - 2, 1, false);                // top cap
     buf.fill_rect(sb_x, thumb_y + 1, sb_w, thumb_h - 2, false);          // body
     buf.fill_rect(sb_x + 1, thumb_y + thumb_h - 1, sb_w - 2, 1, false);  // bottom cap
-  }
-}
-
-void ListMenuScreen::draw_button_hints_(DrawBuffer& buf) const {
-  if (!ui_font_.valid())
-    return;
-  const int W = buf.width();
-  const int H = buf.height();
-  const int baseline = ui_font_.baseline();
-
-  // Four labels: back=◀, select=▶, down=▼, up=▲
-  bool inv_menu = app_ && app_->invert_menu_buttons();
-  const char* lbl_down = "\xe2\x96\xbc";
-  const char* lbl_up = "\xe2\x96\xb2";
-  const char* kLabels[4] = {"\xe2\x97\x80", "\xe2\x96\xb6", inv_menu ? lbl_up : lbl_down, inv_menu ? lbl_down : lbl_up};
-  static const size_t kLens[4] = {3, 3, 3, 3};
-
-  const bool sideways = buf.rotation() == Rotation::Deg90;
-  const int L = sideways ? W : H;
-  const int pair0 = L * 163 / 550;
-  const int pair1 = L - pair0;
-  const int gap = 50;
-  const int btns[4] = {pair0 - gap, pair0 + gap, pair1 - gap, pair1 + gap};
-
-  for (int i = 0; i < 4; ++i) {
-    const int lw = ui_font_.word_width(kLabels[i], kLens[i], FontStyle::Regular);
-    if (!sideways) {
-      const int text_x = W - kHintCenterY - lw / 2;
-      // In landscape, if derived from portrait by rotating -90 deg,
-      // the original left button (X=0) becomes the bottom right button (Y=MAX).
-      // So we map i -> 3 - i if we need to reverse the order on the Y axis
-      // because pair0 is smaller and pair1 is larger.
-      int mapped_i = 3 - i;
-      const int text_y = btns[mapped_i] - ui_font_.y_advance() / 2 + baseline;
-      buf.draw_text_proportional(text_x, text_y, kLabels[i], kLens[i], ui_font_, false);
-    } else {
-      // Per-size vertical nudge to keep glyphs visually centred on kHintCenterY.
-      static constexpr int kHintGlyphNudge[3] = {1, 0, 0};
-      const int nudge = kHintGlyphNudge[std::min(font_size_idx_, 2)];
-      const int text_y = H - kHintCenterY - (ui_font_.y_advance() + 1) / 2 + baseline + nudge;
-      buf.draw_text_proportional(btns[i] - lw / 2, text_y, kLabels[i], kLens[i], ui_font_, false);
-    }
   }
 }
 

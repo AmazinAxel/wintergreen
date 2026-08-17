@@ -1,8 +1,6 @@
 #pragma once
-// SD-card support for wintergreen on ESP32-C3.
-// In normal builds: SPI SD card (SPI2_HOST shares bus with the e-ink display).
-// In QEMU_BUILD:    FAT filesystem on internal flash (wear-levelling), mounted
-//                   at /sdcard so all existing paths work unchanged.
+
+// SD card support
 
 #include <cstdio>
 
@@ -14,38 +12,6 @@
 
 static const char* kSdTag = "sd";
 
-#ifdef QEMU_BUILD
-// -----------------------------------------------------------------------
-// QEMU: mount a FAT partition stored in the internal SPI flash.
-// The partition label "fat" must exist in the partition table.
-// -----------------------------------------------------------------------
-#include "wear_levelling.h"
-
-static wl_handle_t s_wl_handle = WL_INVALID_HANDLE;
-
-inline bool sd_init() {
-  esp_vfs_fat_mount_config_t mnt{};
-  mnt.format_if_mount_failed = true;  // format on first boot (blank flash)
-  mnt.max_files = SD_MAX_FILES;
-  mnt.allocation_unit_size = 0;  // let the driver choose
-
-  esp_err_t err = esp_vfs_fat_spiflash_mount_rw_wl(SD_MOUNT, "fat", &mnt, &s_wl_handle);
-  if (err != ESP_OK) {
-    ESP_LOGE(kSdTag, "flash FAT mount failed: %s", esp_err_to_name(err));
-    return false;
-  }
-  ESP_LOGI(kSdTag, "flash FAT mounted at %s", SD_MOUNT);
-  return true;
-}
-
-inline bool sd_mounted() {
-  return s_wl_handle != WL_INVALID_HANDLE;
-}
-
-#else  // !QEMU_BUILD
-// -----------------------------------------------------------------------
-// Real hardware: SPI SD card.
-// -----------------------------------------------------------------------
 #include "driver/gpio.h"
 #include "driver/sdspi_host.h"
 #include "sdmmc_cmd.h"
@@ -54,7 +20,7 @@ inline bool sd_mounted() {
 static sdmmc_card_t* sd_card_ = nullptr;
 
 inline bool sd_init() {
-  // CS pin: default-high so the SD card stays deselected until we talk to it.
+  // CS pin: default-high so the SD card stays deselected until we talk to it
   gpio_set_direction(SD_CS, GPIO_MODE_OUTPUT);
   gpio_set_level(SD_CS, 1);
 
@@ -93,5 +59,3 @@ inline bool sd_init() {
 inline bool sd_mounted() {
   return sd_card_ != nullptr;
 }
-
-#endif  // QEMU_BUILD

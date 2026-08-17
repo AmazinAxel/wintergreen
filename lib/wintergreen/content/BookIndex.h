@@ -15,13 +15,6 @@ struct BookIndexEntry {
   StringRef title{};
   StringRef author{};
   uint32_t last_open_order = 0;  // 0 = never opened; higher = more recently opened
-  uint64_t read_time_ms = 0;     // cumulative reading time in milliseconds
-  uint32_t times_opened = 0;     // total times the book was opened
-  uint32_t page_turns = 0;       // cumulative page turn count
-  uint16_t progress_pct = 0;    // last-known whole-book progress 0-100
-  uint16_t chapter_count = 0;   // total chapter count
-  uint64_t time_left_ms = 0;    // last-known estimated time remaining
-  uint32_t total_chars = 0;     // total character count (populated on first close)
 };
 
 static constexpr int MAX_BOOKS = 250;
@@ -33,6 +26,8 @@ class BookIndex {
 
   // Returns true if path ends with .epub (case-insensitive) and has a non-empty stem.
   static bool is_book_path(const char* path);
+  // True when the path is an already-converted book (no EPUB needed).
+  static bool is_mrb_path(const char* path);
 
   bool load(const std::string& index_file);
   bool save(const std::string& index_file) const;
@@ -50,19 +45,13 @@ class BookIndex {
 
   // Returns false (no-op) if MAX_BOOKS has been reached.
   bool add_entry(std::string_view path, std::string_view title, std::string_view author,
-                 uint32_t last_open_order = 0, uint64_t read_time_ms = 0,
-                 uint32_t times_opened = 0, uint32_t page_turns = 0,
-                 uint16_t progress_pct = 0, uint16_t chapter_count = 0, uint64_t time_left_ms = 0,
-                 uint32_t total_chars = 0);
-
-  // Update reading stats for a book and save to disk. No-op if not found.
-  void update_reading_stats(std::string_view path, uint64_t read_time_ms,
-                            uint32_t times_opened, uint32_t page_turns,
-                            uint16_t progress_pct, uint16_t chapter_count, uint64_t time_left_ms,
-                            const std::string& index_path, uint32_t total_chars = 0);
+                 uint32_t last_open_order = 0);
 
   // Updates in-memory entry only; call save() to persist.
-  void set_last_opened(std::string_view path, uint32_t order);
+  // Mark `path` as the most recently opened book. The order counter is derived
+  // from the entries themselves rather than persisted separately, so it cannot
+  // drift out of step with the index.
+  void mark_opened(std::string_view path);
 
   // No-op if not found. Call save() to persist.
   void remove_entry(std::string_view path);

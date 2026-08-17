@@ -75,8 +75,6 @@ add_library(wintergreen_core STATIC
     ${CMAKE_CURRENT_SOURCE_DIR}/../../lib/wintergreen/screens/ListMenuScreen.cpp
     ${CMAKE_CURRENT_SOURCE_DIR}/../../lib/wintergreen/screens/MainMenu.cpp
     ${CMAKE_CURRENT_SOURCE_DIR}/../../lib/wintergreen/screens/ReaderScreen.cpp
-    ${CMAKE_CURRENT_SOURCE_DIR}/../../lib/wintergreen/screens/ChapterSelectScreen.cpp
-    ${CMAKE_CURRENT_SOURCE_DIR}/../../lib/wintergreen/screens/LinksScreen.cpp
     ${CMAKE_CURRENT_SOURCE_DIR}/../../lib/wintergreen/screens/ReaderOptionsScreen.cpp
     ${CMAKE_CURRENT_SOURCE_DIR}/../../lib/wintergreen/screens/HiddenBooksMenu.cpp
 )
@@ -106,6 +104,7 @@ target_compile_definitions(wintergreen_desktop PRIVATE SDL_MAIN_HANDLED)
 # Generate a header with the repo-root sd/ path (avoids MSVC /D drive-letter colon issue).
 get_filename_component(REPO_ROOT "${CMAKE_CURRENT_SOURCE_DIR}/../.." ABSOLUTE)
 set(WINTERGREEN_SD_DIR "${REPO_ROOT}/sd")
+# REPO_ROOT is also used to locate resources/ for the reader font.
 configure_file(
     ${CMAKE_CURRENT_SOURCE_DIR}/desktop_config.h.in
     ${CMAKE_CURRENT_BINARY_DIR}/desktop_config.h

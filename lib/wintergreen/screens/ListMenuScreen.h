@@ -51,7 +51,6 @@ class ListMenuScreen : public IScreen {
 
   std::string subtitle_;
   std::string subtitle2_;
-  std::string subtitle3_;
 
   // Two-line rows (title + subtitle, full-width divider, right-hand column) instead of
   // the default centred single-line rows. Set by book-list style screens.
@@ -77,22 +76,13 @@ class ListMenuScreen : public IScreen {
   void add_item(const std::string& label, int indent = 0) {
     owned_strings_.push_back(label);
     labels_.push_back(std::string_view(owned_strings_.back()));
-    separators_.push_back(false);
     indents_.push_back(indent);
   }
   // Zero-copy overload: stores a view into the caller-owned string.
   // The caller must ensure the referenced string outlives this screen.
   void add_item_view(std::string_view label, int indent = 0) {
     labels_.push_back(label);
-    separators_.push_back(false);
     indents_.push_back(indent);
-  }
-  // Insert a visual separator (thin horizontal line, non-selectable).
-  void add_separator(const std::string& header = "") {
-    owned_strings_.push_back(header);
-    labels_.push_back(std::string_view(owned_strings_.back()));
-    separators_.push_back(true);
-    indents_.push_back(0);
   }
   void set_item_label(int index, const std::string& label) {
     if (index >= 0 && index < static_cast<int>(labels_.size())) {
@@ -103,7 +93,6 @@ class ListMenuScreen : public IScreen {
   void clear_items() {
     labels_.clear();
     owned_strings_.clear();
-    separators_.clear();
     indents_.clear();
     selected_ = 0;
     scroll_offset_ = 0;
@@ -114,7 +103,6 @@ class ListMenuScreen : public IScreen {
   void free_items_storage() {
     { std::vector<std::string_view> tmp; labels_.swap(tmp); }
     { std::deque<std::string> tmp; owned_strings_.swap(tmp); }
-    { std::vector<bool> tmp; separators_.swap(tmp); }
     { std::vector<int> tmp; indents_.swap(tmp); }
   }
   int selected() const { return selected_; }
@@ -123,14 +111,20 @@ class ListMenuScreen : public IScreen {
     selected_ = index;
     on_start_set_selection_ = true;
   }
-  virtual bool is_separator(int index) const {
-    return index >= 0 && index < static_cast<int>(separators_.size()) && separators_[index];
+  // No screen inserts separator items any more; MainMenu overrides this to mark
+  // the hairline divider it derives from its own entry list.
+  virtual bool is_separator(int) const {
+    return false;
   }
   // Returns true if the cursor may land on this item. Default: not a separator.
   // Override to additionally exclude theme-irrelevant items.
   virtual bool is_item_focusable(int index) const { return !is_separator(index); }
   virtual int count() const {
     return static_cast<int>(labels_.size());
+  }
+  // Nesting depth stored with the item (TOC entries use it); 0 when unset.
+  int get_item_indent(int index) const {
+    return (index >= 0 && index < static_cast<int>(indents_.size())) ? indents_[index] : 0;
   }
 
   // Label for item at index. Default reads from labels_[]; override to provide
@@ -198,7 +192,6 @@ class ListMenuScreen : public IScreen {
  private:
   std::vector<std::string_view> labels_;
   std::deque<std::string> owned_strings_;  // backing storage for copied labels
-  std::vector<bool> separators_;
   std::vector<int> indents_;
 
   int selected_ = 0;
@@ -236,9 +229,6 @@ class ListMenuScreen : public IScreen {
   // 3. Draws the scrollable item list, scrollbar, and area-boundary indicator lines,
   //    given the already-known header and bottom heights.
   void draw_list_(DrawBuffer& buf, int W, int H, int header_h, int bottom_h) const;
-
-  // 4. Draws the four navigaton-button hint glyphs. Called by draw_bottom_.
-  void draw_button_hints_(DrawBuffer& buf) const;
 };
 
 }  // namespace wintergreen

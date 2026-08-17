@@ -558,11 +558,11 @@ class DrawBuffer {
     return src.valid();
   }
 
-  bool show_sleep_image_embedded(int idx = 0, bool show_text = true) {
+  bool show_sleep_image_embedded(bool show_text = true) {
     Mgr2Source_ src;
 
 #ifdef ESP_PLATFORM
-    const char* name = "sleep_0.mgr";
+    const char* name = "sleep.mgr";
     size_t size = 0;
     esp_partition_mmap_handle_t mmap_h = 0;
     const uint8_t* data = static_cast<const uint8_t*>(asset_blob::g_assets.map(name, size, mmap_h));
@@ -570,9 +570,7 @@ class DrawBuffer {
       return false;
     src = Mgr2Source_::from_memory(data, size);
 #else
-    char path[64];
-    snprintf(path, sizeof(path), "resources/sleep/sleep_%d.mgr", idx);
-    FILE* f = std::fopen(path, "rb");
+    FILE* f = std::fopen("resources/sleep.mgr", "rb");
     if (!f)
       return false;
     src = Mgr2Source_::from_file(f);
@@ -1209,25 +1207,6 @@ inline void DrawBuffer::draw_layout_line(uint8_t* buf, int x_offset, int baselin
                        DisplayFrame::kPhysicalHeight,
                        -DisplayFrame::kPanelOffsetX};
 
-  // State for the current underline span (BW plane only).
-  int ul_x0 = 0, ul_x1 = 0, ul_y = 0, ul_h = 0;
-  const char* ul_href = nullptr;
-
-  auto flush_ul = [&]() {
-    if (!ul_href || ul_x1 <= ul_x0)
-      return;
-    const int ul_w = ul_x1 - ul_x0;
-    if (rotation_ == Rotation::Deg0)
-      fill_rect_physical_(t, ul_x0, ul_y, ul_w, ul_h, white);
-    else if (rotation_ == Rotation::Deg90)
-      fill_rect_physical_(t, ul_y, DisplayFrame::kPhysicalHeight - ul_x0 - ul_w, ul_h, ul_w, white);
-    else if (rotation_ == Rotation::Deg180)
-      fill_rect_physical_(t, DisplayFrame::kPhysicalWidth - ul_x0 - ul_w, DisplayFrame::kPhysicalHeight - ul_y - ul_h, ul_w, ul_h, white);
-    else  // Deg270
-      fill_rect_physical_(t, DisplayFrame::kPhysicalWidth - ul_y - ul_h, ul_x0, ul_h, ul_w, white);
-    ul_href = nullptr;
-  };
-
   for (const auto& w : line.words) {
     if (w.len == 0)
       continue;
@@ -1240,25 +1219,8 @@ inline void DrawBuffer::draw_layout_line(uint8_t* buf, int x_offset, int baselin
       word_baseline -= static_cast<int>(fonts.y_advance(w.size_pct)) * 20 / 100;
     else if (w.vertical_align == VerticalAlign::Sub)
       word_baseline += static_cast<int>(fonts.y_advance(w.size_pct)) * 20 / 100;
-    int end_x = draw_text_impl_(t, x, word_baseline, w.text, w.len, *f, plane, white, w.style, rotation_);
-
-    if (plane == GrayPlane::BW) {
-      if (w.href) {
-        if (w.href != ul_href) {
-          flush_ul();
-          ul_href = w.href;
-          ul_x0 = x;
-          ul_y = word_baseline + static_cast<int>(f->underline_pos());
-          ul_h = static_cast<int>(f->underline_thickness());
-        }
-        ul_x1 = end_x;
-      } else {
-        flush_ul();
-      }
-    }
+    draw_text_impl_(t, x, word_baseline, w.text, w.len, *f, plane, white, w.style, rotation_);
   }
-  if (plane == GrayPlane::BW)
-    flush_ul();
 }
 
 }  // namespace wintergreen

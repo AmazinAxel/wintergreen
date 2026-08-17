@@ -56,7 +56,6 @@ struct Run {
   bool breaking = false;      // true for <br> line breaks
   uint16_t margin_left = 0;   // inline left margin in pixels
   uint16_t margin_right = 0;  // inline right margin in pixels
-  std::string href;           // hyperlink target (empty = no link)
 
   Run() = default;
   Run(const std::string& t, FontStyle s = FontStyle::Regular, bool br = false)
@@ -72,7 +71,7 @@ struct Run {
 
   bool operator==(const Run& o) const {
     return text == o.text && style == o.style && size_pct == o.size_pct && vertical_align == o.vertical_align &&
-           breaking == o.breaking && margin_left == o.margin_left && margin_right == o.margin_right && href == o.href;
+           breaking == o.breaking && margin_left == o.margin_left && margin_right == o.margin_right;
   }
 };
 

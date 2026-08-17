@@ -1,7 +1,10 @@
 #include "Book.h"
 
+#include "CoverPaths.h"
+
 #include <cstdio>
 #include <cstring>
+#include <cctype>
 
 #include "../HeapLog.h"
 
@@ -63,8 +66,6 @@ EpubError Book::load_chapter_streaming(size_t index, ParagraphSink sink, void* s
 
 ImageError Book::decode_image(uint16_t entry_index, DecodedImage& out, uint16_t max_w, uint16_t max_h,
                               uint8_t* work_buf, size_t work_buf_size) {
-  if (!images_enabled)
-    return ImageError::UnsupportedFormat;
   if (entry_index >= epub_.zip().entry_count())
     return ImageError::UnsupportedFormat;
 
@@ -112,13 +113,8 @@ bool Book::write_cover_bin(const char* cover_path, int max_w, int max_h,
   if (idx < 0 || idx >= static_cast<int>(epub_.zip().entry_count()))
     return false;
   DecodedImage img;
-  // Force images_enabled=true so covers are always generated regardless of
-  // the "show reader images" setting.
   auto& entry = epub_.zip().entry(static_cast<uint16_t>(idx));
-  const bool was_enabled = images_enabled;
-  images_enabled = true;
   auto err = decode_image_from_entry(file_, entry, max_w, max_h, img, work_buf, work_buf_size, /*scale_to_fill=*/false);
-  images_enabled = was_enabled;
   if (err != ImageError::Ok || img.data.empty())
     return false;
   FILE* f = std::fopen(cover_path, "wb");
@@ -140,14 +136,6 @@ static std::string epub_stem_(const char* epub_path) {
   const char* name = slash ? slash + 1 : p;
   const char* dot = std::strrchr(name, '.');
   return dot ? std::string(name, static_cast<size_t>(dot - name)) : std::string(name);
-}
-
-std::string cover_bin_path(const char* epub_path, const char* data_dir) {
-  return std::string(data_dir) + "/cache/" + epub_stem_(epub_path) + "/cover.bin";
-}
-
-std::string cover_sleep_bin_path(const char* epub_path, const char* data_dir) {
-  return std::string(data_dir) + "/cache/" + epub_stem_(epub_path) + "/cover_sleep.bin";
 }
 
 }  // namespace wintergreen
