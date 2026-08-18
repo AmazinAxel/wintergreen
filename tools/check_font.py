@@ -15,7 +15,6 @@ import zlib
 HEADER_SIZE = 50
 STYLE_NAMES = ["Regular", "Bold", "Italic", "BoldItalic"]
 
-
 def load(path):
     raw = open(path, "rb").read()
     if raw[:4] in (b"FNTS", b"MBF4"):
@@ -122,7 +121,6 @@ def check(m, label):
     for e in errs:
         print(f"   ERROR {e}")
     return not errs
-
 
 def draw(m, text):
     """ASCII-art the string, using the same 5 levels the panel gets."""

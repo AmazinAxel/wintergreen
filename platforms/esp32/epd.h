@@ -166,6 +166,9 @@ class EInkDisplay : public wintergreen::IDisplay {
 
   bool isScreenOn = false;
   bool inDeepSleep_ = false;
+  // millis() at MASTER_ACTIVATION of a refresh that was fired without waiting;
+  // 0 = nothing outstanding. Collected and logged by waitWhileBusy().
+  uint32_t pending_refresh_start_ = 0;
   bool in_grayscale_mode_ = false;
   bool custom_lut_active_ = false;
   bool in_grayscale_mode() const override {
@@ -174,6 +177,10 @@ class EInkDisplay : public wintergreen::IDisplay {
 
   bool is_busy() const override {
     return gpio_get_level(EPD_BUSY) == 1;
+  }
+
+  void wait_idle() override {
+    waitWhileBusy();
   }
 
   // Custom grayscale LUT buffer (112 bytes, matches kLutSize in serial_communication.h)
@@ -264,7 +271,10 @@ class EInkDisplay : public wintergreen::IDisplay {
     waitWhileBusy();
     setRamArea(0, 0, DISPLAY_WIDTH, DISPLAY_HEIGHT);
     writeRamBuffer(CMD_WRITE_RAM_BW, new_pixels, BUFFER_SIZE);
-    refreshDisplay(EPD_FAST_REFRESH);
+    // Fire and return: the controller now holds the pixels in its own RAM, so both
+    // host buffers are free and the app can lay out and draw the next frame while
+    // the waveform runs. This is the whole page-turn/menu latency win.
+    refreshDisplay(EPD_FAST_REFRESH, /*turnOffScreen=*/false, /*wait=*/false);
   }
 
   void write_ram_bw(const uint8_t* data) override {
@@ -322,6 +332,9 @@ class EInkDisplay : public wintergreen::IDisplay {
   }
 
   void deep_sleep() override {
+    // partial_refresh() may have left a waveform running; CMD_DEEP_SLEEP mid-update
+    // aborts it and leaves a half-drawn panel on screen for the whole sleep.
+    waitWhileBusy();
     sendCommand(CMD_DEEP_SLEEP);
     sendData(0x03);
     isScreenOn = false;
@@ -331,6 +344,15 @@ class EInkDisplay : public wintergreen::IDisplay {
   // Partially refresh a physical sub-rectangle.
   // phys_x is a raw hardware column (0 = first panel column); caller is responsible for
   // adding any panel offset before calling. phys_x must be byte-aligned (multiple of 8).
+  //
+  //
+  // NOTE: this only produces a correct screen when BW RAM outside the window already
+  // matches what is on the panel. setRamArea() bounds where the *write* lands, but
+  // refreshDisplay() drives the whole panel from BW RAM — a partial update looks
+  // localized only because unchanged pixels have BW RAM == RED RAM and get a no-op
+  // waveform. Its one caller, show_loading(), satisfies that because the rest of the
+  // screen is static during conversion. Do not reach for this as a general
+  // "refresh just the changed rows" primitive; see the note in CLAUDE.md.
   void partial_refresh_region(int phys_x, int phys_y, int phys_w, int phys_h, const uint8_t* new_buf,
                               int stride_bytes) override {
     const uint16_t x_start = static_cast<uint16_t>(phys_x);
@@ -420,6 +442,12 @@ class EInkDisplay : public wintergreen::IDisplay {
         break;
       }
     }
+    // A non-blocking refreshDisplay() left its waveform running; this is where it
+    // gets collected, so report its true duration from the activation timestamp.
+    if (pending_refresh_start_ != 0) {
+      ESP_LOGI("epd", "refreshDisplay(async): duration=%lums", millis() - pending_refresh_start_);
+      pending_refresh_start_ = 0;
+    }
     if (comment) {
       ESP_LOGI("epd", "waitWhileBusy done: %s (%lu ms)", comment, millis() - start);
     }
@@ -434,7 +462,12 @@ class EInkDisplay : public wintergreen::IDisplay {
     delay(20);
   }
 
-  void refreshDisplay(EpdRefreshMode mode, bool turnOffScreen = false) {
+  // wait=false fires the waveform and returns immediately, leaving the panel busy.
+  // Safe because every public entry point opens with wakeIfNeeded()+waitWhileBusy(),
+  // so the next panel operation collects the outstanding refresh before touching RAM.
+  // Callers that send further SPI commands right afterwards (setCustomLUT_, deep
+  // sleep, screen power-off) must keep wait=true — a command mid-waveform aborts it.
+  void refreshDisplay(EpdRefreshMode mode, bool turnOffScreen = false, bool wait = true) {
     sendCommand(CMD_DISPLAY_UPDATE_CTRL1);
     sendData(mode == EPD_FAST_REFRESH ? CTRL1_NORMAL : CTRL1_BYPASS_RED);
 
@@ -480,6 +513,15 @@ class EInkDisplay : public wintergreen::IDisplay {
     sendData(displayMode);
 
     sendCommand(CMD_MASTER_ACTIVATION);
+
+    // Powering the screen off happens at the end of the waveform, so those
+    // refreshes can never be left outstanding.
+    if (!wait && !turnOffScreen) {
+      pending_refresh_start_ = millis();
+      if (pending_refresh_start_ == 0)
+        pending_refresh_start_ = 1;  // 0 is the "nothing pending" sentinel
+      return;
+    }
 
     const uint32_t t0 = millis();
     waitWhileBusy();
@@ -564,6 +606,10 @@ class EInkDisplay : public wintergreen::IDisplay {
   // Load a custom LUT into the SSD1677's waveform register, or clear the flag.
   void setCustomLUT_(const uint8_t* lut_data) {
     if (lut_data) {
+      // The grayscale paths call this before their refreshDisplay(), so it can land
+      // while a fire-and-forget partial_refresh() is still driving the panel.
+      // Rewriting the LUT mid-waveform corrupts the update in progress.
+      waitWhileBusy();
       // Bytes 0..104: waveform + timing + frame rate → CMD_WRITE_LUT (0x32)
       sendCommand(CMD_WRITE_LUT);
       sendData(lut_data, 105);

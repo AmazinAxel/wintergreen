@@ -1,18 +1,5 @@
 #!/usr/bin/env bash
-# Convert EPUBs to the device's MRB format on this machine.
-#
-#   tools/convert-books.sh ~/Downloads/books /run/media/alec/SDCARD
-#   tools/convert-books.sh ~/Downloads/books            # -> ./converted
-#
-# Produces one folder per book:
-#   <out>/<book name>/book.mrb    text + layout
-#   <out>/<book name>/cover.bin   thumbnail, when the EPUB has a cover
-#
-# Copy those folders to the SD card. Conversion on the ESP32 is slow; this is
-# the same code path the firmware runs, so the output is identical.
-#
-# Needs cmake + a C++17 compiler. On NixOS they are fetched on demand via
-# nix-shell, so nothing has to be installed.
+
 set -euo pipefail
 
 SRC=${1:-}

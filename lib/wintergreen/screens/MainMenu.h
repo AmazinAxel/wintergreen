@@ -37,6 +37,13 @@ class MainMenu final : public ListMenuScreen {
     return kEmpty;
   }
 
+  // Reveal the books under .hidden/ at the top of the list. Set by the home
+  // screen's back long-press before it pushes this screen; cleared by stop(),
+  // so it never survives leaving the list.
+  void set_show_hidden(bool v) {
+    show_hidden_ = v;
+  }
+
   bool has_books_dir() const {
     return books_dir_ != nullptr;
   }
@@ -92,6 +99,11 @@ class MainMenu final : public ListMenuScreen {
     StringRef author_ref;
     uint32_t last_open_order = 0;
     bool mrb_exists = false;
+    // Books under .hidden/ are not in BookIndex — there is no pool to reference,
+    // so they carry their own metadata and are read straight from the MRB.
+    bool hidden = false;
+    std::string title_own;
+    std::string author_own;
   };
   std::vector<BookEntry> entries_;
   mutable std::string label_buf_;
@@ -127,12 +139,13 @@ class MainMenu final : public ListMenuScreen {
 
   void scan_directory_(DrawBuffer& buf);
   void populate_list_();
+  // Reads <books_dir>/.hidden/ into hidden_. Only called when the gesture asks
+  // for it, so the card is not walked on every visit to this screen.
+  void scan_hidden_();
 
-  // Back-button long-press state for hidden books gesture.
-  // Frames held; on release, short=Settings, long=HiddenBooks.
-  static constexpr int kHiddenHoldFrames = 15;  // ~3s at typical e-ink frame rate
-  int back_hold_frames_ = 0;
-  bool back_was_down_ = false;
+  std::vector<BookEntry> hidden_;
+  bool show_hidden_ = false;
+
 };
 
 }  // namespace wintergreen

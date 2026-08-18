@@ -197,8 +197,10 @@ class ListMenuScreen : public IScreen {
   int selected_ = 0;
   int scroll_offset_ = 0;
   int initial_selection_ = -1;
-  int hold_frames_up_ = 0;
-  int hold_frames_down_ = 0;
+  HoldRepeat hold_up_;
+  HoldRepeat hold_down_;
+  int hold_reps_up_ = 0;    // repeats fired so far this hold; drives the step size
+  int hold_reps_down_ = 0;
 
   uint8_t list_align_ = 0;  // 0=center, 1=left, 2=right
   bool on_start_set_selection_ = false;

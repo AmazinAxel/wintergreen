@@ -47,7 +47,6 @@ void Application::start(DrawBuffer& buf, IRuntime& runtime) {
   menu_.set_app(this);
   reader_.set_app(this);
   reader_options_.set_app(this);
-  hidden_books_.set_app(this);
 
 
   // Set up settings file path if data_dir_ is set
@@ -153,6 +152,11 @@ static bool show_book_cover_sleep_(DrawBuffer& buf, const char* data_dir, const 
 }
 
 void Application::do_sleep_(DrawBuffer& buf, bool wordmark_image) {
+  // Everything below writes or reads the SD card (position, settings, cover) and
+  // the last page turn's refresh may still be running — refreshes no longer block.
+  // The card shares SPI2 with the panel, so drain once here for the whole path.
+  buf.wait_panel_idle();
+
   // Stop the active screen so it can save state (e.g. reading position).
   // The reader now persists position only in stop(), so if a child screen (the
   // quick menu) is on top it must be stopped too or the session is lost.
@@ -274,8 +278,10 @@ void Application::update(const ButtonState& buttons, uint32_t dt_ms, DrawBuffer&
     } else if (pending_pop_count_ > 0) {
       int count = pending_pop_count_;
       pending_pop_count_ = 0;
-      if (top == &reader_ || top == &reader_options_)
+      if (top == &reader_ || top == &reader_options_) {
+        buf.wait_panel_idle();  // SD write; the panel may still be mid-refresh
         save_settings_();
+      }
       screen_mgr_.pop(count, buf, runtime);
       buf.refresh();
     }
@@ -290,8 +296,6 @@ IScreen* wintergreen::Application::screen_for_(ScreenId id) {
       return &reader_;
     case ScreenId::ReaderOptions:
       return &reader_options_;
-    case ScreenId::HiddenBooks:
-      return &hidden_books_;
     case ScreenId::LyraExt:
       return &lyra_ext_;
     default:

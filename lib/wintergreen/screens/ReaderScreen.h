@@ -115,6 +115,29 @@ class ReaderScreen final : public IScreen {
   TextLayout layout_engine_;
   PagePosition page_pos_;
   PageContent page_;
+
+  // One laid-out page held ahead of use. prev_page_() has to run a full
+  // layout_backward() just to learn where the previous page starts; without this it
+  // threw the result away and render_page_() laid the identical page out again, so
+  // every backward turn cost two layouts.
+  //
+  // The key must match on all of chapter/position/geometry: set_font() and
+  // set_options() invalidate TextLayout's paragraph cache wholesale, so a stale entry
+  // does not merely draw the wrong page, it points at freed line vectors.
+  struct LaidOutPageCache {
+    bool valid = false;
+    size_t chapter_idx = 0;
+    PagePosition pos;
+    PageOptions opts;
+    uint8_t font_size_idx = 0;
+    PageContent page;
+  };
+  LaidOutPageCache page_cache_;
+  PageOptions last_opts_;  // geometry of the most recent render, stamped onto the cache
+
+  HoldRepeat hold_next_;
+  HoldRepeat hold_prev_;
+
   bool open_ok_ = false;
   bool buf_was_touched_ = false;
 
@@ -141,6 +164,10 @@ class ReaderScreen final : public IScreen {
   bool next_page_();
   bool prev_page_();
   void load_chapter_(size_t idx);
+  // Stash a page the caller already laid out, keyed on its own start position.
+  void cache_page_(PageContent&& pc);
+  // Move the cached page into page_ if it matches pos under the current geometry.
+  bool take_cached_page_(const PagePosition& pos, const PageOptions& opts);
   void save_position_();
   void load_position_();
 

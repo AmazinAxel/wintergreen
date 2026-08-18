@@ -9,13 +9,6 @@
 #include "ImageDecoder.h"
 #include "XmlReader.h"
 
-#ifdef ESP_PLATFORM
-#include "esp_heap_caps.h"
-#include "esp_log.h"
-#include "esp_system.h"
-#include "esp_timer.h"
-#endif
-
 namespace wintergreen {
 
 // ---------------------------------------------------------------------------
@@ -35,14 +28,6 @@ static bool sv_eq(XmlStringView sv, const char* s) {
 // ---------------------------------------------------------------------------
 // CssCache
 // ---------------------------------------------------------------------------
-
-bool CssCache::low_memory() {
-#ifdef ESP_PLATFORM
-  return esp_get_free_heap_size() < 24 * 1024;
-#else
-  return false;
-#endif
-}
 
 size_t CssCache::find_evict_slot(uint32_t protect_gen) const {
   size_t best = kMaxEntries;
@@ -81,7 +66,7 @@ const CssStylesheet* CssCache::get_or_load(IZipFile& file, const ZipReader& zip,
     return nullptr;
 
   bool over_budget = total_bytes_ + css_data.size() > kMaxCacheBytes;
-  bool need_evict = over_budget || low_memory();
+  bool need_evict = over_budget;
 
   size_t slot;
   if (!need_evict && count_ < kMaxEntries) {
@@ -706,17 +691,6 @@ class BodyParser {
   // Pre-allocate run vector capacity to avoid mid-parse reallocation on
   // fragmented ESP32 heap. Call before parse_xhtml_events.
   void reserve_runs(size_t n) {
-#ifdef ESP_PLATFORM
-    // Cap to what the heap can actually provide to avoid bad_alloc on
-    // fragmented ESP32 heap (largest block may be much smaller than free).
-    {
-      size_t largest = heap_caps_get_largest_free_block(MALLOC_CAP_8BIT);
-      constexpr size_t kReserveHeadroom = 6144;
-      size_t affordable = (largest > kReserveHeadroom) ? (largest - kReserveHeadroom) / sizeof(Run) : 0;
-      if (affordable < n)
-        n = affordable;
-    }
-#endif
     if (n > 0)
       runs_.reserve(n);
   }
@@ -1058,18 +1032,8 @@ class BodyParser {
 
       emit(std::move(para));
       // Re-reserve runs_ after emit() so the just-freed buffer block is available.
-      // Cap to what the heap can actually provide (largest block may be fragmented).
-      if (prev_cap > 0) {
-#ifdef ESP_PLATFORM
-        size_t largest = heap_caps_get_largest_free_block(MALLOC_CAP_8BIT);
-        constexpr size_t kReserveHeadroom = 6144;
-        size_t affordable = (largest > kReserveHeadroom) ? (largest - kReserveHeadroom) / sizeof(Run) : 0;
-        if (affordable < prev_cap)
-          prev_cap = affordable;
-#endif
-        if (prev_cap > 0)
-          runs_.reserve(prev_cap);
-      }
+      if (prev_cap > 0)
+        runs_.reserve(prev_cap);
       runs_.clear();
       indent_.reset();
     } else if (pending_inline_image_.has_value()) {
@@ -1239,10 +1203,6 @@ class BodyParser {
       // paragraph now rather than letting the vector double in size (which may fail
       // on a fragmented heap). The capacity >= 16 guard prevents splitting tiny
       // paragraphs when capacity was never pre-reserved (e.g. desktop/test paths).
-#ifdef ESP_PLATFORM
-      if (runs_.size() == runs_.capacity() && runs_.capacity() >= 16)
-        flush_run();
-#endif
       runs_.push_back(std::move(r));
       current_run_.clear();
     }
@@ -1339,25 +1299,11 @@ class BodyParser {
     id_cb_ctx_ = ctx;
   }
 
-#ifdef ESP_PLATFORM
-  int64_t* emit_us_ = nullptr;  // accumulator for time spent in sink callbacks
-#endif
-
   void emit(Paragraph&& p) {
     has_emitted_ = true;
     ++emitted_count_;
     if (sink_) {
-#ifdef ESP_PLATFORM
-      if (emit_us_) {
-        int64_t t0 = esp_timer_get_time();
-        sink_(sink_ctx_, std::move(p));
-        *emit_us_ += esp_timer_get_time() - t0;
-      } else {
-        sink_(sink_ctx_, std::move(p));
-      }
-#else
       sink_(sink_ctx_, std::move(p));
-#endif
     } else {
       paragraphs_.push_back(std::move(p));
     }
@@ -1390,19 +1336,6 @@ static EpubError parse_xhtml_events(XmlReader& reader, const CssStylesheet* inli
     eff_ext.add(extern_css);
   XmlEvent ev;
 
-#ifdef ESP_PLATFORM
-  int64_t xml_us = 0;   // time in next_event (decompress + tokenize)
-  int64_t css_us = 0;   // time in CSS get()
-  int64_t text_us = 0;  // time in push_text (entity decode + whitespace normalize)
-  int64_t elem_us = 0;  // time in StartElement dispatch (tag matching, style stacks)
-  int64_t end_us = 0;   // time in EndElement dispatch
-  int64_t emit_us = 0;  // time in sink callback (Paragraph → write_paragraph)
-  int64_t head_us = 0;  // time seeking to <body> (includes decompressing head)
-  size_t text_bytes = 0;
-  size_t event_count = 0;
-  parser.emit_us_ = &emit_us;
-  int64_t head_t0 = esp_timer_get_time();
-#endif
   for (;;) {
     XmlError xerr = reader.next_event(ev);
     if (xerr == XmlError::BufferTooSmall) {
@@ -1450,82 +1383,21 @@ static EpubError parse_xhtml_events(XmlReader& reader, const CssStylesheet* inli
 
   const CssStylesheet* effective_inline = inline_css ? inline_css : &parsed_inline_css;
 
-#ifdef ESP_PLATFORM
-  head_us = esp_timer_get_time() - head_t0;
-#endif
-
-#ifdef WINTERGREEN_DIAG_STREAMING
-  size_t event_count = 0;
-  size_t start_count = 0;
-  size_t end_count = 0;
-  size_t text_count = 0;
-  XmlError last_err = XmlError::Ok;
-  const char* exit_reason = "unknown";
-#endif
-
-#ifdef ESP_PLATFORM
-  XmlEventType prev_type = XmlEventType::EndOfFile;
-  int64_t dispatch_t0 = 0;
-#endif
-
   for (;;) {
-#ifdef ESP_PLATFORM
-    // Attribute previous iteration's dispatch time
-    if (dispatch_t0 != 0) {
-      int64_t elapsed = esp_timer_get_time() - dispatch_t0;
-      if (prev_type == XmlEventType::StartElement)
-        elem_us += elapsed;
-      else if (prev_type == XmlEventType::EndElement)
-        end_us += elapsed;
-      else if (prev_type == XmlEventType::Text)
-        text_us += elapsed;
-    }
-    int64_t t0 = esp_timer_get_time();
-#endif
     XmlError xerr = reader.next_event(ev);
-#ifdef ESP_PLATFORM
-    xml_us += esp_timer_get_time() - t0;
-    event_count++;
-#endif
     if (xerr == XmlError::BufferTooSmall) {
       reader.skip_element();
       continue;
     }
     if (xerr != XmlError::Ok) {
-#ifdef WINTERGREEN_DIAG_STREAMING
-      last_err = xerr;
-      exit_reason = "error";
-#endif
       break;
     }
     if (ev.type == XmlEventType::EndOfFile) {
-#ifdef WINTERGREEN_DIAG_STREAMING
-      exit_reason = "eof";
-#endif
       break;
     }
     if (ev.type == XmlEventType::EndElement && sv_eq(ev.name, "body")) {
-#ifdef WINTERGREEN_DIAG_STREAMING
-      exit_reason = "body";
-#endif
       break;
     }
-
-#ifdef WINTERGREEN_DIAG_STREAMING
-    event_count++;
-    if (ev.type == XmlEventType::StartElement) {
-      start_count++;
-      // Track if we see unexpected elements
-    } else if (ev.type == XmlEventType::EndElement)
-      end_count++;
-    else if (ev.type == XmlEventType::Text)
-      text_count++;
-#endif
-
-#ifdef ESP_PLATFORM
-    prev_type = ev.type;
-    dispatch_t0 = esp_timer_get_time();
-#endif
 
     if (ev.type == XmlEventType::StartElement) {
       if (sv_eq(ev.name, "img") || sv_eq(ev.name, "image")) {
@@ -1609,14 +1481,8 @@ static EpubError parse_xhtml_events(XmlReader& reader, const CssStylesheet* inli
       const char* cls_p = class_sv.data ? class_sv.data : nullptr;
       size_t cls_len = class_sv.length;
 
-#ifdef ESP_PLATFORM
-      int64_t css_t0 = esp_timer_get_time();
-#endif
       CssRule style = inline_rule + effective_inline->get(el_p, el_len, id_p, id_len, cls_p, cls_len) +
                       eff_ext.get(el_p, el_len, id_p, id_len, cls_p, cls_len);
-#ifdef ESP_PLATFORM
-      css_us += esp_timer_get_time() - css_t0;
-#endif
 
       // Apply browser-default margins for elements that usually have them.
       // Only apply if no explicit margin-left was set by CSS.
@@ -2000,24 +1866,8 @@ static EpubError parse_xhtml_events(XmlReader& reader, const CssStylesheet* inli
         parser.drop_cap_depth_.reset();
       }
       parser.push_text(ev.content.data, ev.content.length);
-#ifdef ESP_PLATFORM
-      text_bytes += ev.content.length;
-#endif
     }
   }
-
-#ifdef ESP_PLATFORM
-  parser.emit_us_ = nullptr;
-  ESP_LOGD("perf", "  head=%ldms xml=%ldms css=%ldms elem=%ldms end=%ldms text=%ldms emit=%ldms  events=%u txtB=%u",
-           (long)(head_us / 1000), (long)(xml_us / 1000), (long)(css_us / 1000), (long)(elem_us / 1000),
-           (long)(end_us / 1000), (long)(text_us / 1000), (long)(emit_us / 1000), (unsigned)event_count,
-           (unsigned)text_bytes);
-#endif
-
-#ifdef WINTERGREEN_DIAG_STREAMING
-  fprintf(stderr, "DIAG: events=%zu start=%zu end=%zu text=%zu exit=%s err=%d\n", event_count, start_count, end_count,
-          text_count, exit_reason, (int)last_err);
-#endif
 
   return EpubError::Ok;
 }

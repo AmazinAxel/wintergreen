@@ -25,9 +25,11 @@ class LyraExtScreen final : public ListMenuScreen {
 
   void update(const ButtonState& buttons, DrawBuffer& buf, IRuntime& runtime) override;
 
+
  protected:
   void on_start() override;
   void on_select(int index) override;
+  // Back never reaches the base class — update() resolves it on release.
   void on_back() override {}
 
  private:
@@ -51,9 +53,14 @@ class LyraExtScreen final : public ListMenuScreen {
 
   BitmapFont author_font_;
 
-  static constexpr int kHiddenHoldFrames = 60;  // ~1.5 s at a 25 ms frame
-  int  back_hold_frames_ = 0;
+  // Wall time, not frames — see the note in CLAUDE.md.
+  static constexpr uint32_t kHiddenHoldMs = 3000;
+  uint32_t back_hold_ms_ = 0;
   bool back_was_down_    = false;
+  // Set on every start: MainMenu pops on the back *press*, so this screen comes
+  // back with the button still down. Without swallowing that first hold, its
+  // release would read as a fresh tap and re-open the list immediately.
+  bool back_ignore_      = true;
 
   // Scales the slot's cover into a box_w × box_h box, preserving aspect.
   void load_cover_(int slot_idx, int box_w, int box_h) const;

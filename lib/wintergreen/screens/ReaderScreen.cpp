@@ -53,6 +53,11 @@ bool ReaderScreen::decode_image_to_buffer_(uint16_t img_key, uint32_t offset, ui
                                            uint16_t clip_h) {
   if (offset == 0 || size == 0)
     return false;
+  // Refreshes are fired without waiting, so the previous page's waveform may still
+  // be running. The SD card shares SPI2 with the panel and concurrent traffic
+  // corrupts an update in flight, so drain before touching the card. Text-only
+  // pages never reach here and keep the full overlap.
+  buf.wait_panel_idle();
   char cache_path[256];
   snprintf(cache_path, sizeof(cache_path), "%s/img_%u_%ux%u.bin", book_cache_dir_.c_str(),
            static_cast<unsigned>(img_key), static_cast<unsigned>(max_w), static_cast<unsigned>(max_h));
@@ -263,18 +268,12 @@ void ReaderScreen::start(DrawBuffer& buf, IRuntime& runtime) {
 
   buf_was_touched_ = false;
 
-  // There is no on-device conversion. A book is a .mrb produced by
-  // tools/epub2mrb; if it will not open there is nothing to fall back to, so
-  // say so rather than grinding through an EPUB parse the device no longer has
-  // the code for.
   if (!mrb_ok) {
     MR_LOGI("reader", "mrb open failed: '%s'", mrb_path_.c_str());
     open_ok_ = false;
     goto show_error;
   }
 
-  // Derive a stable book key from MRB metadata (title + author).
-  // This survives epub file renames while staying unique across different books.
   book_key_ = make_book_key(mrb_.metadata());
   pos_path_ = std::string(data_dir_) + "/" + book_key_ + ".pos";
 
@@ -350,12 +349,18 @@ void ReaderScreen::resume(DrawBuffer& buf, IRuntime& runtime) {
 }
 
 void ReaderScreen::stop() {
-  if (open_ok_)
+  if (open_ok_) {
+    // .pos is an SD write and the panel may still be mid-refresh — see the note in
+    // decode_image_to_buffer_. This is the only reader path that writes the card.
+    if (buf_)
+      buf_->wait_panel_idle();
     save_position_();
+  }
   image_size_fn_ = {};
   chapter_src_.reset();
   mrb_.close();
   page_ = PageContent{};
+  page_cache_ = LaidOutPageCache{};  // its words pointed into the source just freed
   mrb_path_.clear();
   mrb_path_.shrink_to_fit();
   pos_path_.clear();
@@ -371,7 +376,7 @@ void ReaderScreen::stop() {
   buf_ = nullptr;
 }
 
-void ReaderScreen::update(const ButtonState& buttons, DrawBuffer& buf, IRuntime& /*runtime*/) {
+void ReaderScreen::update(const ButtonState& buttons, DrawBuffer& buf, IRuntime& runtime) {
   if (!open_ok_) {
     // Auto-pop if the book was never found (no display was touched).
     // Otherwise wait for back button so user can see the error message.
@@ -392,17 +397,25 @@ void ReaderScreen::update(const ButtonState& buttons, DrawBuffer& buf, IRuntime&
 
   // Process press events in the order they arrived.
   int page_delta = 0;
-  bool had_next_press = false;
-  bool had_prev_press = false;
 
-  // Side rocker: the lower button always advances, in every orientation. This
-  // started out orientation-dependent, but both holds turned out to want the
-  // same thing on hardware, so the branch is gone rather than left as a no-op.
-  const bool inv_side = !(app_ && app_->invert_side_buttons());
+  // Side rocker, which is one physical control whose ends swap places when the
+  // device is turned. Rotating to landscape flips it; portrait uses the
+  // configured mapping as-is:
+  //
+  //   portrait   Up = next,   Down = prev
+  //   landscape  Down = next, Up   = prev
+  //
+  // Landscape is Deg0 or Deg180 — "reversed" is still the same physical hold, so
+  // testing only Deg0 would leave the flipped case behaving like portrait.
+  const Rotation rot = buf.rotation();
+  const bool landscape_hold = (rot == Rotation::Deg0 || rot == Rotation::Deg180);
+  bool inv_side = app_ && app_->invert_side_buttons();
+  if (landscape_hold)
+    inv_side = !inv_side;
   const bool inv_bottom = app_ && app_->invert_bottom_paging();
 
+  // Front row is fixed to the panel and does not rotate with the hold.
   // Default: Button3=next, Button2=prev (inv_bottom=true flips front buttons).
-  // Side: Down=next, Up=prev.
   Button logical_next_front = inv_bottom ? Button::Button2 : Button::Button3;
   Button logical_prev_front = inv_bottom ? Button::Button3 : Button::Button2;
   Button logical_next_side = inv_side ? Button::Down : Button::Up;
@@ -412,10 +425,8 @@ void ReaderScreen::update(const ButtonState& buttons, DrawBuffer& buf, IRuntime&
   while (buttons.next_press(btn)) {
     if (btn == logical_next_front || btn == logical_next_side) {
       ++page_delta;
-      had_next_press = true;
     } else if (btn == logical_prev_front || btn == logical_prev_side) {
       --page_delta;
-      had_prev_press = true;
     } else {
       switch (btn) {
         case Button::Button0:
@@ -436,13 +447,12 @@ void ReaderScreen::update(const ButtonState& buttons, DrawBuffer& buf, IRuntime&
     }
   }
 
-  // Hold-down: advance one page per frame while a nav button is held,
-  // but only if no fresh press event arrived this frame (avoids double-counting
-  // the initial press).
-  if (!had_next_press && (buttons.is_down(logical_next_front) || buttons.is_down(logical_next_side)))
-    ++page_delta;
-  if (!had_prev_press && (buttons.is_down(logical_prev_front) || buttons.is_down(logical_prev_side)))
-    --page_delta;
+  // Hold-down: keep paging while a nav button is held. Gated on elapsed hold time,
+  // not on frames — the press itself is already counted above, and a tap must never
+  // add a repeat no matter how fast the frame loop happens to be running.
+  const uint32_t dt_ms = runtime.frame_time_ms();
+  page_delta += hold_next_.tick(buttons.is_down(logical_next_front) || buttons.is_down(logical_next_side), dt_ms);
+  page_delta -= hold_prev_.tick(buttons.is_down(logical_prev_front) || buttons.is_down(logical_prev_side), dt_ms);
 
   bool changed = false;
   if (page_delta > 0) {
@@ -459,7 +469,30 @@ void ReaderScreen::update(const ButtonState& buttons, DrawBuffer& buf, IRuntime&
   }
 }
 
+void ReaderScreen::cache_page_(PageContent&& pc) {
+  page_cache_.valid = true;
+  page_cache_.chapter_idx = chapter_idx_;
+  page_cache_.pos = pc.start;
+  page_cache_.opts = last_opts_;
+  page_cache_.font_size_idx = reader_settings_.font_size_idx;
+  page_cache_.page = std::move(pc);
+}
+
+bool ReaderScreen::take_cached_page_(const PagePosition& pos, const PageOptions& opts) {
+  if (!page_cache_.valid || page_cache_.chapter_idx != chapter_idx_ || !(page_cache_.pos == pos) ||
+      !(page_cache_.opts == opts) || page_cache_.font_size_idx != reader_settings_.font_size_idx)
+    return false;
+  // Move, never copy: LayoutWord::text points into MrbChapterSource's paragraph
+  // window, so only one PageContent may be live at a time.
+  page_ = std::move(page_cache_.page);
+  page_cache_ = LaidOutPageCache{};
+  return true;
+}
+
 void ReaderScreen::load_chapter_(size_t idx) {
+  // Rebuilding the source frees every paragraph slot the cached page's words point
+  // into. Nothing in the key can detect that, so it has to be dropped explicitly.
+  page_cache_ = LaidOutPageCache{};
   chapter_src_.reset();
   if (idx < mrb_.chapter_count()) {
     chapter_src_ = std::make_unique<MrbChapterSource>(mrb_, static_cast<uint16_t>(idx));
@@ -489,13 +522,18 @@ void ReaderScreen::render_page_(DrawBuffer& buf) {
   opts.padding_bottom = bottom_padding_(landscape);
   layout_engine_.set_font(font);
   layout_engine_.set_options(opts);
+  last_opts_ = opts;
+  // resolve_stable_position can move page_pos_, so the cache is keyed on the
+  // resolved value — checking before this point would match the wrong page.
   page_pos_ = layout_engine_.resolve_stable_position(page_pos_);
   layout_engine_.set_position(page_pos_);
 
 #ifdef ESP_PLATFORM
   int64_t t_layout = esp_timer_get_time();
 #endif
-  page_ = layout_engine_.layout();
+  const bool cached = take_cached_page_(page_pos_, opts);
+  if (!cached)
+    page_ = layout_engine_.layout();
 #ifdef ESP_PLATFORM
   long layout_us = (long)(esp_timer_get_time() - t_layout);
 #endif
@@ -601,9 +639,9 @@ void ReaderScreen::render_page_(DrawBuffer& buf) {
   long render_us = (long)(esp_timer_get_time() - t0);
   long draw_us = (long)(esp_timer_get_time() - t_draw);
   ESP_LOGI("perf",
-           "render_page: %ldms total (layout=%ldms[miss=%d para=%ldms hyph=%ldms metrics=%ldms] draw=%ldms) words=%d "
-           "images=%d",
-           render_us / 1000, layout_us / 1000, g_layout_cache_misses, (long)(g_layout_para_us / 1000),
+           "render_page: %ldms total (layout=%ldms[cached=%d miss=%d para=%ldms hyph=%ldms metrics=%ldms] "
+           "draw=%ldms) words=%d images=%d",
+           render_us / 1000, layout_us / 1000, (int)cached, g_layout_cache_misses, (long)(g_layout_para_us / 1000),
            (long)(g_layout_hyph_us / 1000), (long)(g_layout_metrics_us / 1000), draw_us / 1000, n_words,
            (int)images.size());
 #endif
@@ -725,6 +763,7 @@ bool ReaderScreen::prev_page_() {
       layout_engine_.set_position(PagePosition{end_para, 0});
       auto pc = layout_engine_.layout_backward();
       page_pos_ = pc.start;
+      cache_page_(std::move(pc));
       return true;
     }
     return false;
@@ -737,6 +776,9 @@ bool ReaderScreen::prev_page_() {
   layout_engine_.set_position(end);
   auto pc = layout_engine_.layout_backward();
   page_pos_ = pc.start;
+  // The page we just navigated to is fully laid out right here. Keep it instead of
+  // making render_page_ lay out the identical page a second time.
+  cache_page_(std::move(pc));
   return true;
 }
 

@@ -11,14 +11,12 @@ set(lib_sources
     ${LIB}/screens/MainMenu.cpp
     ${LIB}/screens/ReaderScreen.cpp
     ${LIB}/screens/ReaderOptionsScreen.cpp
-    ${LIB}/screens/HiddenBooksMenu.cpp
     ${LIB}/screens/LyraExtScreen.cpp
     ${LIB}/content/CoverPaths.cpp
     ${LIB}/content/ZipReader.cpp
     ${LIB}/content/TextLayout.cpp
     ${LIB}/content/hyphenation/Hyphenation.cpp
     ${LIB}/content/BookIndex.cpp
-    ${LIB}/content/mrb/MrbWriter.cpp
     ${LIB}/content/mrb/MrbReader.cpp
     ${LIB}/content/ImageDecoder.cpp
     ${LIB}/content/JpegDecoder.cpp

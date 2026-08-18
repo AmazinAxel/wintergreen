@@ -57,7 +57,6 @@ class CssCache {
   size_t total_bytes_ = 0;
   uint32_t gen_ = 0;
 
-  static bool low_memory();
   // Returns the index of the best LRU candidate with last_used_gen <= protect_gen
   // (or any entry when protect_gen == 0). Returns kMaxEntries if none found.
   size_t find_evict_slot(uint32_t protect_gen) const;

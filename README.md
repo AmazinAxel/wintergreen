@@ -35,10 +35,16 @@ namespace wintergreen::config {
   inline constexpr bool kSunlightFadingFix = false;
   inline constexpr uint8_t kAutoSleepMinutes = 1;
   inline constexpr uint32_t kPowerHoldSleepMs = 400;
+
+  inline constexpr uint32_t kHoldDelayMs = 350;
+  inline constexpr uint32_t kHoldRepeatMs = 175;
+  inline constexpr int kHoldAccelStep = 1;
 }
 ```
 
 If you use a white Xteink in the sun, I recommend enabling the fading fix, but it can cause more full screen refreshes. Auto sleep should be set to as low a value as comfortably possible. I personally recommend 1-2 minutes, depending on your reading speed.
+
+The button timing should also be modified to your liking! Especially to scroll through a large library of books or chapters, I suggest lower values for repeating and hold.
 
 The prebuilt binaries ship with the default config from above! If you want to modify those values, you'd have to build it from scratch.
 

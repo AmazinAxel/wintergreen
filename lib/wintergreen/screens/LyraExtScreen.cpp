@@ -145,6 +145,10 @@ void LyraExtScreen::on_start() {
     BookIndex::instance().load(idx_path);
   }
 
+  back_ignore_ = true;
+  back_was_down_ = false;
+  back_hold_ms_ = 0;
+
   num_books_ = 0;
   for (int i = 0; i < kMaxBooks; ++i)
     slots_[i] = BookSlot{};
@@ -190,26 +194,50 @@ void LyraExtScreen::on_select(int index) {
   app_->push_screen(ScreenId::Reader);
 }
 
+// Back is handled here rather than through on_back(): a tap opens the book list
+// and a ~3 s hold opens it with the hidden books revealed, and the two can only
+// be told apart when the button comes back up.
+//
+// Resolving on release is also what keeps the pushed screen clean. MainMenu used
+// to own this gesture, and because the push happened on the *press*, MainMenu
+// started with Button0 still physically down — its own release handler then fired
+// immediately and popped it. The list appeared only for as long as the button was
+// held. Any screen that pushes another on a button press has this problem.
 void LyraExtScreen::update(const ButtonState& buttons, DrawBuffer& buf, IRuntime& runtime) {
-  // Back is handled here, not by the base class: a tap opens the full book list,
-  // a long hold opens Hidden Books, and the two can only be told apart on release.
-  const bool back_down = buttons.is_down(Button::Button0);
   ButtonState fwd = buttons;
-  if (back_down) {
-    if (back_hold_frames_ <= kHiddenHoldFrames) back_hold_frames_++;
-    fwd.pressed_latch &= ~(1u << static_cast<uint8_t>(Button::Button0));
+  const bool back_down = buttons.is_down(Button::Button0);
+
+  // Strip Button0 from what the base class sees, always: it must never fire
+  // on_back(), and a press that arrived before this screen started is dropped
+  // here too.
+  fwd.pressed_latch &= ~(1u << static_cast<uint8_t>(Button::Button0));
+  {
     uint8_t nc = 0;
     for (uint8_t i = 0; i < fwd.press_history_count; ++i)
       if (static_cast<Button>(fwd.press_history[i]) != Button::Button0)
         fwd.press_history[nc++] = fwd.press_history[i];
     fwd.press_history_count = nc;
+  }
+
+  if (back_ignore_) {
+    if (!back_down)
+      back_ignore_ = false;
+    ListMenuScreen::update(fwd, buf, runtime);
+    return;
+  }
+
+  if (back_down) {
+    if (back_hold_ms_ <= kHiddenHoldMs)
+      back_hold_ms_ += runtime.frame_time_ms();
     back_was_down_ = true;
   } else if (back_was_down_) {
     back_was_down_ = false;
-    const int held = back_hold_frames_;
-    back_hold_frames_ = 0;
-    if (app_)
-      app_->push_screen(held >= kHiddenHoldFrames ? ScreenId::HiddenBooks : ScreenId::MainMenu);
+    const uint32_t held = back_hold_ms_;
+    back_hold_ms_ = 0;
+    if (app_) {
+      app_->main_menu()->set_show_hidden(held >= kHiddenHoldMs);
+      app_->push_screen(ScreenId::MainMenu);
+    }
     return;
   }
   ListMenuScreen::update(fwd, buf, runtime);

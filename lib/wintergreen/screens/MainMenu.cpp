@@ -4,9 +4,11 @@
 #include <cctype>
 #include <cstdio>
 #include <cstring>
+#include <queue>
 
 #include "../Application.h"
 #include "../content/BookIndex.h"
+#include "../content/mrb/MrbReader.h"
 
 #ifdef ESP_PLATFORM
 #include <dirent.h>
@@ -42,6 +44,11 @@ void MainMenu::on_start() {
   // is indistinguishable from "never scanned". Treating it as authoritative is
   // a trap: the card gets books added, the empty index still loads fine, and
   // nothing ever rescans, so the library stays permanently empty.
+  // Hidden books are revealed by the home screen's back long-press, which sets
+  // the flag before pushing this screen.
+  if (show_hidden_ && hidden_.empty())
+    scan_hidden_();
+
   const bool loaded = BookIndex::instance().load(index_path);
   if (loaded && !BookIndex::instance().entries().empty()) {
     populate_list_();
@@ -53,34 +60,6 @@ void MainMenu::on_start() {
 }
 
 void MainMenu::update(const ButtonState& buttons, DrawBuffer& buf, IRuntime& runtime) {
-  // Long-press back (~3s) → hidden books; short press → Settings (on_back()).
-  // While held we suppress Button0 from the forwarded state so ListMenuScreen
-  // doesn't fire on_back() mid-hold. On release we decide which action to take.
-  const bool back_down = buttons.is_down(Button::Button0);
-  ButtonState fwd = buttons;
-  if (back_down) {
-    if (back_hold_frames_ <= kHiddenHoldFrames)
-      back_hold_frames_++;
-    // Strip Button0 from the copy so ListMenuScreen never sees the press.
-    fwd.pressed_latch &= ~(1u << static_cast<uint8_t>(Button::Button0));
-    uint8_t nc = 0;
-    for (uint8_t i = 0; i < fwd.press_history_count; ++i)
-      if (static_cast<Button>(fwd.press_history[i]) != Button::Button0)
-        fwd.press_history[nc++] = fwd.press_history[i];
-    fwd.press_history_count = nc;
-    back_was_down_ = true;
-  } else if (back_was_down_) {
-    back_was_down_ = false;
-    const int held = back_hold_frames_;
-    back_hold_frames_ = 0;
-    if (held >= kHiddenHoldFrames) {
-      if (app_) app_->push_screen(ScreenId::HiddenBooks);
-    } else {
-      on_back();
-    }
-    return;
-  }
-
   // Detect external mutations (serial upload/delete/rename) while this screen
   // is visible. The generation counter is bumped by BookIndex on every
   // mutation that changes the logical contents.
@@ -101,14 +80,20 @@ void MainMenu::update(const ButtonState& buttons, DrawBuffer& buf, IRuntime& run
     cached_generation_ = BookIndex::instance().generation();
   }
 
-  ListMenuScreen::update(fwd, buf, runtime);
+  ListMenuScreen::update(buttons, buf, runtime);
 }
 
 void MainMenu::on_select(int index) {
   if (is_separator(index)) return;
-  int real = entries_index_for(index);
-  app_->record_book_opened(entries_[real].path);
-  app_->reader()->set_path(entries_[real].path.c_str());
+  const int real = entries_index_for(index);
+  if (real < 0 || real >= static_cast<int>(entries_.size())) return;
+  const BookEntry& e = entries_[real];
+  // A hidden book is never recorded: mark_opened() would do nothing (it is not
+  // indexed) and the index save would be pointless, but more to the point a
+  // hidden book must not surface in the recents carousel.
+  if (!e.hidden)
+    app_->record_book_opened(e.path);
+  app_->reader()->set_path(e.path.c_str());
   app_->push_screen(ScreenId::Reader);
 }
 
@@ -117,6 +102,10 @@ void MainMenu::stop() {
   if (!cur.empty())
     initial_selection_ = cur;
 
+  // Revealing hidden books lasts only as long as the screen does — leaving and
+  // coming back means performing the gesture again.
+  show_hidden_ = false;
+  { std::vector<BookEntry> tmp; hidden_.swap(tmp); }
   { std::vector<BookEntry> tmp; entries_.swap(tmp); }
   free_items_storage();
   BookIndex::instance().clear_entries();
@@ -141,6 +130,77 @@ void MainMenu::scan_directory_(DrawBuffer& buf) {
   buf.reset_after_scratch(true);
 }
 
+// Name of the directory containing `path` — the title fallback for a book whose
+// MRB metadata is empty, matching what BookIndex does for visible books.
+static std::string folder_name_of(const std::string& path) {
+  const size_t last = path.find_last_of('/');
+  if (last == std::string::npos || last == 0)
+    return path;
+  const size_t prev = path.find_last_of('/', last - 1);
+  const size_t start = prev == std::string::npos ? 0 : prev + 1;
+  return path.substr(start, last - start);
+}
+
+void MainMenu::scan_hidden_() {
+  hidden_.clear();
+  if (!books_dir_)
+    return;
+
+  std::vector<std::string> paths;
+  std::queue<std::string> q;
+  q.push(std::string(books_dir_) + "/.hidden");
+  while (!q.empty()) {
+    const std::string dir = std::move(q.front());
+    q.pop();
+#ifdef ESP_PLATFORM
+    DIR* d = opendir(dir.c_str());
+    if (!d) continue;
+    struct dirent* ent;
+    while ((ent = readdir(d)) != nullptr) {
+      if (ent->d_name[0] == '.') continue;  // only the .hidden root itself is a dot dir
+      const std::string full = dir + "/" + ent->d_name;
+      if (ent->d_type == DT_DIR)
+        q.push(full);
+      else if (BookIndex::is_mrb_path(full.c_str()))
+        paths.push_back(full);
+    }
+    closedir(d);
+#else
+    try {
+      for (const auto& e : fs::directory_iterator(dir, fs::directory_options::skip_permission_denied)) {
+        std::string full = e.path().string();
+        for (char& c : full) if (c == '\\') c = '/';
+        if (e.path().filename().string()[0] == '.') continue;
+        if (e.is_directory())
+          q.push(full);
+        else if (BookIndex::is_mrb_path(full.c_str()))
+          paths.push_back(full);
+      }
+    } catch (...) {}
+#endif
+  }
+
+  for (auto& p : paths) {
+    BookEntry e;
+    MrbReader r;
+    if (!r.open(p.c_str()))
+      continue;
+    e.title_own = r.metadata().title;
+    e.author_own = r.metadata().author.value_or("");
+    r.close();
+    if (e.title_own.empty() || e.title_own == "none")
+      e.title_own = folder_name_of(p);
+    e.path = std::move(p);
+    e.hidden = true;
+    e.mrb_exists = true;
+    hidden_.push_back(std::move(e));
+  }
+
+  std::sort(hidden_.begin(), hidden_.end(), [](const BookEntry& a, const BookEntry& b) {
+    return ci_less(a.title_own, b.title_own);
+  });
+}
+
 int MainMenu::count() const {
   return static_cast<int>(entries_.size()) + static_cast<int>(separators_.size());
 }
@@ -162,7 +222,7 @@ std::string_view MainMenu::get_item_label(int index) const {
     return {};
   const StringPool& pool = BookIndex::instance().pool();
   const BookEntry& e = entries_[real];
-  const auto title_sv = e.title_ref.view(pool);
+  const std::string_view title_sv = e.hidden ? std::string_view(e.title_own) : e.title_ref.view(pool);
 
   // Title only; a trailing middle dot marks an already-converted book.
   if (!e.mrb_exists)
@@ -176,6 +236,10 @@ std::string_view MainMenu::get_item_subtitle(int index) const {
   int real = entries_index_for(index);
   if (real < 0 || real >= static_cast<int>(entries_.size())) return {};
   const BookEntry& e = entries_[real];
+  if (e.hidden) {
+    subtitle_buf_ = e.author_own;
+    return subtitle_buf_;
+  }
   const StringPool& pool = BookIndex::instance().pool();
 
   subtitle_buf_ = e.author_ref.view(pool);
@@ -232,8 +296,22 @@ void MainMenu::populate_list_() {
   for (int i = 0; i < static_cast<int>(entries_.size()); ++i) {
     if (entries_[i].last_open_order == 0) { split = i; break; }
   }
-  if (split > 0 && split < static_cast<int>(entries_.size()))
-    separators_.push_back({split, ""});
+
+  // Hidden books go above everything, behind their own divider. They are
+  // inserted after the sort so they keep their own alphabetical order and are
+  // never mixed into the recently-opened group.
+  const int n_hidden = show_hidden_ ? static_cast<int>(hidden_.size()) : 0;
+  if (n_hidden > 0) {
+    entries_.insert(entries_.begin(), hidden_.begin(), hidden_.end());
+    split += n_hidden;
+  }
+
+  // Separator positions are *visual* indices, so a separator shifts every one
+  // below it by a row.
+  if (n_hidden > 0 && n_hidden < static_cast<int>(entries_.size()))
+    separators_.push_back({n_hidden, ""});
+  if (split > n_hidden && split < static_cast<int>(entries_.size()))
+    separators_.push_back({split + (n_hidden > 0 ? 1 : 0), ""});
 
   if (!initial_selection_.empty()) {
     for (int i = 0; i < static_cast<int>(entries_.size()); ++i) {

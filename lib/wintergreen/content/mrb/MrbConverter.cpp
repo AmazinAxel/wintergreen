@@ -7,15 +7,6 @@
 #include "../EpubParser.h"
 #include "../ZipReader.h"
 
-#ifdef ESP_PLATFORM
-#include "esp_heap_caps.h"
-#include "esp_log.h"
-#include "esp_system.h"
-#include "esp_timer.h"
-#include "freertos/FreeRTOS.h"
-#include "freertos/task.h"
-#endif
-
 namespace wintergreen {
 
 // Shared image-key remapping used by both converter paths.
@@ -76,10 +67,6 @@ bool write_split_paragraph(MrbWriter& writer, Paragraph& para) {
 
   if (est <= kMaxSerializedBody)
     return writer.write_paragraph(para);
-
-#ifdef ESP_PLATFORM
-  ESP_LOGI("split", "splitting para: runs=%u est=%u", (unsigned)para.text.runs.size(), (unsigned)est);
-#endif
 
   // Write the paragraph as a series of chunks, each within kMaxSerializedBody bytes.
   // We track slice indices into para.text.runs — no intermediate vector is allocated.
@@ -144,9 +131,6 @@ bool convert_epub_to_mrb_streaming(Book& book, const char* output_path, uint8_t*
                                    std::function<void(int, int)> progress_cb) {
   MrbWriter writer;
   if (!writer.open(output_path)) {
-#ifdef ESP_PLATFORM
-    ESP_LOGE("mrb", "writer.open failed: %s", output_path);
-#endif
     return false;
   }
 
@@ -167,10 +151,6 @@ bool convert_epub_to_mrb_streaming(Book& book, const char* output_path, uint8_t*
 
   std::vector<ImageMapping> image_map;
   const auto& zip = book.epub().zip();
-
-#ifdef ESP_PLATFORM
-  int64_t total_start = esp_timer_get_time();
-#endif
 
   // --- Fragment → para_index resolution setup ---
   // Build a working copy of the TOC early so we can resolve fragment anchors.
@@ -203,10 +183,6 @@ bool convert_epub_to_mrb_streaming(Book& book, const char* output_path, uint8_t*
     uint16_t current_zip_file_idx;
     uint16_t current_chapter_idx;
     // (anchors are written directly to the MrbWriter as they arrive)
-#ifdef ESP_PLATFORM
-    int64_t write_us;  // time in write_paragraph (MRB I/O)
-    size_t para_count;
-#endif
   };
   SinkCtx ctx{};
   ctx.writer = &writer;
@@ -217,14 +193,6 @@ bool convert_epub_to_mrb_streaming(Book& book, const char* output_path, uint8_t*
   ctx.toc_work = &toc_work;
   ctx.current_zip_file_idx = 0;
   ctx.current_chapter_idx = 0;
-#ifdef ESP_PLATFORM
-  ctx.write_us = 0;
-  ctx.para_count = 0;
-  unsigned total_paras = 0;
-  long slowest_ms = 0;
-  int slowest_ci = -1;
-  int64_t last_log_us = esp_timer_get_time();
-#endif
 
   // ID sink: always active.
   // Resolves TOC fragment anchors AND collects all id→para mappings for runtime link navigation.
@@ -252,18 +220,8 @@ bool convert_epub_to_mrb_streaming(Book& book, const char* output_path, uint8_t*
 
     remap_paragraph_images(para, *c.writer, *c.image_map, *c.zip);
 
-#ifdef ESP_PLATFORM
-    int64_t t0 = esp_timer_get_time();
-#endif
     bool write_ok = write_split_paragraph(*c.writer, para);
-#ifdef ESP_PLATFORM
-    c.write_us += esp_timer_get_time() - t0;
-    c.para_count++;
-#endif
     if (!write_ok) {
-#ifdef ESP_PLATFORM
-      ESP_LOGE("mrb", "write_split_paragraph failed at ch %u", (unsigned)c.current_chapter_idx);
-#endif
       c.error = true;
     }
   };
@@ -271,17 +229,10 @@ bool convert_epub_to_mrb_streaming(Book& book, const char* output_path, uint8_t*
   for (size_t ci = 0; ci < book.chapter_count(); ++ci) {
     writer.begin_chapter();
 
-#ifdef ESP_PLATFORM
-    int64_t ch_start = esp_timer_get_time();
-#endif
-
     ctx.current_zip_file_idx = static_cast<uint16_t>(book.epub().spine()[ci].file_idx);
     ctx.current_chapter_idx = static_cast<uint16_t>(ci);
     book.load_chapter_streaming(ci, sink, &ctx, work_buf, xml_buf, id_sink, &ctx);
     if (ctx.error) {
-#ifdef ESP_PLATFORM
-      ESP_LOGE("mrb", "ctx.error after ch %u", (unsigned)ci);
-#endif
       return false;
     }
 
@@ -290,22 +241,6 @@ bool convert_epub_to_mrb_streaming(Book& book, const char* output_path, uint8_t*
     if (progress_cb)
       progress_cb(static_cast<int>(ci + 1), static_cast<int>(book.chapter_count()));
 
-#ifdef ESP_PLATFORM
-    long ch_ms = (long)((esp_timer_get_time() - ch_start) / 1000);
-    total_paras += ctx.para_count;
-    if (ch_ms > slowest_ms) {
-      slowest_ms = ch_ms;
-      slowest_ci = (int)ci;
-    }
-    // Print at most once per second
-    if (esp_timer_get_time() - last_log_us >= 1000000LL) {
-      ESP_LOGI("mrb", "ch %u/%u  %ldms  free=%lu", (unsigned)ci, (unsigned)book.chapter_count(), ch_ms,
-               (unsigned long)esp_get_free_heap_size());
-      last_log_us = esp_timer_get_time();
-    }
-    ctx.write_us = 0;
-    ctx.para_count = 0;
-#endif
   }
 
   // Remap TOC file_idx (zip entry index) → spine index so ReaderScreen::load_chapter_() works.
@@ -374,267 +309,7 @@ bool convert_epub_to_mrb_streaming(Book& book, const char* output_path, uint8_t*
     }
   }
 
-#ifdef ESP_PLATFORM
-  long total_ms = (long)((esp_timer_get_time() - total_start) / 1000);
-  ESP_LOGI("mrb", "TOTAL conversion: %ldms (%u chapters, %u paras, slowest ch%d=%ldms) ok=%d", total_ms,
-           (unsigned)book.chapter_count(), (unsigned)total_paras, slowest_ci, slowest_ms, ok);
-#endif
-
   return ok;
 }
-
-#ifdef ESP_PLATFORM
-void benchmark_epub_conversion(Book& book, const char* tmp_path, long open_ms, uint8_t* work_buf, uint8_t* xml_buf) {
-  static constexpr const char* TAG = "bench";
-  static constexpr size_t kWorkBufSize = ZipEntryInput::kDecompSize + ZipEntryInput::kDictSize + 2048;
-  static constexpr size_t kXmlBufSize = 16384;
-
-  std::unique_ptr<uint8_t[]> owned_work, owned_xml;
-  if (!work_buf) {
-    owned_work = std::make_unique<uint8_t[]>(kWorkBufSize);
-    work_buf = owned_work.get();
-  }
-  if (!xml_buf) {
-    owned_xml = std::make_unique<uint8_t[]>(kXmlBufSize);
-    xml_buf = owned_xml.get();
-  }
-
-  const ZipReader& zip = book.epub().zip();
-  const auto& spine = book.epub().spine();
-  IZipFile& file = book.file();
-  const unsigned nch = (unsigned)book.chapter_count();
-
-  ESP_LOGI(TAG, "=== EPUB BENCHMARK START ===");
-  ESP_LOGI(TAG, "chapters=%u  free=%lu largest=%lu", nch, (unsigned long)esp_get_free_heap_size(),
-           (unsigned long)heap_caps_get_largest_free_block(MALLOC_CAP_8BIT));
-  ESP_LOGI(TAG, "BENCH_OPEN: %ldms", open_ms);
-
-  auto discard_cb = [](const uint8_t*, size_t, void*) -> bool { return true; };
-
-  // BENCH_CONV: full streaming conversion (main metric)
-  ESP_LOGI(TAG, "--- BENCH_CONV ---");
-  int64_t t = esp_timer_get_time();
-  bool ok = convert_epub_to_mrb_streaming(book, tmp_path, work_buf, xml_buf);
-  long t_conv = (long)((esp_timer_get_time() - t) / 1000);
-  long out_bytes = 0;
-  if (ok) {
-    FILE* f2 = fopen(tmp_path, "rb");
-    if (f2) {
-      fseek(f2, 0, SEEK_END);
-      out_bytes = ftell(f2);
-      fclose(f2);
-      remove(tmp_path);
-    }
-  }
-  ESP_LOGI(TAG, "BENCH_CONV: %ldms  output=%ldB  ok=%d", t_conv, out_bytes, ok);
-
-  // BENCH_SEEK: raw SD seek cost — seeks to each chapter's local header, no inflate
-  ESP_LOGI(TAG, "--- BENCH_SEEK (pure SD seek cost, %u seeks) ---", nch);
-  uint8_t lhbuf[30];
-  t = esp_timer_get_time();
-  for (const auto& si : spine) {
-    const ZipEntry& e = zip.entry(si.file_idx);
-    file.seek(e.local_header_offset, SEEK_SET);
-    file.read(lhbuf, sizeof(lhbuf));
-  }
-  long t_seek = (long)((esp_timer_get_time() - t) / 1000);
-  ESP_LOGI(TAG, "BENCH_SEEK: %ldms  avg=%ldms/seek", t_seek, t_seek / (long)nch);
-
-  // BENCH_DECOMP: decompress all chapters to /dev/null (seek + inflate, no parse)
-  ESP_LOGI(TAG, "--- BENCH_DECOMP (decompress only, %u chapters) ---", nch);
-  size_t decomp_bytes = 0;
-  t = esp_timer_get_time();
-  for (const auto& si : spine) {
-    const ZipEntry& e = zip.entry(si.file_idx);
-    decomp_bytes += e.uncompressed_size;
-    zip.extract_streaming(file, e, discard_cb, nullptr, work_buf, kWorkBufSize);
-  }
-  long t_decomp = (long)((esp_timer_get_time() - t) / 1000);
-  ESP_LOGI(TAG, "BENCH_DECOMP: %ldms  %uB", t_decomp, (unsigned)decomp_bytes);
-
-  // BENCH_BUILD: decompress + XML parse + paragraph build (no write)
-  ESP_LOGI(TAG, "--- BENCH_BUILD (decompress + XML + paragraph build) ---");
-  unsigned total_paras = 0;
-  auto count_sink = [](void* ctx, Paragraph&&) { ++(*(unsigned*)ctx); };
-  t = esp_timer_get_time();
-  for (size_t ci = 0; ci < book.chapter_count(); ++ci)
-    book.load_chapter_streaming(ci, count_sink, &total_paras, work_buf, xml_buf);
-  long t_build = (long)((esp_timer_get_time() - t) / 1000);
-  ESP_LOGI(TAG, "BENCH_BUILD: %ldms  paras=%u", t_build, total_paras);
-
-  // BENCH_WRITE: raw fwrite — isolates SD write throughput
-  long t_write = 0;
-  if (out_bytes > 0) {
-    ESP_LOGI(TAG, "--- BENCH_WRITE (raw fwrite %ldB) ---", out_bytes);
-    char wr_path[300];
-    snprintf(wr_path, sizeof(wr_path), "%s.wr", tmp_path);
-    FILE* wf = fopen(wr_path, "wb");
-    if (wf) {
-      // Source bytes are arbitrary — this measures write throughput, not content.
-      // Reuse work_buf rather than a static: it is already allocated, always at
-      // least this large, and BENCH_BUILD is done with it.
-      t = esp_timer_get_time();
-      for (long rem = out_bytes; rem > 0;) {
-        int want = rem < 4096 ? (int)rem : 4096;
-        fwrite(work_buf, 1, (size_t)want, wf);
-        rem -= want;
-      }
-      fclose(wf);
-      t_write = (long)((esp_timer_get_time() - t) / 1000);
-      remove(wr_path);
-      long kbps = t_write > 0 ? (long)(out_bytes / 1024) * 1000 / t_write : 0;
-      ESP_LOGI(TAG, "BENCH_WRITE: %ldms  %ldKB/s", t_write, kbps);
-    }
-  }
-
-  ESP_LOGI(TAG,
-           "=== BENCHMARK DONE: OPEN=%ldms CONV=%ldms SEEK=%ldms DECOMP=%ldms BUILD=%ldms WRITE=%ldms ===", open_ms,
-           t_conv, t_seek, t_decomp, t_build, t_write);
-}
-
-// ---------------------------------------------------------------------------
-// benchmark_image_size_read
-// ---------------------------------------------------------------------------
-
-void benchmark_image_size_read(Book& book, uint8_t* work_buf) {
-  static constexpr const char* TAG = "img_bench";
-
-  IZipFile& file = book.file();
-  const ZipReader& zip = book.epub().zip();
-
-  ESP_LOGI(TAG, "=== IMAGE SIZE BENCHMARK START ===");
-  ESP_LOGI(TAG, "zip_entries=%u  free=%lu largest=%lu", (unsigned)zip.entry_count(),
-           (unsigned long)esp_get_free_heap_size(), (unsigned long)heap_caps_get_largest_free_block(MALLOC_CAP_8BIT));
-
-  // Work buffer for tinfl decompressor + LZ dictionary (~44 KB).
-  // Caller should pass queue.scratch_buf1() (48 KB) to avoid heap allocation.
-  static constexpr size_t kWorkBufSize = ZipEntryInput::kDecompSize + ZipEntryInput::kDictSize + 1024;
-  std::unique_ptr<uint8_t[]> local_work;
-  if (!work_buf) {
-    local_work = std::make_unique<uint8_t[]>(kWorkBufSize);
-    work_buf = local_work.get();
-    if (!work_buf) {
-      ESP_LOGE(TAG, "OOM: no work buffer");
-      return;
-    }
-  }
-
-  unsigned total = 0, ok = 0, fail = 0;
-  int64_t t_total = 0;
-
-  for (unsigned i = 0; i < zip.entry_count(); ++i) {
-    const ZipEntry& entry = zip.entry(i);
-
-    // Filter by file extension — skip XHTML/CSS/NCX without any I/O.
-    auto name = entry.name;
-    auto dot = name.rfind('.');
-    if (dot == std::string_view::npos)
-      continue;
-    auto ext = name.substr(dot + 1);
-    if (ext != "jpg" && ext != "jpeg" && ext != "png" && ext != "JPG" && ext != "JPEG" && ext != "PNG")
-      continue;
-
-    ++total;
-
-    // Stream-decompress only until we have the image dimensions, then stop.
-    // ImageSizeStream state is ~32 bytes; no heap allocation for image data.
-    // PNG needs 24 bytes; JPEG SOF is past all APP/EXIF/ICC segments (may be 20+ KB).
-    ImageSizeStream stream;
-    int64_t t0 = esp_timer_get_time();
-    zip.extract_streaming(
-        file, entry,
-        [](const uint8_t* d, size_t n, void* ud) -> bool { return !static_cast<ImageSizeStream*>(ud)->feed(d, n); },
-        &stream, work_buf, kWorkBufSize);
-    int64_t us = esp_timer_get_time() - t0;
-    t_total += us;
-
-    const char* fmt_str = (ext == "png" || ext == "PNG") ? "PNG " : "JPEG";
-    if (stream.ok()) {
-      ++ok;
-      ESP_LOGI(TAG, "  entry %3u %-4s  %5ux%-5u  %4ldus", i, fmt_str, stream.width(), stream.height(), (long)us);
-    } else {
-      ++fail;
-      ESP_LOGI(TAG, "  entry %3u %-4s  ERR (no SOF found)", i, fmt_str);
-    }
-  }
-
-  long avg_us = total > 0 ? (long)(t_total / total) : 0;
-  ESP_LOGI(TAG, "=== IMAGE SIZE BENCH DONE: images=%u ok=%u fail=%u total=%ldms avg=%ldus ===", total, ok, fail,
-           (long)(t_total / 1000), avg_us);
-}
-
-// ---------------------------------------------------------------------------
-// benchmark_image_decode
-// ---------------------------------------------------------------------------
-
-void benchmark_image_decode(Book& book, uint8_t* work_buf) {
-  static constexpr const char* TAG = "img_decode";
-  // Full display resolution — same cap the ReaderScreen uses.
-  // 480×800 → stride=60, output=48 000 bytes (fits in scratch_buf1).
-  static constexpr uint16_t kMaxW = DrawBuffer::kWidth;
-  static constexpr uint16_t kMaxH = DrawBuffer::kHeight;
-
-  const ZipReader& zip = book.epub().zip();
-
-  ESP_LOGI(TAG, "=== IMAGE DECODE TEST START ===");
-  ESP_LOGI(TAG, "zip_entries=%u  free=%lu largest=%lu", (unsigned)zip.entry_count(),
-           (unsigned long)esp_get_free_heap_size(), (unsigned long)heap_caps_get_largest_free_block(MALLOC_CAP_8BIT));
-
-  // Work buffer for ZipEntryInput (~44 KB).  Caller passes queue.scratch_buf1().
-  static constexpr size_t kWorkBufSize = ZipEntryInput::kDecompSize + ZipEntryInput::kDictSize + 1024;
-  std::unique_ptr<uint8_t[]> local_work;
-  if (!work_buf) {
-    local_work = std::make_unique<uint8_t[]>(kWorkBufSize);
-    work_buf = local_work.get();
-    if (!work_buf) {
-      ESP_LOGE(TAG, "OOM: no work buffer");
-      return;
-    }
-  }
-
-  unsigned total = 0, ok_count = 0, fail_count = 0;
-  int64_t t_total = 0;
-
-  for (unsigned i = 0; i < zip.entry_count(); ++i) {
-    const ZipEntry& entry = zip.entry(i);
-    auto name = entry.name;
-    auto dot = name.rfind('.');
-    if (dot == std::string_view::npos)
-      continue;
-    auto ext = name.substr(dot + 1);
-    bool is_jpeg = (ext == "jpg" || ext == "jpeg" || ext == "JPG" || ext == "JPEG");
-    bool is_png = (ext == "png" || ext == "PNG");
-    if (!is_jpeg && !is_png)
-      continue;
-
-    ++total;
-    const char* fmt_str = is_jpeg ? "JPEG" : "PNG ";
-
-    uint32_t free_before = esp_get_free_heap_size();
-    int64_t t0 = esp_timer_get_time();
-
-    DecodedImage decoded;
-    ImageError err = book.decode_image(i, decoded, kMaxW, kMaxH, work_buf, kWorkBufSize);
-
-    int64_t us = esp_timer_get_time() - t0;
-    t_total += us;
-    uint32_t free_after = esp_get_free_heap_size();
-
-    if (err == ImageError::Ok) {
-      ++ok_count;
-      ESP_LOGI(TAG, "  entry %3u %-4s  %4ux%-4u  OK   %5ldms  heap_delta=%ld", i, fmt_str, decoded.width,
-               decoded.height, (long)(us / 1000), (long)free_before - (long)free_after);
-    } else {
-      ++fail_count;
-      ESP_LOGI(TAG, "  entry %3u %-4s          FAIL err=%d  %5ldms  heap_delta=%ld", i, fmt_str, (int)err,
-               (long)(us / 1000), (long)free_before - (long)free_after);
-    }
-  }
-
-  long avg_ms = total > 0 ? (long)(t_total / 1000 / total) : 0;
-  ESP_LOGI(TAG, "=== IMAGE DECODE TEST DONE: images=%u ok=%u fail=%u total=%ldms avg=%ldms free=%lu===", total,
-           ok_count, fail_count, (long)(t_total / 1000), avg_ms, (unsigned long)esp_get_free_heap_size());
-}
-#endif
 
 }  // namespace wintergreen

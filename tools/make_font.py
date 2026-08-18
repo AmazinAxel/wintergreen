@@ -31,6 +31,12 @@ Rendering choices, for quality:
     quarter-pixel advances this format supports are actually meaningful.
   * The 5 levels are nearest-neighbour bins of coverage (boundaries at 1/8, 3/8,
     5/8, 7/8), which is the correct rounding for evenly spaced output levels.
+  * --mono switches to FT_LOAD_TARGET_MONO and emits no gray planes. That is the
+    right choice when the consumer only ever draws GrayPlane::BW, as the reader
+    now does: thresholding an AA render leaves stems straddling pixel boundaries
+    (blurry and uneven), where mono hinting snaps them to the grid. It also drops
+    two thirds of the bitmap data. The cost is integer advances — the hinter
+    rounds them — so the quarter-pixel field carries whole pixels.
   * Class kerning is extracted from GPOS (and the legacy kern table) and packed
     losslessly: glyphs with identical kerning rows share a class.
 """
@@ -116,6 +122,8 @@ class Glyph:
 
 
 LOAD_FLAGS = freetype.FT_LOAD_RENDER | freetype.FT_LOAD_TARGET_LIGHT
+MONO_LOAD_FLAGS = freetype.FT_LOAD_RENDER | freetype.FT_LOAD_TARGET_MONO
+MONO = False  # set from --mono
 
 
 def glyph_index(face, cp):
@@ -131,7 +139,7 @@ def render_glyph(face, cp):
     gi = glyph_index(face, cp)
     if gi == 0:
         return None
-    face.load_glyph(gi, LOAD_FLAGS)
+    face.load_glyph(gi, MONO_LOAD_FLAGS if MONO else LOAD_FLAGS)
     slot = face.glyph
     bmp = slot.bitmap
 
@@ -147,6 +155,19 @@ def render_glyph(face, cp):
         return g
 
     stride = (g.width + 7) // 8
+
+    if MONO:
+        # FreeType hands back a bit-packed, MSB-first plane where 1 = ink; the
+        # BW plane wants 0 = ink, and its padding bits white. Inverting does
+        # both, since FreeType leaves the padding clear.
+        bw = bytearray(stride * g.height)
+        for row in range(g.height):
+            src = row * bmp.pitch
+            for i in range(stride):
+                bw[row * stride + i] = ~bmp.buffer[src + i] & 0xFF
+        g.bw, g.lsb, g.msb = bytes(bw), b"", b""
+        return g
+
     bw = bytearray(b"\xff" * (stride * g.height))
     lsb = bytearray(stride * g.height)
     msb = bytearray(stride * g.height)
@@ -442,8 +463,9 @@ def build_mbf(faces, px, name, kern_sources=None, line_height_pct=None):
             offsets[style].append(seen[key])
 
     bitmap_data_offset = off
-    gray_lsb_offset = bitmap_data_offset + len(bw_pool)
-    gray_msb_offset = gray_lsb_offset + len(lsb_pool)
+    # 0 = plane absent (BitmapFont::has_grayscale keys off this).
+    gray_lsb_offset = 0 if MONO else bitmap_data_offset + len(bw_pool)
+    gray_msb_offset = 0 if MONO else gray_lsb_offset + len(lsb_pool)
 
     glyph_height = max((g.height for g in styles["regular"]), default=px)
     underline_pos = max(1, px // 10)
@@ -580,6 +602,12 @@ def main():
             "metrics, which vary enough between families to change how the reader's "
             "line-height setting feels.",
         )
+        p.add_argument(
+            "--mono",
+            action="store_true",
+            help="hinted 1-bit rendering, no gray planes. For consumers that only draw "
+            "GrayPlane::BW.",
+        )
 
     b = sub.add_parser("bundle", help="reader font: compressed FNTS v2 bundle")
     add_faces(b)
@@ -596,6 +624,9 @@ def main():
     h.add_argument("--out", required=True)
 
     args = ap.parse_args()
+
+    global MONO
+    MONO = args.mono
 
     faces = {}
     kern_sources = {}

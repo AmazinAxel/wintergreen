@@ -760,10 +760,6 @@ void ListMenuScreen::update(const ButtonState& buttons, DrawBuffer& buf, IRuntim
   bool moved = false;       // selection changed — needs a redraw
   bool needs_draw = false;  // on_select returned true — needs a redraw
 
-  // Track whether a fresh press event arrived this frame for each nav direction.
-  bool had_up_press = false;
-  bool had_down_press = false;
-
   bool inv_menu = app_ && app_->invert_menu_buttons();
   // Default (inv_menu=false): Button3=up, Button2=down, Up=up, Down=down.
   Button logical_up_front = inv_menu ? Button::Button2 : Button::Button3;
@@ -777,13 +773,11 @@ void ListMenuScreen::update(const ButtonState& buttons, DrawBuffer& buf, IRuntim
       if (n > 0) {
         move_up();
         moved = true;
-        had_up_press = true;
       }
     } else if (btn == logical_down_front || btn == logical_down_side) {
       if (n > 0) {
         move_down();
         moved = true;
-        had_down_press = true;
       }
     } else {
       switch (btn) {
@@ -817,31 +811,47 @@ void ListMenuScreen::update(const ButtonState& buttons, DrawBuffer& buf, IRuntim
     }
   }
 
-  // Hold-down acceleration: when a nav button is held (no fresh press this frame),
-  // step size grows by 1 each frame: frame 0 = 1, frame 1 = 2, frame 2 = 3, …
-  auto hold_step = [](int frames) -> int { return frames + 1; };
+  // Hold-down: repeats start after config::kHoldDelayMs, then come every
+  // config::kHoldRepeatMs, with the step growing by config::kHoldAccelStep entries
+  // per repeat so a long hold accelerates through the list. Driven by elapsed time
+  // rather than frames — the press itself is already handled above, and frame
+  // duration swings with render and panel work, so counting frames made a tap
+  // register as two presses whenever frames were short.
+  const uint32_t dt_ms = runtime.frame_time_ms();
+  const int up_repeats = hold_up_.tick(buttons.is_down(logical_up_front) || buttons.is_down(logical_up_side), dt_ms);
+  const int down_repeats =
+      hold_down_.tick(buttons.is_down(logical_down_front) || buttons.is_down(logical_down_side), dt_ms);
 
-  const bool up_held = !had_up_press && (buttons.is_down(logical_up_front) || buttons.is_down(logical_up_side));
-  const bool down_held = !had_down_press && (buttons.is_down(logical_down_front) || buttons.is_down(logical_down_side));
+  // The step is read into a local before the inner loop. Writing this as
+  // `for (i = 0; i < ++hold_reps_up_; ++i)` re-evaluates the increment in the
+  // condition every pass, so the bound outruns i and the loop never ends.
+  // Repeat r moves 1 + r*kHoldAccelStep entries, capped at the list length —
+  // beyond that it is just spinning around a list it has already crossed.
+  auto step_for = [n](int repeat_index) {
+    const int step = 1 + repeat_index * config::kHoldAccelStep;
+    return step < n ? step : n;
+  };
 
-  if (up_held && n > 0) {
-    const int step = hold_step(hold_frames_up_);
-    for (int i = 0; i < step; ++i)
-      move_up();
-    ++hold_frames_up_;
+  if (up_repeats > 0 && n > 0) {
+    for (int r = 0; r < up_repeats; ++r) {
+      const int step = step_for(hold_reps_up_++);
+      for (int i = 0; i < step; ++i)
+        move_up();
+    }
     moved = true;
-  } else if (!had_up_press) {
-    hold_frames_up_ = 0;
+  } else if (hold_up_.idle()) {
+    hold_reps_up_ = 0;
   }
 
-  if (down_held && n > 0) {
-    const int step = hold_step(hold_frames_down_);
-    for (int i = 0; i < step; ++i)
-      move_down();
-    ++hold_frames_down_;
+  if (down_repeats > 0 && n > 0) {
+    for (int r = 0; r < down_repeats; ++r) {
+      const int step = step_for(hold_reps_down_++);
+      for (int i = 0; i < step; ++i)
+        move_down();
+    }
     moved = true;
-  } else if (!had_down_press) {
-    hold_frames_down_ = 0;
+  } else if (hold_down_.idle()) {
+    hold_reps_down_ = 0;
   }
 
   if (moved || needs_draw || force_redraw_) {

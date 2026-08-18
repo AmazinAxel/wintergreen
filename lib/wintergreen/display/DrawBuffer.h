@@ -104,6 +104,11 @@ class IDisplay {
   virtual bool is_busy() const {
     return false;
   }
+
+  // Block until any outstanding refresh has finished. Refreshes are fired without
+  // waiting, so callers that are about to use a bus the panel shares (SD on SPI2)
+  // must drain first — concurrent SD traffic corrupts an in-flight update.
+  virtual void wait_idle() {}
 };
 
 // Double-buffered display with simple draw helpers.
@@ -517,6 +522,13 @@ class DrawBuffer {
     memcpy(bufs_[active_idx_], bufs_[1 - active_idx_], kBufSize);
     active_idx_ = 1 - active_idx_;
     active_valid_ = true;
+  }
+
+  // Block until the panel has finished any outstanding refresh. Call before SD
+  // access: the card shares SPI2 with the display and concurrent traffic corrupts
+  // an update in flight.
+  void wait_panel_idle() {
+    display_.wait_idle();
   }
 
   // Put the display into deep sleep (low-power mode). Call after a full refresh.

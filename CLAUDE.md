@@ -8,10 +8,10 @@ straight into a book.
 ## Build & flash
 
 ```
-pio run                       # build (default env: esp32c3)
-pio run -t upload             # build + flash over USB
+pio run                            # build (default env: esp32c3)
+pio run -t upload                  # build + flash over USB
 pio run -e esp32c3-dev -t upload   # ~940 KB image, no embedded reader font
-pio device monitor            # serial log, 115200
+pio device monitor                 # serial log, 115200
 ```
 
 `esp32c3-dev` sets `-DWG_NO_EMBED_FONT`, which drops Literata (726 KB) from the
@@ -30,6 +30,11 @@ in sync when adding or removing core `.cpp` files, as must
 `tools/epub2mrb/CMakeLists.txt`. All three list sources **explicitly**, so a
 deleted file fails at CMake generate time with an error naming
 `idf_component_register` rather than anything you touched.
+
+`ESP_PLATFORM` is **not** a QEMU leftover — it is ESP-IDF's own macro, defined
+for any ESP32 target build, and it is the seam between firmware and the two host
+builds (`tools/epub2mrb`, `platforms/desktop`). It stays. The QEMU flag was
+`QEMU_BUILD`, below.
 
 The `esp32c3-qemu` env is gone, along with every `QEMU_BUILD` conditional. Two
 things that removal broke, both worth knowing about:
@@ -119,21 +124,114 @@ does not break the buttons. Two caveats if it gets implemented:
   render/page-turn path and released when returning to the idle poll. Plain
   `esp_pm_configure` without that lock is a regression, not a win.
 
-The side rocker's **lower button always advances**, in every orientation —
-`inv_side` is the inverse of `Application::invert_side_buttons()`. This was
-briefly made orientation-dependent (flipped in portrait, configured value in
-landscape) before hardware testing showed both holds want the same mapping, so
-the branch was removed rather than left as a no-op.
+Side-rocker paging is **orientation-dependent**; the front row is not. The rocker
+is one physical control whose ends swap places when the device is turned, so
+`ReaderScreen::update()` flips `inv_side` in landscape:
 
-Note for anything that *is* orientation-dependent: portrait is `Deg90` **or**
-`Deg270` and landscape is `Deg0` **or** `Deg180` — the reversed orientations are
-the same physical hold. Checks written as `rotation() == Deg0` silently misbehave
-when the reader is flipped; that bug was present in the reader's layout padding
-and is fixed.
+|            | Up (rocker top) | Down (rocker bottom) |
+|------------|-----------------|----------------------|
+| Portrait   | next            | previous             |
+| Landscape  | previous        | next                 |
+
+`Application::invert_side_buttons()` is the portrait mapping; landscape is always
+its inverse. The front buttons are fixed to the panel and never change.
+
+Portrait is `Deg90` **or** `Deg270` and landscape is `Deg0` **or** `Deg180` — the
+reversed orientations are the same physical hold, so a check written as
+`rotation() == Deg0` leaves flipped-landscape behaving like portrait. That bug
+was present in the reader's layout padding and is fixed.
 
 Input timing is chosen for responsiveness: 5 ms button sampling (`input.h`) under
 a 25 ms UI frame (`main.cpp`), so a press lands on the next frame. Screens repaint
 only on state changes, so frame rate does not drive panel traffic.
+
+**Never measure a hold in frames.** Frame duration is not a constant — it swings
+with how much a screen rendered and whether the panel was mid-refresh — so a frame
+count means different wall time in different builds. Use `runtime.frame_time_ms()`,
+which returns the *measured* last frame, and compare against milliseconds. Both
+frame-counted holds in the tree were wrong the moment `partial_refresh()` stopped
+blocking and frames went from hundreds of ms to ~25:
+
+- the reader's and list's page/row repeat fired once **per frame** with no delay, so
+  a normal tap registered as two presses. They now use `HoldRepeat` (`Input.h`),
+  driven by `config::kHoldDelayMs` / `kHoldRepeatMs` / `kHoldAccelStep`.
+
+`HoldRepeat::tick()` may return more than one repeat when a frame ran long, so a
+slow render cannot throttle the repeat rate — but it is capped at `kMaxPerTick`,
+because cashing in a multi-second stall as a burst reads as a freeze then a jump.
+
+The menu's acceleration step is read into a local before its inner loop. Written as
+`for (i = 0; i < ++hold_reps_up_; ++i)` the increment sits in the loop *condition*
+and is re-evaluated every pass, so the bound outruns `i` and the loop never
+terminates — that shipped once and hung the device on any button hold. The step is
+also capped at the list length; beyond that it is spinning around a list it has
+already crossed.
+- the hidden-books long-press was `15` frames, commented "≈3s at typical e-ink
+  frame rate" — i.e. calibrated to refresh-blocked frames. It became ~0.4 s. It is
+  milliseconds now, and (on `LyraExtScreen`, where it moved) it is the tree's only
+  remaining hold gesture outside `Application`'s power button.
+
+`Application`'s power-button hold was always ms-based (`power_hold_ms_ += dt_ms`)
+and was unaffected — that is the pattern to copy.
+
+### Refresh latency
+
+Almost all of a page turn or a menu keystroke is the e-ink waveform, not the CPU.
+Layout and draw are tens of milliseconds; the waveform is hundreds. Three things
+exploit that, and the first two have **invariants that are easy to break**.
+
+**`partial_refresh()` does not block.** `refreshDisplay()` takes a `wait` flag and
+`partial_refresh()` passes `false`, so it fires `CMD_MASTER_ACTIVATION` and returns
+while the panel is still updating. The app then lays out and draws the *next* frame
+during the waveform instead of after it. This is safe only because **every**
+`EInkDisplay` entry point opens with `wakeIfNeeded(); waitWhileBusy();` — that
+prologue is what collects the outstanding refresh. Do not add a panel operation
+without it. Two consequences that are load-bearing:
+
+- Anything that sends SPI right after firing must keep `wait = true`, or the command
+  lands mid-waveform and corrupts the update. That means `full_refresh`, both
+  grayscale paths, and anything with `turnOffScreen` (the screen powers down at the
+  *end* of the waveform). `setCustomLUT_()` and `deep_sleep()` therefore start with
+  their own `waitWhileBusy()` — `deep_sleep()` mid-update leaves a half-drawn panel
+  on screen for the entire sleep, which is the most visible way to get this wrong.
+- **The SD card shares SPI2 with the panel** and concurrent traffic corrupts an
+  update in flight (this is why `main.cpp` already defers index ops on
+  `epd.is_busy()`). Any new SD access must call `DrawBuffer::wait_panel_idle()`
+  first. The existing ones are `decode_image_to_buffer_`, `ReaderScreen::stop()`'s
+  `.pos` write, `do_sleep_()`, and the settings save on reader pop. Text-only pages
+  never touch the card and keep the full overlap.
+
+**Region refresh cannot be used to update "just the changed rows", and this was
+tried and reverted.** `setRamArea()` bounds where a RAM *write* lands; it does not
+bound the refresh. `refreshDisplay()` drives the **whole panel** from BW RAM, and a
+partial update merely *looks* localized because unchanged pixels have BW RAM == RED
+RAM and receive a no-op waveform. So writing only a sub-rectangle leaves the rest of
+BW RAM holding the last *fully written* frame, and the panel faithfully redraws that
+stale frame everywhere outside the window.
+
+The symptom, when `ListMenuScreen` used a diff-and-region-refresh helper for cursor
+movement: previously-selected rows stayed lit, the reader page showed through behind
+the menu, and the screen alternated between correct and stale as the periodic
+full-refresh corrected it. Keeping BW RAM in sync would mean writing all 48 KB
+anyway, and the waveform is panel-wide regardless — there is no saving to be had.
+
+`partial_refresh_region()` remains correct for its **one** caller, `show_loading()`,
+which satisfies the precondition: during conversion the rest of the screen is static
+*and* BW RAM already matches it. That narrow validity is why it looked like a general
+primitive and is not one.
+
+**`ReaderScreen::page_cache_`** holds one laid-out page. `prev_page_()` has to run a
+full `layout_backward()` just to learn where the previous page starts; it used to
+throw the result away and `render_page_()` laid the identical page out again, so
+every backward turn cost two layouts. The key is chapter + position + `PageOptions`
++ font size index, checked **after** `resolve_stable_position()` (which can move
+`page_pos_`). `set_font`/`set_options` wipe `TextLayout`'s paragraph cache wholesale,
+so a stale entry doesn't merely draw the wrong page — it points at freed line
+vectors. `LayoutWord::text` points into `MrbChapterSource`'s 32-slot paragraph
+window rather than into `PageContent`, which is why the cached page is **moved**
+into `page_` (never copied — only one may be live) and why `load_chapter_()` and
+`stop()` drop it explicitly: rebuilding the source frees every slot it points into,
+and no key comparison can detect that.
 
 Auto-sleep never fires while USB is connected — `main.cpp` calls `keep_awake()`
 every iteration when `usb_serial_jtag_is_connected()`, which zeroes
@@ -201,6 +299,9 @@ values. The project root is on the include path for both platform builds.
 | `kSunlightFadingFix` | `false` | Periodic full flush to fight sunlight contrast loss. Read by `Application::sunlight_fading_fix()`. |
 | `kAutoSleepMinutes` | `1` | Read by `Application::sleep_timeout_min()`. |
 | `kPowerHoldSleepMs` | `800` | Power-button hold before sleeping; a shorter press acts as Select. Read by `Application::power_hold_sleep_ms()`. |
+| `kHoldDelayMs` | `350` | How long a nav button must be held before it auto-repeats. Below ~250 ms a tap starts reading as two presses — the press itself already counts once. |
+| `kHoldRepeatMs` | `175` | Gap between repeats once they start; lower is faster. |
+| `kHoldAccelStep` | `1` | Extra list entries added per repeat in menus, so a long hold accelerates. `0` = constant one entry per repeat. The reader ignores it — page turns never accelerate. |
 
 Everything else is hardcoded. `Application` exposes them as `static constexpr`
 member functions so call sites read unchanged:
@@ -236,13 +337,48 @@ the app applies after `update()` returns. `screen_for_(ScreenId)` maps the enum
 to the member.
 
 Screen stack: `LyraExtScreen` (home) → `MainMenu` (all books) → `ReaderScreen`
-→ `ReaderOptionsScreen` (quick menu). `HiddenBooksMenu` is reached by a ~3 s
-back long-press on MainMenu, or a ~1.5 s one on the home screen.
+→ `ReaderOptionsScreen` (quick menu). There are only these four screens.
+
+Back on the home screen opens the book list; back in the list returns home.
+
+**Hidden books are a mode of `MainMenu`, not a screen.** A ~3 s back long-press
+**on the home screen** opens the list with the books under `<books_dir>/.hidden/`
+at the top, above their own hairline divider (`set_show_hidden()` before the
+push). That gesture is the only way to see them, and `MainMenu::stop()` clears
+the flag, so leaving the list means performing it again.
+
+The gesture lives on the home screen rather than in the list because it resolves
+on **release**, and only a release-time push lands on a screen whose buttons are
+up. It was first written in `MainMenu`, which pushed on the *press*: the pushed
+screen started with Button0 still physically down, its own release handler fired,
+and the list vanished the moment the user let go — it stayed visible only while
+the button was held. `LyraExtScreen` also swallows the first hold after every
+`start()` (`back_ignore_`), because `MainMenu` pops on the back press and hands
+the home screen a button that is still down; without that, the release would read
+as a fresh tap and reopen the list. **Any screen pushing another from a button
+press inherits this problem.**
+
+Four things the hidden list itself depends on:
+
+- `.hidden` books are **not in `BookIndex`** (its scan skips dot-directories),
+  so `MainMenu::scan_hidden_()` walks the folder itself and reads title/author
+  straight from each MRB. Those entries carry owned `title_own`/`author_own`
+  strings rather than `StringRef`s, because there is no pool entry to reference.
+  The scan runs only when the gesture first asks for it.
+- `on_select` skips `record_book_opened()` for a hidden entry. `mark_opened()`
+  would be a no-op anyway, but the point is that a hidden book must never reach
+  the recents carousel on the home screen.
+- `separators_` holds **visual** indices, so the hidden divider shifts the
+  recently-opened/never-opened one below it by a row. `populate_list_()` inserts
+  the hidden group after sorting, so it keeps its own alphabetical order.
+- Hidden books are `.hidden/<book>/book.mrb` like any other. The old
+  `HiddenBooksMenu` scanned for `*.epub`, which stopped matching anything the
+  moment EPUB support was removed — it was listing an empty folder.
 
 The home screen is a **carousel of the five most recently opened books**, not a
 list: battery percentage top right, one large cover, title (up to two lines) and
 author centred beneath it, and a row of dots for position. Up/Down move between
-recents, Select opens the book, and a short **Back opens the full book list** —
+recents, Select opens the book, and **Back opens the full book list** —
 which is why there is no longer a Recent Books screen (`RecentBooksScreen` is
 deleted, along with `ScreenId::RecentBooks`). It still derives from
 `ListMenuScreen` purely for the item/selection/navigation machinery; every pixel
@@ -277,7 +413,7 @@ Chronicle/Minimal/Stele/Codex/Lyra variants are gone. Two per-instance booleans
 select the remaining layout variations:
 
 - `detail_list_` — two-line rows (title + subtitle, full-width divider, right-hand
-  column). Set by MainMenu, HiddenBooksMenu.
+  column). Set by MainMenu.
 - `plain_list_` — centred-title header instead of the wordmark status bar. Set by
   ChapterSelectScreen.
 
@@ -289,8 +425,8 @@ header (`draw_header_`, and `LyraExtScreen`'s own header).
 
 Both false = standard wordmark header + centred single-line rows. A non-empty
 `subtitle_` switches the header into the book-details card and is checked before
-either flag. `header_override_` replaces the "wintergreen" wordmark per screen
-(HiddenBooksMenu uses "secret").
+either flag. `header_override_` replaces the "wintergreen" wordmark per screen;
+nothing sets it now that `HiddenBooksMenu` (which used "secret") is gone.
 
 Drawing is four passes: `draw_header_` → `draw_bottom_` → `draw_list_`, with
 `compute_header_h_` mirroring the header maths for scroll calculations.
@@ -371,7 +507,7 @@ skips dot-directories, so `.wintergreen/cache/` is never picked up):
 - `<name>.epub` — a source, converted on demand into
   `.wintergreen/cache/<stem>/book.mrb` with covers alongside it.
 
-A third: the "converted" marker in `MainMenu` and `HiddenBooksMenu` looked for
+A third: the "converted" marker in `MainMenu` looked for
 `cache/<stem>/book.mrb`, and every converted book has the stem `book` — so they
 all probed the same nonexistent path and every one displayed as *not* converted.
 An `.mrb` path is converted by definition; the check is now short-circuited.
@@ -399,9 +535,11 @@ sideload paths were deliberately removed, along with the `'Y'` (clear SD fonts)
 and `'F'` (invalidate font) serial commands.
 
 - **Reader: Atkinson Hyperlegible**, 5 sizes (20/24/28/32/36 px), all four
-  styles. Lives in the appended asset blob (`platforms/esp32/asset_blob.*`) and
-  is provisioned into a flash partition on first boot after a firmware update,
-  keyed on CRC.
+  styles, built `--mono` (see below). Lives in the appended asset blob
+  (`platforms/esp32/asset_blob.*`) and is provisioned into a flash partition on
+  first boot after a firmware update, keyed on CRC. **Only the `esp32c3` env
+  ships it** — a font change is invisible until a full build is flashed, because
+  `esp32c3-dev` filters the asset out and the device keeps the partition it has.
 - **UI: Iosevka Slab Bold**, one size per header in `display/ui_font_*.h`
   (14/24/32 px → small/large/header). There is no medium; that header was unused
   and is gone.
@@ -419,16 +557,39 @@ Literata — `make_font.py`'s docstring is the real reference:
 - The reader font asset is `[uint32 uncompressed size][zlib stream]` wrapping an
   FNTS v2 bundle: `[FNTS][num][ver=2][pad:2][name:32][num × uint32][MBF4...]`.
 
+The gray planes are **optional** — `gray_lsb_offset` / `gray_msb_offset` of 0
+mean absent, which is what `has_grayscale()` keys off. The reader font is now
+built that way, via `make_font.py --mono`: `FT_LOAD_TARGET_MONO`, no gray planes.
+
+That followed from the reader drawing only `GrayPlane::BW` (see "Removed"). The
+BW plane is not a 50% threshold — `LEVEL_BITS` puts level 2 (37.5% coverage) in
+the ink plane, so BW-only text was fattened by a ring of barely-covered edge
+pixels, and `FT_LOAD_TARGET_LIGHT` left stems straddling pixel boundaries, so
+that ring was uneven from glyph to glyph. Mono hinting snaps stems to the grid
+instead: same total advance widths, but uniform stems and clean curves. It also
+cut the asset from 296 KB to 122 KB compressed, since two of the three bitmap
+pools are gone.
+
+Don't "fix" the AA path to match — the 5-level encoding and its 37.5% threshold
+are correct *for grayscale output*, where the lightening pass pulls those edge
+pixels back. They only misbehave when the gray planes are thrown away.
+
 `tools/check_font.py` parses a bundle or bare MBF4 exactly the way `BitmapFont.h`
 does and ASCII-art renders a sample string. Run it after regenerating a font —
-a structurally broken font renders blank on device with no error.
+a structurally broken font renders blank on device with no error. Its header line
+reports `gray=yes|no`, which is the quick check that `--mono` took effect.
+
+The **UI fonts are still AA-rendered and thresholded**, so menu text has exactly
+the blobbiness the reader font just lost, and each `ui_font_*.h` carries two
+bitmap pools nothing reads. Rebuilding them with `--mono` is the same one command
+per header.
 
 Regenerating (needs freetype-py + fontTools, absent from the PlatformIO
 interpreter, hence nix-shell):
 
 ```
 nix-shell -p 'python3.withPackages(ps: [ps.freetype-py ps.fonttools])' --run '
-  python3 tools/make_font.py bundle --name AtkinsonHyperlegible \
+  python3 tools/make_font.py bundle --name AtkinsonHyperlegible --mono \
     --sizes 20,24,28,32,36 --line-height 150 \
     --regular …-Regular.ttf --bold …-Bold.ttf \
     --italic …-Italic.ttf --bold-italic …-BoldItalic.ttf \
@@ -571,8 +732,12 @@ Ordered by expected payoff. Each of these has been analysed; none is speculative
    a provisioning step on a virgin board.
 3. **Low-battery cutoff.** There is currently none — `battery_percentage()` is
    display-only and the device runs until brownout. See "Battery health" below.
-4. **Page pre-rendering** during idle, to make page turns feel instant. Measure
-   with the existing `RenderBench` serial command first; not worth the complexity
+4. **Pre-laying-out the *next* page** after a turn, so the forward path skips
+   layout entirely. The cache and its invalidation already exist (see "Refresh
+   latency" — `page_cache_` / `take_cached_page_`); all that is missing is a
+   `prerender_next_page_()` call after `buf.refresh()`, predicting the next
+   position with the same image-snapback logic `next_page_()` uses. **Measure
+   first** with the `'P'` `RenderBench` serial command; not worth the complexity
    if render is already fast.
 5. **Try `-Os` against `-O2`.** Counterintuitively `-Os` can be *faster* here:
    code executes from flash through a fixed 16 KB cache, so a smaller hot path
@@ -581,7 +746,8 @@ Ordered by expected payoff. Each of these has been analysed; none is speculative
 
 Closed, don't re-investigate: instruction cache size (fixed in C3 silicon, not
 configurable as it is on the S3), QIO flash mode, SD clock above 20 MHz,
-tickless idle. See "Build & flash" and "Idle power".
+tickless idle, and region-only refresh for menu cursor movement. See "Build &
+flash", "Idle power" and "Refresh latency".
 
 ### Battery health
 
@@ -603,6 +769,12 @@ Settings menu, theme picker, Stats / GlobalStats / WhatsNew / Alert / ConvertAll
 screens, the bouncing-ball and grayscale demos, BMP sleep-image conversion,
 sleep-image cycling, SD-card font selection, and the on-device System tab
 (clear cache, rebuild index, rebuild SPIFFS, OTA partition switch).
+
+**`RecentBooksScreen` and `HiddenBooksMenu`**, with `ScreenId::RecentBooks` and
+`ScreenId::HiddenBooks`. Recents became the home carousel and hidden books became
+a `MainMenu` mode — see Architecture for both. Remember that both
+`platforms/*/CMakeLists.txt` list core `.cpp` files **explicitly**, so deleting a
+screen means editing them too.
 
 **Antialiased (grayscale) text in the reader.** `ReaderScreen::apply_grayscale_`,
 the `grayscale_pending_` / `grayscale_active_` state and the `revert_grayscale`
@@ -691,7 +863,21 @@ their last callers. `Application::ensure_cover_bin()` went too: with no EPUB
 there is nothing to extract from. Together that is ~95 KB of flash.
 
 `ZipReader` **stays** in the firmware despite EPUBs being gone — it is how
-embedded images are read, as stored entries pointing into the MRB.
+embedded images are read, as stored entries pointing into the MRB. `MrbWriter`
+does **not**: its only caller is `MrbConverter`, so it was dropped from
+`platforms/esp32/CMakeLists.txt` and is now host-only alongside it.
+
+Because those TUs are host-only, every `#ifdef ESP_PLATFORM` inside them was
+unreachable, and they have been flattened to the host branch. Gone with them:
+`MrbConverter`'s three `benchmark_*` functions (~250 lines, no callers since the
+`X`/`I`/`D` commands went), all the `esp_timer` sub-stage instrumentation in
+`convert_epub_to_mrb_streaming` and `parse_xhtml_streaming`, the
+`heap_caps_get_largest_free_block` reserve-capping and capacity-triggered
+`flush_run()` in `EpubParser`'s run accumulator, and `CssCache::low_memory()`
+(which was `esp_get_free_heap_size() < 24 KB` on device and a constant `false`
+off it, so eviction is now driven by `over_budget` alone). The never-defined
+`WINTERGREEN_DIAG_STREAMING` blocks went too. None of this changes converter
+output — the host build never compiled any of it.
 
 **Font sideloading**, both paths: the serial `FONT` upload (raw write to the
 spiffs partition) and `SDFN` uploads to `/sdcard/fonts/`, plus the `'Y'` and

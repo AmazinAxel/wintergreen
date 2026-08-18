@@ -112,8 +112,6 @@ class ReaderOptionsScreen final : public ListMenuScreen {
   int idx_font_size_ = -1;
   int idx_rotate_display_ = -1;
   int idx_reader_rotate_display_ = -1;
-  // Index of the first chapter row; every row at or after it is a chapter.
-  // -1 when the book has no chapter list.
   int first_chapter_ = -1;
 
   uint16_t pending_chapter_ = 0;
@@ -135,5 +133,4 @@ class ReaderOptionsScreen final : public ListMenuScreen {
 
   const TableOfContents* toc_ = nullptr;
 };
-
 }  // namespace wintergreen

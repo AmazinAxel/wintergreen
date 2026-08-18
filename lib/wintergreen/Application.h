@@ -8,7 +8,6 @@
 #include "Runtime.h"
 #include "ScreenManager.h"
 #include "display/DrawBuffer.h"
-#include "screens/HiddenBooksMenu.h"
 #include "screens/IScreen.h"
 #include "screens/LyraExtScreen.h"
 #include "screens/MainMenu.h"
@@ -24,17 +23,14 @@ enum class ScreenId : uint8_t {
   MainMenu,
   Reader,
   ReaderOptions,
-  HiddenBooks,
   LyraExt,
 };
 
-// Maps the rotate_display / rotate_reader setting value (0-3) to the DrawBuffer Rotation enum.
-// 0=Portrait(Deg90), 1=Landscape(Deg0), 2=Portrait-Flip(Deg270), 3=Landscape-Flip(Deg180)
 inline Rotation rotation_from_setting(uint8_t v) {
   switch (v) {
     case 1:  return Rotation::Deg0;
-    case 2:  return Rotation::Deg270;
-    case 3:  return Rotation::Deg180;
+    case 2:  return Rotation::Deg270; // get rid
+    case 3:  return Rotation::Deg180; // get rid
     default: return Rotation::Deg90;
   }
 }
@@ -42,8 +38,8 @@ inline Rotation rotation_from_setting(uint8_t v) {
 inline const char* rotation_label(uint8_t v) {
   switch (v) {
     case 1:  return "Landscape";
-    case 2:  return "Portrait Reversed";
-    case 3:  return "Landscape Reversed";
+    case 2:  return "Portrait Reversed"; // remove
+    case 3:  return "Landscape Reversed"; // remove
     default: return "Portrait";
   }
 }
@@ -72,16 +68,10 @@ class Application {
   std::string settings_written_;
   std::string pending_book_path_;
 
-  // Save all persistent state to the settings file
   void save_settings_();
-  // Load all persistent state from the settings file
   void load_settings_();
-  // Common sleep sequence (save state, show sleep image, set running_=false)
-  // Draws the sleep screen and powers down. wordmark_image=true forces the
-  // embedded wintergreen image instead of the book cover (power long-press).
   void do_sleep_(DrawBuffer& buf, bool wordmark_image = false);
 
-  // Font management. set_reader_font() also propagates to the reader screen.
   void set_reader_font(const BitmapFontSet* fonts) {
     reader_font_ = fonts;
     reader_.set_fonts(fonts);
@@ -116,9 +106,8 @@ class Application {
   LyraExtScreen* lyra_ext_screen() {
     return &lyra_ext_;
   }
-  // ── Fixed behaviour ───────────────────────────────────────────────────────
-  // There is no settings menu. Everything below is compile-time constant; the
-  // only tunables live in WintergreenConfig.h at the project root.
+
+  // todo remove ---------------
 
   // Converted-book marker.
   static constexpr bool show_converted_indicator() { return true; }
@@ -219,7 +208,6 @@ class Application {
   MainMenu menu_;
   ReaderScreen reader_;
   ReaderOptionsScreen reader_options_;
-  HiddenBooksMenu hidden_books_;
   bool font_warning_shown_ = false;
 
   ScreenId pending_push_ = ScreenId::None;
