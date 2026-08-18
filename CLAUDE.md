@@ -141,6 +141,13 @@ reversed orientations are the same physical hold, so a check written as
 `rotation() == Deg0` leaves flipped-landscape behaving like portrait. That bug
 was present in the reader's layout padding and is fixed.
 
+**The reversed orientations are no longer reachable.** `rotate_reader` is 0
+(portrait, `Deg90`) or 1 (landscape, `Deg0`); `rotation_from_setting` and
+`rotation_label` collapsed from four cases to two, "Reader Display" toggles
+rather than cycles, and both the setter and the settings loader clamp anything
+else to 0. The `Rotation` enum keeps all four values — the panel driver needs
+them — so the paragraph above still applies to any new orientation check.
+
 Input timing is chosen for responsiveness: 5 ms button sampling (`input.h`) under
 a 25 ms UI frame (`main.cpp`), so a press lands on the next frame. Screens repaint
 only on state changes, so frame rate does not drive panel traffic.
@@ -312,7 +319,10 @@ member functions so call sites read unchanged:
   must not be advertised by a screen that sits on display while the device is
   idle. Everything else, including sleeping from the home screen, gets the
   embedded wordmark image.
-- converted-book marker on; battery is a header percentage, never an icon
+- battery is a header percentage, never an icon. The converted-book marker is
+  gone — every book on the card is an MRB, so the trailing middle dot marked
+  every row and said nothing (`show_converted_indicator()` and `mrb_exists` went
+  with it)
 - images always render: the `images_enabled` global is gone, not defaulted
 - default button mapping (`invert_bottom_paging()` is `true` — that is the default)
 - single reader font (Atkinson Hyperlegible, `FontManager::kFontAsset`), no picker
@@ -341,15 +351,23 @@ Screen stack: `LyraExtScreen` (home) → `MainMenu` (all books) → `ReaderScree
 
 Back on the home screen opens the book list; back in the list returns home.
 
-**Hidden books are a mode of `MainMenu`, not a screen.** A ~3 s back long-press
+**Hidden books are a mode of `MainMenu`, not a screen.** A 1 s back long-press
 **on the home screen** opens the list with the books under `<books_dir>/.hidden/`
 at the top, above their own hairline divider (`set_show_hidden()` before the
 push). That gesture is the only way to see them, and `MainMenu::stop()` clears
 the flag, so leaving the list means performing it again.
 
-The gesture lives on the home screen rather than in the list because it resolves
-on **release**, and only a release-time push lands on a screen whose buttons are
-up. It was first written in `MainMenu`, which pushed on the *press*: the pushed
+**The hold fires while the button is still down**, the moment `kHiddenHoldMs`
+elapses — waiting for the release made the device look dead for the length of the
+hold. That is safe *here* because presses are rising edges only (`input.h` queues
+them on the edge), so `MainMenu` receives no Button0 event from a button that was
+already down when it started, and `back_consumed_` makes the eventual release a
+no-op. The plain book list still opens on release, since a tap cannot be
+distinguished from a hold any earlier.
+
+The gesture lives on the home screen rather than in the list because the *tap*
+resolves on **release**, and only a release-time push lands on a screen whose
+buttons are up. It was first written in `MainMenu`, which pushed on the *press*: the pushed
 screen started with Button0 still physically down, its own release handler fired,
 and the list vanished the moment the user let go — it stayed visible only while
 the button was held. `LyraExtScreen` also swallows the first hold after every
@@ -376,9 +394,17 @@ Four things the hidden list itself depends on:
   moment EPUB support was removed — it was listing an empty folder.
 
 The home screen is a **carousel of the five most recently opened books**, not a
-list: battery percentage top right, one large cover, title (up to two lines) and
-author centred beneath it, and a row of dots for position. Up/Down move between
-recents, Select opens the book, and **Back opens the full book list** —
+list: battery percentage top right, one large cover inside a 2 px frame held
+10 px clear of it, title (up to two lines) and author centred directly beneath
+it, and a row of diamonds for position (the selected one carries a second,
+larger outline diamond). Only title lines actually drawn advance the cursor, so
+the author never floats under a reserved blank line; the diamonds are anchored
+to the bottom of the panel so they don't move with it.
+
+Up/Down are **swapped** on this screen (`swap_updown_`, applied to the state
+forwarded to the base class): the carousel runs left-to-right, so the top of the
+side rocker and the bottom front key have to advance it, which is the opposite of
+what a vertical list wants. Select opens the book, and **Back opens the full book list** —
 which is why there is no longer a Recent Books screen (`RecentBooksScreen` is
 deleted, along with `ScreenId::RecentBooks`). It still derives from
 `ListMenuScreen` purely for the item/selection/navigation machinery; every pixel
@@ -391,19 +417,57 @@ Two things about that screen worth knowing:
   (hence the `mutable` cover members). Loading it from `update()` instead would
   draw one frame with the previous book's cover and then redraw — two e-ink
   refreshes per press.
-- Covers are **upscaled by a whole number only**. The converter's 160x240
-  `cover.bin` lands on an exact 2× in the 448x521 box, and pixel-doubling keeps
-  the 1-bit dither intact where a fractional nearest-neighbour scale moirés it.
-  Only a cover larger than the box takes the aspect-fitting path.
+- The cover comes from **`cover_sleep.bin`** (up to 480x786), not the 160x240
+  `cover.bin` the book list uses — the box is ~450x550, so the thumbnail could
+  only ever be pixel-doubled into it. `cover.bin` is the fallback when the
+  full-res file is missing.
+- Two scaling paths, and the distinction matters. **Upscaling is whole-number
+  only**: pixel-doubling keeps the 1-bit dither intact where a fractional
+  nearest-neighbour scale moirés it. **Downscaling is a box filter plus a 4x4
+  ordered dither** — the average of a cell is a coverage fraction, and a hard
+  50% threshold would throw away every tone between paper and ink. It streams
+  the source a row at a time (a 480x786 cover is 47 KB) with one accumulator row.
+- All-white rows are **trimmed off the top and bottom** afterwards. Covers often
+  carry a white band above and below the artwork, and with the frame drawn a
+  fixed distance from the bitmap those bands read as lopsided padding. Columns
+  are left alone — the cover is fitted to the box width, so side bands are rare.
+- The cover read calls `wait_panel_idle()` first: the card shares SPI2 with the
+  panel and this is a much longer read than the old thumbnail.
 
 There is no separate Chapters page: `ReaderOptionsScreen` lists the book's TOC
-inline, below Font Size and Reader Display, and scrolls. Selecting a chapter sets
+inline, below Font Size and Reader, and scrolls. Selecting a chapter sets
 `pending_chapter()` / `pending_para_index()` and pops one screen;
 `ReaderScreen::resume()` consumes them. Two things that merge broke and had to be
 handled: chapter titles legitimately contain `": "` ("Chapter 1: The Beginning"),
 so the `Label: Value` split is gated to non-chapter rows or the title gets torn
 into two columns; and nested TOC entries carry a depth that must still indent,
 via `ListMenuScreen::get_item_indent()`.
+
+Its header is drawn entirely by its own `draw_all_` — the base class's card
+header is unused, so `title_`/`subtitle_` are left empty. It is book title,
+current chapter, rule; there is **no battery** (it is an overlay on the book, and
+the reader underneath shows none either). Both the title and the chapter are word
+wrapped (`wrap_`, 2 and 3 lines) and each carries its percentage right-aligned on
+its **first** line, set in the *same font as the text beside it* so the pair reads
+as one line. The chapter is a size down from the title (`chapter_font_()` =
+`section_font_`), like a subtitle. The old `Book X% · Chapter Y%` row is gone, as
+is the author (it is on the home screen and the book list already). `header_h_()`
+measures that block from the wrapped lines computed in `on_start()`, and
+`get_visible_count_()` calls it — the two used to re-derive the height
+independently, which is exactly how scroll bugs get in.
+
+A hairline divides the settings from the chapters, drawn in a `kSepH` gap of its
+own between the two rather than inside the first chapter's row — a selected row
+fills its whole rect, and a rule drawn inside it would be painted over. Row
+height is `row_h_()` = the list font's `y_advance()` + padding, not a constant:
+the list is set in the 32 px header face and the old fixed 28 px row was shorter
+than a single line of it.
+
+The book title comes from `ReaderScreen::display_title_()`, not
+`mrb_.metadata().title`: a converted EPUB with no usable metadata title yields
+the literal string `"none"`, and `BookIndex` already substitutes the containing
+folder name for it. Without the same substitution here the quick menu said
+"none" for a book the home screen named correctly.
 
 ### ListMenuScreen
 
@@ -413,8 +477,11 @@ Chronicle/Minimal/Stele/Codex/Lyra variants are gone. Two per-instance booleans
 select the remaining layout variations:
 
 - `detail_list_` — two-line rows (title + subtitle, full-width divider, right-hand
-  column). Set by MainMenu.
-- `plain_list_` — centred-title header instead of the wordmark status bar. Set by
+  column). Set by MainMenu. The right-hand column is the reading percentage and
+  sits on the **subtitle** baseline, bottom right beside the author, so the title
+  gets the full row width. The **last** row draws no divider — there is nothing
+  below it to divide from.
+- `plain_list_` — centred-title header instead of the battery status bar. Set by
   ChapterSelectScreen.
 
 No screen draws button labels, nav-arrow glyphs or a battery icon: the labelled
@@ -423,10 +490,22 @@ No screen draws button labels, nav-arrow glyphs or a battery icon: the labelled
 buttons are fixed and the panel is small. Battery appears once, as `NN%` in the
 header (`draw_header_`, and `LyraExtScreen`'s own header).
 
-Both false = standard wordmark header + centred single-line rows. A non-empty
-`subtitle_` switches the header into the book-details card and is checked before
-either flag. `header_override_` replaces the "wintergreen" wordmark per screen;
-nothing sets it now that `HiddenBooksMenu` (which used "secret") is gone.
+Both false = standard header + centred single-line rows. A non-empty `subtitle_`
+switches the header into the book-details card and is checked before either flag.
+
+**The header is battery-only.** There is no "wintergreen" wordmark on any screen
+and no rule under the header — the book-details card drew the wordmark in a bar
+of its own and that is gone too. The card's footer no longer repeats the battery
+either. `header_override_`, which swapped the wordmark per screen, went with the
+wordmark.
+
+Every screen draws the percentage through `ListMenuScreen::draw_battery_`, and
+`LyraExtScreen` — which otherwise shares no drawing code with the base — calls it
+too, sizing its own header from `battery_row_h_()`. The position is a property of
+the base class rather than of each screen on purpose: when the home carousel had
+its own copy of the maths it drifted from the list's by a few pixels in both
+axes, which is plainly visible as a jump when moving between them. Don't
+reintroduce a per-screen `W - pad - pw`.
 
 Drawing is four passes: `draw_header_` → `draw_bottom_` → `draw_list_`, with
 `compute_header_h_` mirroring the header maths for scroll calculations.
@@ -507,10 +586,10 @@ skips dot-directories, so `.wintergreen/cache/` is never picked up):
 - `<name>.epub` — a source, converted on demand into
   `.wintergreen/cache/<stem>/book.mrb` with covers alongside it.
 
-A third: the "converted" marker in `MainMenu` looked for
-`cache/<stem>/book.mrb`, and every converted book has the stem `book` — so they
-all probed the same nonexistent path and every one displayed as *not* converted.
-An `.mrb` path is converted by definition; the check is now short-circuited.
+A third: the "converted" marker in `MainMenu` looked for `cache/<stem>/book.mrb`,
+and every converted book has the stem `book` — so they all probed the same
+nonexistent path and every one displayed as *not* converted. The marker has since
+been removed outright (see Configuration), taking the per-book `fopen` with it.
 
 Two traps here, both hit during the switch to converted books. `cover_bin_path()`
 derives from the file *stem*, and every converted book is literally named
@@ -540,9 +619,12 @@ and `'F'` (invalidate font) serial commands.
   first boot after a firmware update, keyed on CRC. **Only the `esp32c3` env
   ships it** — a font change is invisible until a full build is flashed, because
   `esp32c3-dev` filters the asset out and the device keeps the partition it has.
-- **UI: Iosevka Slab Bold**, one size per header in `display/ui_font_*.h`
-  (14/24/32 px → small/large/header). There is no medium; that header was unused
-  and is gone.
+- **UI: Iosevka Slab Medium**, built `--mono`, one size per header in
+  `display/ui_font_*.h` (14/24/32 px → small/large/header). There is no medium
+  *size*; that header was unused and is gone. It was Bold until the weight was
+  dropped — Bold at 14 px thresholds into near-solid blocks, and the mono
+  hinting is what keeps Medium's thinner stems from breaking up. Dropping the
+  gray planes roughly halved each header (small: 20,332 → 10,099 bytes).
 
 MBF4 format is documented in `content/BitmapFontFormat.h`, but three things that
 matter are **not** in that header and were recovered by decoding the old shipped
@@ -579,10 +661,19 @@ does and ASCII-art renders a sample string. Run it after regenerating a font —
 a structurally broken font renders blank on device with no error. Its header line
 reports `gray=yes|no`, which is the quick check that `--mono` took effect.
 
-The **UI fonts are still AA-rendered and thresholded**, so menu text has exactly
-the blobbiness the reader font just lost, and each `ui_font_*.h` carries two
-bitmap pools nothing reads. Rebuilding them with `--mono` is the same one command
-per header.
+The UI fonts are built `--mono` too, so no `ui_font_*.h` carries the two bitmap
+pools nothing reads. Regenerating one is a single command per header, e.g.
+
+```
+nix-shell -p 'python3.withPackages(ps: [ps.freetype-py ps.fonttools])' --run '
+  python3 tools/make_font.py header --mono \
+    --regular …/SGr-IosevkaSlab-Medium.ttc:0 \
+    --name ui_small --size 14 --symbol ui_small \
+    --out lib/wintergreen/display/ui_font_small.h'
+```
+
+The TTC face index matters: face **0** is Iosevka Slab, and the rest are the
+Extended and Oblique cuts.
 
 Regenerating (needs freetype-py + fontTools, absent from the PlatformIO
 interpreter, hence nix-shell):
@@ -899,8 +990,18 @@ reading-time accumulator (`tick_activity_`, `kActivityWindowMs`,
 `last_activity_ms_`) and `ListMenuScreen::subtitle3_`.
 
 `.pos` is now four numbers: chapter, paragraph, offset, text offset. The index
-line is `path|title|author|last_open_order`. Both readers tolerate the old longer
-forms — extra fields are simply not consumed.
+line is `path|title|author|last_open_order|progress_pct`. Both readers tolerate
+the old shorter and longer forms — a missing field reads as 0 and extra ones are
+not consumed, so `INDEX_FORMAT_VERSION` did not need bumping.
+
+`progress_pct` is the one exception to "no statistics in the index", and it is
+there for cost, not sentiment: the book list shows a percentage per row, and
+deriving it live would mean opening every MRB *and* every `.pos` on the card
+every time the list is built. `ReaderScreen::stop()` hands it to
+`Application::record_book_progress()`, which reloads the index first —
+`MainMenu::pause()` (the default, = `stop()`) clears the in-memory entries
+whenever the reader is pushed, so saving without reloading would truncate the
+file, and it re-clears afterwards to leave that state as it found it.
 
 What stayed: `progress_pct()` and the `total_chars` / `char_before_para()`
 machinery behind it. That is computed live from the reading position, not

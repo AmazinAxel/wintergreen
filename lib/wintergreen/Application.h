@@ -26,28 +26,22 @@ enum class ScreenId : uint8_t {
   LyraExt,
 };
 
+// Two orientations only. The reversed ones (Deg270/Deg180) were dropped: they
+// are the same physical hold as their counterparts, so they earned a settings
+// toggle that did nothing a user could see except confuse the paging maps —
+// portrait is Deg90 *or* Deg270 and landscape is Deg0 *or* Deg180, and code that
+// checked for one exact value behaved wrongly in the reversed case.
 inline Rotation rotation_from_setting(uint8_t v) {
-  switch (v) {
-    case 1:  return Rotation::Deg0;
-    case 2:  return Rotation::Deg270; // get rid
-    case 3:  return Rotation::Deg180; // get rid
-    default: return Rotation::Deg90;
-  }
+  return v == 1 ? Rotation::Deg0 : Rotation::Deg90;
 }
 
 inline const char* rotation_label(uint8_t v) {
-  switch (v) {
-    case 1:  return "Landscape";
-    case 2:  return "Portrait Reversed"; // remove
-    case 3:  return "Landscape Reversed"; // remove
-    default: return "Portrait";
-  }
+  return v == 1 ? "Landscape" : "Portrait";
 }
 
 class Application {
  public:
-  // Menu font size index passed to ListMenuScreen: 0=small 1=medium 2=large 3=X-large.
-  static constexpr int kMenuFontSize = 3;
+  static constexpr int kMenuFontSize = 3; // TODO REMOVE ME
 
   Application() = default;
 
@@ -110,7 +104,6 @@ class Application {
   // todo remove ---------------
 
   // Converted-book marker.
-  static constexpr bool show_converted_indicator() { return true; }
 
   // Sleep screen: book cover, no caption text.
   static constexpr bool show_sleep_text() { return false; }
@@ -136,7 +129,7 @@ class Application {
     return rotate_reader_;
   }
   void set_rotate_reader(uint8_t v) {
-    rotate_reader_ = v <= 3 ? v : 0;
+    rotate_reader_ = v == 1 ? 1 : 0;
     save_settings_();
   }
 
@@ -144,6 +137,10 @@ class Application {
   // Called by MainMenu when the user opens a book: updates the open-order
   // counter in the index and persists both the index and settings.
   void record_book_opened(const std::string& path);
+
+  // Called by ReaderScreen when it closes: caches the reading percentage in the
+  // index so the book list can show it without reopening every book.
+  void record_book_progress(const std::string& path, int pct);
 
 
   // Navigate to a screen: push on top of the current screen (current stays on stack).

@@ -65,7 +65,23 @@ class ReaderOptionsScreen final : public ListMenuScreen {
   void draw_all_(DrawBuffer& buf, std::optional<uint8_t> battery_pct = std::nullopt) const override;
   int get_visible_count_(int H, int scroll_off) const override;
 
-  static constexpr int kRowH = 28;
+  // Row height follows the font rather than being a constant: the list font is
+  // the 32 px header face, and the old fixed 28 px was shorter than a line of it.
+  static constexpr int kRowPad = 12;
+  int row_h_() const { return ui_font_.y_advance() + kRowPad; }
+  static constexpr int kLM = 14, kRM = 14;
+  static constexpr int kPctGap = 10;    // title text → its percentage
+  static constexpr int kBlockGap = 10;  // between title, chapter and the rule
+  static constexpr int kSepH = 14;      // gap holding the settings/chapters hairline
+  // No battery on this screen — it is an overlay on the book, not a top-level
+  // screen, and the reader it sits over shows nothing either.
+  static constexpr int kHeaderTop = 16;
+  int header_top_() const { return kHeaderTop; }
+
+  // The chapter is a subtitle to the book title: one step down in size, in the
+  // same font the settings rows use.
+  const BitmapFont& chapter_font_() const { return section_font_.valid() ? section_font_ : subtitle_font_; }
+  const BitmapFont& title_font_() const { return header_font_.valid() ? header_font_ : ui_font_; }
 
   // ── Chapter jump ──────────────────────────────────────────────────────────
   // The chapter list lives in this screen; there is no separate Chapters page.
@@ -123,9 +139,21 @@ class ReaderOptionsScreen final : public ListMenuScreen {
   int prev_selected_ = 0;
 
   std::string book_title_;
-  std::string book_title1_buf_;
-  std::string book_title2_buf_;
   std::string chapter_title_;
+  // Wrapped at on_start() so draw_all_ and header_h_ measure the same block.
+  std::vector<std::string> title_lines_;
+  std::vector<std::string> chapter_lines_;
+  std::string book_pct_buf_;
+  std::string chapter_pct_buf_;
+
+  // Word-wraps `text` into at most `max_lines` lines of `f`, ellipsising the
+  // last one if it still overflows. `first_w` is the width available to the
+  // first line, which is narrower when a percentage sits beside it.
+  static std::vector<std::string> wrap_(const BitmapFont& f, const std::string& text, int first_w, int rest_w,
+                                        int max_lines);
+
+  // Pixels from the top of the panel to the rule above the item list.
+  int header_h_() const;
 
   int book_progress_pct_ = 0;
   int chapter_progress_pct_ = 0;

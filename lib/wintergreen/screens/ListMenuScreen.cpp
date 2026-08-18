@@ -149,6 +149,19 @@ void ListMenuScreen::draw_all_(DrawBuffer& buf, std::optional<uint8_t> battery_p
   draw_list_(buf, W, H, header_h, bottom_h);
 }
 
+void ListMenuScreen::draw_battery_(DrawBuffer& buf, int W, std::optional<uint8_t> battery_pct) const {
+  if (!battery_pct)
+    return;
+  const BitmapFont& bf = section_font_.valid() ? section_font_ : ui_font_;
+  if (!bf.valid())
+    return;
+  char pbuf[8];
+  std::snprintf(pbuf, sizeof(pbuf), "%u%%", static_cast<unsigned>(*battery_pct));
+  const size_t len = std::strlen(pbuf);
+  const int pw = bf.word_width(pbuf, len, FontStyle::Regular);
+  buf.draw_text_proportional(W - kBatteryPadX - pw, kBatteryPadY + bf.baseline(), pbuf, len, bf, false);
+}
+
 // ─────────────────────────────────────────────────────────────────────────────
 // 1. compute_header_h_: returns the header height without drawing anything.
 //    Used by ensure_visible_() and center_on_selected_() before the draw pass.
@@ -157,7 +170,7 @@ int ListMenuScreen::compute_header_h_() const {
   // Book-details card: unified across all themes when subtitle_ (author) is set.
   if (!subtitle_.empty() && ui_font_.valid()) {
     static constexpr int kBarPadY = 8;
-    int h = kBarPadY + ui_font_.y_advance() + kBarPadY + 1;  // wordmark bar + 1px rule
+    int h = kBarPadY + ui_font_.y_advance() + kBarPadY;  // battery row, no rule
     if (header_font_.valid() && subtitle_font_.valid()) {
       static constexpr int kCardPadT = 10, kCardPadB = 10, kTitleGap = 4, kLineGap = 6;
       h += kCardPadT;
@@ -172,7 +185,7 @@ int ListMenuScreen::compute_header_h_() const {
   if (!plain_list_) {
     const int hf = header_font_.valid() ? header_font_.y_advance()
                                         : (ui_font_.valid() ? ui_font_.y_advance() : 0);
-    return 10 + hf + 8 + 1;  // top pad + header row + gap + rule
+    return 10 + hf + 8;  // top pad + battery row + gap; no rule
   }
   int subtitle_h = 0;
   if (ui_font_.valid()) {
@@ -193,15 +206,11 @@ int ListMenuScreen::compute_header_h_() const {
 int ListMenuScreen::draw_header_(DrawBuffer& buf, int W, int H, std::optional<uint8_t> battery_pct) const {
   // Book-details card: unified across all themes when subtitle_ (author) is set.
   if (!subtitle_.empty() && ui_font_.valid()) {
+    // Same header as every other screen: battery top right, no wordmark, no rule.
     static constexpr int kBarPadY = 8;
     const int bar_h = kBarPadY + ui_font_.y_advance() + kBarPadY;
-    const int text_y = kBarPadY + ui_font_.baseline();
-    static const char kBrand[] = "wintergreen";
-    const size_t blen = std::strlen(kBrand);
-    const int bw = ui_font_.word_width(kBrand, blen, FontStyle::Regular);
-    buf.draw_text_proportional((W - bw) / 2, text_y, kBrand, blen, ui_font_, false);
-    buf.fill_rect(0, bar_h, W, 1, false);
-    int y = bar_h + 1;
+    draw_battery_(buf, W, battery_pct);
+    int y = bar_h;
     if (header_font_.valid() && subtitle_font_.valid()) {
       static constexpr int kCardPadT = 10, kCardPadB = 10, kTitleGap = 4, kLineGap = 6;
       static constexpr int kRM = 14;
@@ -243,26 +252,12 @@ int ListMenuScreen::draw_header_(DrawBuffer& buf, int W, int H, std::optional<ui
   if (!plain_list_) {
     if (!ui_font_.valid()) return 0;
     const int hf_adv = header_font_.valid() ? header_font_.y_advance() : ui_font_.y_advance();
-    static constexpr int kPad = 12;
     const BitmapFont& bf = section_font_.valid() ? section_font_ : ui_font_;
 
-    // Wordmark, or a per-screen override (e.g. "secret"), left-aligned in the header row.
-    const char* head = header_override_.empty() ? "wintergreen" : header_override_.c_str();
-    const size_t head_len = std::strlen(head);
-    const int head_y = 10 + (hf_adv - ui_font_.y_advance()) / 2 + ui_font_.baseline();
-    buf.draw_text_proportional(kPad, head_y, head, head_len, ui_font_, false);
-
-    if (battery_pct) {
-      char pbuf[8];
-      std::snprintf(pbuf, sizeof(pbuf), "%u%%", static_cast<unsigned>(*battery_pct));
-      const int pw = bf.word_width(pbuf, std::strlen(pbuf), FontStyle::Regular);
-      const int bat_y = 10 + (hf_adv - bf.y_advance()) / 2 + bf.baseline();
-      buf.draw_text_proportional(W - kPad - pw, bat_y, pbuf, std::strlen(pbuf), bf, false);
-    }
-
-    const int rule_y = 10 + hf_adv + 8;
-    buf.fill_rect(0, rule_y, W, 1, false);
-    return rule_y + 1;
+    // Battery percentage and nothing else: no wordmark, and no rule under it.
+    // Same helper the home screen calls, so the two land on the same pixel.
+    draw_battery_(buf, W, battery_pct);
+    return 10 + hf_adv + 8;
   }
   if (title_ && header_font_.valid()) {
     const size_t len = std::strlen(title_);
@@ -308,12 +303,8 @@ int ListMenuScreen::draw_bottom_(DrawBuffer& buf, int W, int H, std::optional<ui
     const int bottom_h = kBarPadY + subtitle_font_.y_advance() + kBarPadY + 1;
     const int bar_y = H - bottom_h;
     buf.fill_rect(0, bar_y, W, 1, false);
-    std::string footer = wintergreen_header_left();
-    if (battery_pct.has_value()) {
-      char nbuf[12];
-      std::snprintf(nbuf, sizeof(nbuf), " \xc2\xb7 %d%%", battery_pct.value());
-      footer += nbuf;
-    }
+    // Battery lives in the header now, so it is not repeated down here.
+    const std::string footer = wintergreen_header_left();
     if (!footer.empty()) {
       const int fw = subtitle_font_.word_width(footer.c_str(), footer.size(), FontStyle::Regular);
       const int text_y = bar_y + 1 + kBarPadY + subtitle_font_.baseline();
@@ -396,12 +387,13 @@ void ListMenuScreen::draw_list_(DrawBuffer& buf, int W, int H, int header_h, int
           display_label = label.substr(0, pos);
       }
 
-      // Right column (read time / "–")
+      // Right column (reading percentage). It sits on the *subtitle* baseline,
+      // so the title gets the full width and only the author has to make room.
       int right_w_actual = 0;
       if (!right_txt.empty())
-        right_w_actual = subtitle_font_.word_width(right_txt.data(), right_txt.size(), FontStyle::Regular);
+        right_w_actual = sub_font.word_width(right_txt.data(), right_txt.size(), FontStyle::Regular);
       const int right_reserved = right_txt.empty() ? 0 : (right_w_actual + 8);
-      const int max_lw = W - kLM - kRM - sb_reserved - right_reserved;
+      const int max_lw = W - kLM - kRM - sb_reserved;
 
       const int title_y = y + kPadT + ui_font_.baseline();
       int dlw = ui_font_.word_width(display_label.data(), display_label.size(), FontStyle::Regular);
@@ -424,16 +416,18 @@ void ListMenuScreen::draw_list_(DrawBuffer& buf, int W, int H, int header_h, int
         buf.draw_text_proportional(kLM, title_y, display_label.data(), display_label.size(), ui_font_, sel);
       }
 
-      // Right-aligned read time (in subtitle_font_, same baseline as title)
+      const int sub_baseline = y + kPadT + title_h + kGap + sub_font.baseline();
+
+      // Right-aligned percentage, on the author's baseline.
       if (!right_txt.empty()) {
         const int right_x = W - kRM - sb_reserved - right_w_actual;
-        buf.draw_text_proportional(right_x, title_y, right_txt.data(), right_txt.size(), subtitle_font_, sel);
+        buf.draw_text_proportional(right_x, sub_baseline, right_txt.data(), right_txt.size(), sub_font, sel);
       }
 
       // Subtitle line (author, setting value)
       if (!sub.empty()) {
-        const int sub_y = y + kPadT + title_h + kGap + sub_font.baseline();
-        const int max_sw = W - kLM - kRM - sb_reserved;
+        const int sub_y = sub_baseline;
+        const int max_sw = W - kLM - kRM - sb_reserved - right_reserved;
         int sw = sub_font.word_width(sub.data(), sub.size(), FontStyle::Regular);
         if (sw > max_sw) {
           const int sel_ell_w = sub_font.word_width(kEll, 3, FontStyle::Regular);
@@ -456,8 +450,10 @@ void ListMenuScreen::draw_list_(DrawBuffer& buf, int W, int H, int header_h, int
         }
       }
 
-      // Full-width per-book divider (1px, thinner than 2px status bar sep)
-      buf.fill_rect(0, y + slot_h - 1, W, 1, false);
+      // Full-width per-book divider. The last row has nothing below it to be
+      // divided from, so it gets none.
+      if (i != n - 1)
+        buf.fill_rect(0, y + slot_h - 1, W, 1, false);
       y += slot_h;
     }
 

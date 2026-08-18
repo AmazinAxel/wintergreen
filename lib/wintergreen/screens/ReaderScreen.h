@@ -155,6 +155,12 @@ class ReaderScreen final : public IScreen {
   // Returns the filename stem of path_ (no directory, no extension).
   std::string book_stem_() const;
 
+  // The book's title as it should be shown. Falls back to the containing folder
+  // name when the MRB has no usable title — a converted EPUB whose metadata said
+  // nothing yields the literal "none", which is what the book list already
+  // substitutes for, so the two screens must not disagree.
+  std::string display_title_() const;
+
   bool decode_image_to_buffer_(uint16_t img_key, uint32_t offset, uint32_t size, DrawBuffer& buf, int dest_x,
                                int dest_y, uint16_t max_w, uint16_t max_h, uint16_t src_y = 0, uint16_t clip_h = 0);
   void render_page_(DrawBuffer& buf);

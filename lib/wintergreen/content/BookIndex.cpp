@@ -125,7 +125,7 @@ bool BookIndex::load(const std::string& index_file) {
       len--;
     }
 
-    // Format: path|title|author[|last_open_order]
+    // Format: path|title|author[|last_open_order[|progress_pct]]
     char* sep1 = std::strchr(line, '|');
     if (!sep1)
       continue;
@@ -139,12 +139,19 @@ bool BookIndex::load(const std::string& index_file) {
     // after it; those are no longer tracked, and strtoul stops at the separator
     // so the extra columns are simply ignored.
     uint32_t order = 0;
+    uint32_t pct = 0;
     char* sep3 = std::strchr(sep2 + 1, '|');
     if (sep3) {
       *sep3 = '\0';
       order = static_cast<uint32_t>(std::strtoul(sep3 + 1, nullptr, 10));
+      // Optional field 5: cached reading percentage. Absent in files written by
+      // older firmware, which simply read back as 0.
+      char* sep4 = std::strchr(sep3 + 1, '|');
+      if (sep4)
+        pct = static_cast<uint32_t>(std::strtoul(sep4 + 1, nullptr, 10));
     }
-    add_entry(line, sep1 + 1, sep2 + 1, order);
+    if (add_entry(line, sep1 + 1, sep2 + 1, order))
+      entries_.back().progress_pct = static_cast<uint8_t>(pct > 100 ? 100 : pct);
   }
 
   std::fclose(f);
@@ -165,11 +172,12 @@ bool BookIndex::save(const std::string& index_file) const {
     auto path_v = entry.path.view(pool_);
     auto title_v = entry.title.view(pool_);
     auto author_v = entry.author.view(pool_);
-    std::fprintf(f, "%.*s|%.*s|%.*s|%u\n",
+    std::fprintf(f, "%.*s|%.*s|%.*s|%u|%u\n",
                  static_cast<int>(path_v.size()), path_v.data(),
                  static_cast<int>(title_v.size()), title_v.data(),
                  static_cast<int>(author_v.size()), author_v.data(),
-                 static_cast<unsigned>(entry.last_open_order));
+                 static_cast<unsigned>(entry.last_open_order),
+                 static_cast<unsigned>(entry.progress_pct));
   }
 
   if (std::fclose(f) != 0) {
@@ -274,16 +282,29 @@ void BookIndex::mark_opened(std::string_view path) {
   }
 }
 
+void BookIndex::set_progress(std::string_view path, int pct) {
+  if (pct < 0) pct = 0;
+  if (pct > 100) pct = 100;
+  for (auto& entry : entries_) {
+    if (entry.path.view(pool_) == path) {
+      entry.progress_pct = static_cast<uint8_t>(pct);
+      return;
+    }
+  }
+}
+
 void BookIndex::build_index(const std::string& root_dir, DrawBuffer& buf) {
   // Preserve open order across a rescan so the most-recently-read sort survives.
   struct OldStats {
     std::string key;
     uint32_t order;
+    uint8_t pct;
   };
   std::vector<OldStats> old_stats;
   for (const auto& e : entries_)
     if (e.last_open_order > 0)
-      old_stats.push_back({e.title.to_string(pool_) + '\x01' + e.author.to_string(pool_), e.last_open_order});
+      old_stats.push_back({e.title.to_string(pool_) + '\x01' + e.author.to_string(pool_), e.last_open_order,
+                           e.progress_pct});
 
   entries_.clear();
   pool_.reset();
@@ -316,6 +337,7 @@ void BookIndex::build_index(const std::string& root_dir, DrawBuffer& buf) {
       for (const auto& old : old_stats) {
         if (old.key == key) {
           entries_.back().last_open_order = old.order;
+          entries_.back().progress_pct = old.pct;
           break;
         }
       }

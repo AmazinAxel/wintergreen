@@ -356,6 +356,25 @@ void wintergreen::Application::record_book_opened(const std::string& path) {
   }
   save_settings_();
 }
+void wintergreen::Application::record_book_progress(const std::string& path, int pct) {
+  if (!data_dir_ || path.empty())
+    return;
+  const std::string index_path = std::string(data_dir_) + "/book_index.dat";
+  BookIndex& idx = BookIndex::instance();
+  // MainMenu::stop() clears the in-memory entries, so the reader usually closes
+  // with nothing loaded — reload first or the save would truncate the file.
+  bool reloaded = false;
+  if (idx.entries().empty()) {
+    if (!idx.load(index_path))
+      return;
+    reloaded = true;
+  }
+  idx.set_progress(path, pct);
+  idx.save(index_path);
+  if (reloaded)
+    idx.clear_entries();
+}
+
 void wintergreen::Application::load_settings_() {
   if (settings_path_.empty())
     return;
@@ -388,7 +407,7 @@ void wintergreen::Application::load_settings_() {
     else if (std::sscanf(line, "font_size=%u", &uval) == 1)
       rs.font_size_idx = uval < kMaxFontSizes ? static_cast<uint8_t>(uval) : 1;
     else if (std::sscanf(line, "rotate_reader=%u", &uval) == 1)
-      rotate_reader_ = static_cast<uint8_t>(uval <= 3 ? uval : 0);
+      rotate_reader_ = static_cast<uint8_t>(uval == 1 ? 1 : 0);
   }
   std::fclose(f);
 

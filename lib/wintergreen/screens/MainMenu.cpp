@@ -40,12 +40,6 @@ void MainMenu::on_start() {
 
   std::string index_path = std::string(app_->data_dir_) + "/book_index.dat";
 
-  // An index that parses but holds no books is not a useful cached result — it
-  // is indistinguishable from "never scanned". Treating it as authoritative is
-  // a trap: the card gets books added, the empty index still loads fine, and
-  // nothing ever rescans, so the library stays permanently empty.
-  // Hidden books are revealed by the home screen's back long-press, which sets
-  // the flag before pushing this screen.
   if (show_hidden_ && hidden_.empty())
     scan_hidden_();
 
@@ -192,7 +186,6 @@ void MainMenu::scan_hidden_() {
       e.title_own = folder_name_of(p);
     e.path = std::move(p);
     e.hidden = true;
-    e.mrb_exists = true;
     hidden_.push_back(std::move(e));
   }
 
@@ -222,13 +215,24 @@ std::string_view MainMenu::get_item_label(int index) const {
     return {};
   const StringPool& pool = BookIndex::instance().pool();
   const BookEntry& e = entries_[real];
-  const std::string_view title_sv = e.hidden ? std::string_view(e.title_own) : e.title_ref.view(pool);
+  // Title only — every book on the card is a converted MRB, so the old trailing
+  // middle dot marked every single row and said nothing.
+  return e.hidden ? std::string_view(e.title_own) : e.title_ref.view(pool);
+}
 
-  // Title only; a trailing middle dot marks an already-converted book.
-  if (!e.mrb_exists)
-    return title_sv;
-  label_buf_ = std::string(title_sv) + " \xc2\xb7";
-  return label_buf_;
+// Reading percentage, drawn at the bottom right of the row beside the author.
+// Blank for a book that has never been opened, and for hidden books, which are
+// never recorded in the index.
+std::string_view MainMenu::get_item_right(int index) const {
+  if (is_separator(index)) return {};
+  const int real = entries_index_for(index);
+  if (real < 0 || real >= static_cast<int>(entries_.size())) return {};
+  const BookEntry& e = entries_[real];
+  if (e.hidden || e.last_open_order == 0) return {};
+  char buf[8];
+  std::snprintf(buf, sizeof(buf), "%u%%", static_cast<unsigned>(e.progress_pct));
+  right_buf_ = buf;
+  return right_buf_;
 }
 
 std::string_view MainMenu::get_item_subtitle(int index) const {
@@ -260,27 +264,13 @@ void MainMenu::populate_list_() {
 
   const StringPool& bpool = BookIndex::instance().pool();
   detail_list_ = true;
-  const bool check_mrb = app_ && app_->data_dir_ && app_->show_converted_indicator();
   for (const auto& idx : BookIndex::instance().entries()) {
     BookEntry e;
     e.path = idx.path.to_string(bpool);
     e.title_ref = idx.title;
     e.author_ref = idx.author;
     e.last_open_order = idx.last_open_order;
-    if (check_mrb) {
-      if (BookIndex::is_mrb_path(e.path.c_str())) {
-        e.mrb_exists = true;  // already converted — that is what the file is
-      } else {
-        const char* name = e.path.c_str();
-        const char* sep = std::strrchr(name, '/');
-        if (sep) name = sep + 1;
-        const char* dot = std::strrchr(name, '.');
-        std::string stem(name, dot ? static_cast<size_t>(dot - name) : std::strlen(name));
-        std::string mrb_path = std::string(app_->data_dir_) + "/cache/" + stem + "/book.mrb";
-        FILE* mf = std::fopen(mrb_path.c_str(), "rb");
-        if (mf) { std::fclose(mf); e.mrb_exists = true; }
-      }
-    }
+    e.progress_pct = idx.progress_pct;
     entries_.push_back(std::move(e));
   }
 

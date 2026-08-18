@@ -41,6 +41,20 @@ std::string ReaderScreen::book_stem_() const {
   return std::string(name, len);
 }
 
+std::string ReaderScreen::display_title_() const {
+  const std::string& t = mrb_.metadata().title;
+  if (!t.empty() && t != "none")
+    return t;
+  // Same fallback BookIndex uses: the containing folder, which the converter
+  // names after the original file.
+  const size_t last = path_.find_last_of('/');
+  if (last == std::string::npos || last == 0)
+    return book_stem_();
+  const size_t prev = path_.find_last_of('/', last - 1);
+  const size_t start = prev == std::string::npos ? 0 : prev + 1;
+  return path_.substr(start, last - start);
+}
+
 // ---------------------------------------------------------------------------
 // ReaderScreen — image size resolution
 // ---------------------------------------------------------------------------
@@ -355,6 +369,10 @@ void ReaderScreen::stop() {
     if (buf_)
       buf_->wait_panel_idle();
     save_position_();
+    // Cache the percentage for the book list, which has no cheap way to derive
+    // it (that would mean opening every MRB and .pos on the card).
+    if (app_)
+      app_->record_book_progress(path_, progress_pct());
   }
   image_size_fn_ = {};
   chapter_src_.reset();
@@ -437,7 +455,7 @@ void ReaderScreen::update(const ButtonState& buttons, DrawBuffer& buf, IRuntime&
           saved_page_pos_ = page_pos_;
           app_->reader_options()->set_settings(&reader_settings_);
           app_->reader_options()->populate(mrb_.toc(), static_cast<uint16_t>(chapter_idx_), page_pos_.paragraph,
-                                           mrb_.metadata().title, progress_pct(), chapter_progress_pct(),
+                                           display_title_(), progress_pct(), chapter_progress_pct(),
                                            mrb_.chapter_count());
           app_->push_screen(ScreenId::ReaderOptions);
           return;

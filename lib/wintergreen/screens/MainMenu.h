@@ -64,6 +64,7 @@ class MainMenu final : public ListMenuScreen {
 
   std::string_view get_item_label(int index) const override;
   std::string_view get_item_subtitle(int index) const override;
+  std::string_view get_item_right(int index) const override;
   std::string wintergreen_header_left() const override;
   bool is_separator(int index) const override;
   int count() const override;
@@ -98,7 +99,7 @@ class MainMenu final : public ListMenuScreen {
     StringRef title_ref;
     StringRef author_ref;
     uint32_t last_open_order = 0;
-    bool mrb_exists = false;
+    uint8_t progress_pct = 0;
     // Books under .hidden/ are not in BookIndex — there is no pool to reference,
     // so they carry their own metadata and are read straight from the MRB.
     bool hidden = false;
@@ -106,8 +107,8 @@ class MainMenu final : public ListMenuScreen {
     std::string author_own;
   };
   std::vector<BookEntry> entries_;
-  mutable std::string label_buf_;
   mutable std::string subtitle_buf_;
+  mutable std::string right_buf_;
 
   // Labeled section separators: {visual_index, label}.
   // Inserted by populate_list_() for LastOpened sort ("Recents", "All Books").

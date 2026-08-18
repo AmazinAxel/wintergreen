@@ -61,9 +61,6 @@ class ListMenuScreen : public IScreen {
   // screens (chapter select, links) that appear on top of the reader.
   bool plain_list_ = false;
 
-  // When non-empty: used in place of "wintergreen" in the status bar header.
-  // Leave empty for the normal wordmark.
-  std::string header_override_;
 
   // 0 = center (default), 1 = left, 2 = right
   void set_list_align(uint8_t align) {
@@ -166,6 +163,19 @@ class ListMenuScreen : public IScreen {
   BitmapFont subtitle_font_;   // always small; used for item subtitles and tight labels
   BitmapFont section_font_;    // one step below ui_font_; use for APPEARANCE/NAVIGATE etc.
   static int font_size_idx_;  // 0=Normal, 1=Large, 2=XLarge
+
+  // The battery percentage, top right. Every screen calls this — the position is
+  // fixed here rather than per-screen so the header does not shift by a pixel
+  // when moving between the home carousel and a list.
+  static constexpr int kBatteryPadX = 16;
+  static constexpr int kBatteryPadY = 10;
+  void draw_battery_(DrawBuffer& buf, int W, std::optional<uint8_t> battery_pct) const;
+
+  // Height the battery row occupies, from the top of the panel.
+  int battery_row_h_() const {
+    const BitmapFont& bf = section_font_.valid() ? section_font_ : ui_font_;
+    return kBatteryPadY + (bf.valid() ? bf.y_advance() : 0);
+  }
 
   void request_redraw() {
     force_redraw_ = true;

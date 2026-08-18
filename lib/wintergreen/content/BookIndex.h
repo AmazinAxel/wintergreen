@@ -15,6 +15,10 @@ struct BookIndexEntry {
   StringRef title{};
   StringRef author{};
   uint32_t last_open_order = 0;  // 0 = never opened; higher = more recently opened
+  // Reading position as a percentage, cached here purely so the book list can
+  // show it without opening every MRB and .pos on the card. Written when the
+  // reader closes; 0 for a book that was never opened.
+  uint8_t progress_pct = 0;
 };
 
 static constexpr int MAX_BOOKS = 250;
@@ -52,6 +56,9 @@ class BookIndex {
   // from the entries themselves rather than persisted separately, so it cannot
   // drift out of step with the index.
   void mark_opened(std::string_view path);
+
+  // Cache the reading percentage shown in the book list. Call save() to persist.
+  void set_progress(std::string_view path, int pct);
 
   // No-op if not found. Call save() to persist.
   void remove_entry(std::string_view path);
