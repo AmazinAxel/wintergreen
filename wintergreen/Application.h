@@ -9,7 +9,7 @@
 #include "ScreenManager.h"
 #include "display/DrawBuffer.h"
 #include "screens/IScreen.h"
-#include "screens/LyraExtScreen.h"
+#include "screens/HomeScreen.h"
 #include "screens/MainMenu.h"
 #include "screens/ReaderOptionsScreen.h"
 #include "screens/ReaderScreen.h"
@@ -23,7 +23,7 @@ enum class ScreenId : uint8_t {
   MainMenu,
   Reader,
   ReaderOptions,
-  LyraExt,
+  HomeScreen,
 };
 
 // Two orientations only. The reversed ones (Deg270/Deg180) were dropped: they
@@ -97,8 +97,8 @@ class Application {
   MainMenu* main_menu() {
     return &menu_;
   }
-  LyraExtScreen* lyra_ext_screen() {
-    return &lyra_ext_;
+  HomeScreen* home_screen() {
+    return &home_;
   }
 
   // todo remove ---------------
@@ -201,7 +201,7 @@ class Application {
 
 
 
-  LyraExtScreen lyra_ext_;
+  HomeScreen home_;
   MainMenu menu_;
   ReaderScreen reader_;
   ReaderOptionsScreen reader_options_;

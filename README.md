@@ -36,8 +36,8 @@ namespace wintergreen::config {
   inline constexpr uint8_t kAutoSleepMinutes = 1;
   inline constexpr uint32_t kPowerHoldSleepMs = 400;
 
-  inline constexpr uint32_t kHoldDelayMs = 350;
-  inline constexpr uint32_t kHoldRepeatMs = 175;
+  inline constexpr uint32_t kHoldDelayMs = 200;
+  inline constexpr uint32_t kHoldRepeatMs = 200;
   inline constexpr int kHoldAccelStep = 1;
 }
 ```

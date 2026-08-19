@@ -14,9 +14,9 @@ namespace wintergreen {
 // where it sits among the recents. Up/Down move between them, Select opens the
 // book, Back opens the full book list (there is no separate Recents screen), and
 // a long Back press opens Hidden Books.
-class LyraExtScreen final : public ListMenuScreen {
+class HomeScreen final : public ListMenuScreen {
  public:
-  LyraExtScreen() = default;
+  HomeScreen() = default;
 
   const char* name() const override { return "Home"; }
 

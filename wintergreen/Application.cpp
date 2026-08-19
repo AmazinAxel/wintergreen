@@ -43,7 +43,7 @@ void Application::start(DrawBuffer& buf, IRuntime& runtime) {
   if (reader_font_)
     reader_.set_fonts(reader_font_);
 
-  lyra_ext_.set_app(this);
+  home_.set_app(this);
   menu_.set_app(this);
   reader_.set_app(this);
   reader_options_.set_app(this);
@@ -60,7 +60,7 @@ void Application::start(DrawBuffer& buf, IRuntime& runtime) {
 
   buf.set_rotation(rotation_from_setting(rotate_display())); // rotaton
 
-  screen_mgr_.push(&lyra_ext_, buf, runtime);
+  screen_mgr_.push(&home_, buf, runtime);
 
   // Don't auto-open books from the hidden folder — they're meant to stay private.
   if (!pending_book_path_.empty() && pending_book_path_.find("/.hidden/") != std::string::npos)
@@ -296,8 +296,8 @@ IScreen* wintergreen::Application::screen_for_(ScreenId id) {
       return &reader_;
     case ScreenId::ReaderOptions:
       return &reader_options_;
-    case ScreenId::LyraExt:
-      return &lyra_ext_;
+    case ScreenId::HomeScreen:
+      return &home_;
     default:
       return nullptr;
   }

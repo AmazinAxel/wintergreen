@@ -1,4 +1,4 @@
-#include "LyraExtScreen.h"
+#include "HomeScreen.h"
 
 #include <algorithm>
 #include <cmath>
@@ -103,7 +103,7 @@ static constexpr uint8_t kBayer4[4][4] = {
   {15,  7, 13,  5},
 };
 
-void LyraExtScreen::load_cover_(int i, int box_w, int box_h) const {
+void HomeScreen::load_cover_(int i, int box_w, int box_h) const {
   cover_data_.clear();
   cover_w_ = cover_h_ = 0;
   cover_slot_ = i;
@@ -236,7 +236,7 @@ void LyraExtScreen::load_cover_(int i, int box_w, int box_h) const {
   std::fclose(f);
 }
 
-void LyraExtScreen::on_start() {
+void HomeScreen::on_start() {
   const Rotation rot = current_rotation_();
   if (rot == Rotation::Deg0 || rot == Rotation::Deg180)
     set_buf_rotation_(Rotation::Deg90);
@@ -296,7 +296,7 @@ void LyraExtScreen::on_start() {
   set_selected(0);
 }
 
-void LyraExtScreen::on_select(int index) {
+void HomeScreen::on_select(int index) {
   if (!app_ || index < 0 || index >= num_books_) return;
   app_->record_book_opened(slots_[index].path);
   app_->reader()->set_path(slots_[index].path.c_str());
@@ -312,7 +312,7 @@ void LyraExtScreen::on_select(int index) {
 // started with Button0 still physically down — its own release handler then fired
 // immediately and popped it. The list appeared only for as long as the button was
 // held. Any screen that pushes another on a button press has this problem.
-void LyraExtScreen::update(const ButtonState& buttons, DrawBuffer& buf, IRuntime& runtime) {
+void HomeScreen::update(const ButtonState& buttons, DrawBuffer& buf, IRuntime& runtime) {
   ButtonState fwd = buttons;
   const bool back_down = buttons.is_down(Button::Button0);
 
@@ -379,7 +379,7 @@ void LyraExtScreen::update(const ButtonState& buttons, DrawBuffer& buf, IRuntime
   ListMenuScreen::update(fwd, buf, runtime);
 }
 
-void LyraExtScreen::draw_all_(DrawBuffer& buf, std::optional<uint8_t> battery_pct) const {
+void HomeScreen::draw_all_(DrawBuffer& buf, std::optional<uint8_t> battery_pct) const {
   if (!ui_font_.valid()) return;
   const int W = buf.width();
   const int H = buf.height();

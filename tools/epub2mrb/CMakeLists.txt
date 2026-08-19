@@ -8,7 +8,7 @@ if(NOT CMAKE_BUILD_TYPE)
 endif()
 
 get_filename_component(REPO_ROOT "${CMAKE_CURRENT_SOURCE_DIR}/../.." ABSOLUTE)
-set(LIB ${REPO_ROOT}/lib/wintergreen)
+set(LIB ${REPO_ROOT}/wintergreen)
 
 # miniz, vendored — same sources the desktop and ESP32 builds use.
 set(MINIZ_DIR ${REPO_ROOT}/third_party/miniz)
@@ -38,5 +38,5 @@ add_executable(epub2mrb
     ${LIB}/content/mrb/MrbReader.cpp
     ${LIB}/content/mrb/MrbConverter.cpp)
 
-target_include_directories(epub2mrb PRIVATE ${REPO_ROOT}/lib ${REPO_ROOT})
+target_include_directories(epub2mrb PRIVATE ${REPO_ROOT} ${REPO_ROOT})
 target_link_libraries(epub2mrb PRIVATE miniz)

@@ -7,7 +7,7 @@ Produces the two shapes the firmware consumes:
           behind a uint32 length prefix (what asset_blob ships and
           FontPartition::provision_embedded decompresses).
   header  UI font: a bare MBF4 emitted as a C array, matching
-          lib/wintergreen/display/ui_font_*.h.
+          wintergreen/display/ui_font_*.h.
 
 Needs freetype-py, which is not in the PlatformIO interpreter. Run it under:
 

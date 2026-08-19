@@ -2,7 +2,7 @@ FILE(GLOB app_sources
     ${CMAKE_CURRENT_LIST_DIR}/*.c
     ${CMAKE_CURRENT_LIST_DIR}/*.cpp)
 
-set(LIB ${CMAKE_CURRENT_LIST_DIR}/../../lib/wintergreen)
+set(LIB ${CMAKE_CURRENT_LIST_DIR}/../../wintergreen)
 
 set(lib_sources
     ${LIB}/Application.cpp
@@ -11,7 +11,7 @@ set(lib_sources
     ${LIB}/screens/MainMenu.cpp
     ${LIB}/screens/ReaderScreen.cpp
     ${LIB}/screens/ReaderOptionsScreen.cpp
-    ${LIB}/screens/LyraExtScreen.cpp
+    ${LIB}/screens/HomeScreen.cpp
     ${LIB}/content/CoverPaths.cpp
     ${LIB}/content/ZipReader.cpp
     ${LIB}/content/TextLayout.cpp
@@ -29,7 +29,7 @@ set(MINIZ_DIR ${CMAKE_CURRENT_LIST_DIR}/../../third_party/miniz)
 idf_component_register(
     SRCS ${app_sources} ${lib_sources} ${CMAKE_CURRENT_LIST_DIR}/miniz_wrapper.cpp
          ${CMAKE_CURRENT_LIST_DIR}/assets_embedded.S
-    INCLUDE_DIRS "." "${CMAKE_CURRENT_LIST_DIR}/../.." "${CMAKE_CURRENT_LIST_DIR}/../../lib" "${MINIZ_DIR}"
+    INCLUDE_DIRS "." "${CMAKE_CURRENT_LIST_DIR}/../.." "${CMAKE_CURRENT_LIST_DIR}/../.." "${MINIZ_DIR}"
     REQUIRES fatfs driver wear_levelling)
 
 # IDF 5.x adds -Wno-old-style-declaration (C-only) globally; GCC -Werror rejects
