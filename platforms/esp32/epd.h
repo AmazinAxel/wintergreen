@@ -159,15 +159,41 @@ class EInkDisplay : public wintergreen::IDisplay {
 
   // ---- wintergreen::IDisplay ----
 
-  void full_refresh(const uint8_t* pixels, wintergreen::RefreshMode mode, bool turnOffScreen) override {
+  // RED RAM is the *previous* frame, and only EPD_FULL_REFRESH reads it.
+  //
+  // The full-refresh waveform is prior-state dependent: it drives each pixel from
+  // its old level to its new one, and the level it starts from is what RED holds.
+  // This used to write `pixels` to both planes with CTRL1_BYPASS_RED set, which
+  // told the controller to ignore RED altogether — so those 48 KB went out over
+  // SPI and were discarded, and the waveform fell back to the controller's own
+  // notion of the previous frame. After a session of fast partials that notion is
+  // stale, so pixels that should have been given a long white drive got a short
+  // one and stayed grey.
+  //
+  // Visible as a sleep cover that comes up washed out in its light areas, only on
+  // light covers (a dark one is mostly large transitions that get driven anyway)
+  // and only sometimes, since it depends on what was last on the glass.
+  //
+  // Half keeps BYPASS_RED. It is the boot paint — Application::start()'s
+  // full_refresh() defaults to it — and that sequence has already produced a
+  // panel that ran a waveform and then displayed nothing for the rest of time
+  // (see the EPD_HALF_REFRESH case in refreshDisplay). It draws from a cleared
+  // panel on a cold boot, so it has no previous frame to honour and gains
+  // nothing from one. Leave it alone.
+  void full_refresh(const uint8_t* pixels, const uint8_t* prev, wintergreen::RefreshMode mode,
+                    bool turnOffScreen) override {
 
     wakeIfNeeded();
     waitWhileBusy();
+    const bool full = (mode != wintergreen::RefreshMode::Half);
+    // Without a previous frame there is nothing better to start from than the
+    // new one, which is the old behaviour.
+    const uint8_t* red = (full && prev) ? prev : pixels;
     // Buffer covers all 800 columns; panel offset is baked into draw-function coordinates.
     setRamArea(0, 0, DISPLAY_WIDTH, DISPLAY_HEIGHT);
     writeRamBuffer(CMD_WRITE_RAM_BW, pixels, BUFFER_SIZE);
-    writeRamBuffer(CMD_WRITE_RAM_RED, pixels, BUFFER_SIZE);
-    refreshDisplay(mode == wintergreen::RefreshMode::Half ? EPD_HALF_REFRESH : EPD_FULL_REFRESH, turnOffScreen);
+    writeRamBuffer(CMD_WRITE_RAM_RED, red, BUFFER_SIZE);
+    refreshDisplay(full ? EPD_FULL_REFRESH : EPD_HALF_REFRESH, turnOffScreen);
   }
 
   // Fire and return: the controller now holds the pixels in its own RAM, so both
@@ -353,7 +379,11 @@ class EInkDisplay : public wintergreen::IDisplay {
   // sleep, screen power-off) must keep wait=true — a command mid-waveform aborts it.
   void refreshDisplay(EpdRefreshMode mode, bool turnOffScreen = false, bool wait = true) {
     sendCommand(CMD_DISPLAY_UPDATE_CTRL1);
-    sendData(mode == EPD_FAST_REFRESH ? CTRL1_NORMAL : CTRL1_BYPASS_RED);
+    // Only EPD_HALF_REFRESH bypasses RED. Fast has always used it as the previous
+    // frame, and Full now does too — that is what makes a full refresh drive from
+    // the pixel's actual old level rather than from whatever the controller last
+    // tracked. See full_refresh() for what the bypass cost on the sleep cover.
+    sendData(mode == EPD_HALF_REFRESH ? CTRL1_BYPASS_RED : CTRL1_NORMAL);
 
     // best guess at display mode bits:
     // bit | hex | name                    | effect

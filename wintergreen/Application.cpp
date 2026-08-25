@@ -386,9 +386,15 @@ void Application::save_settings_() {
 }
 
 
-void Application::release_index_for_radio() {
-  // The reading position is already on disk (ReaderScreen writes .pos on close)
-  // and settings are saved on sleep, so nothing here is the only copy.
+void Application::release_ram_for_radio() {
+  // **Only the book index.** DrawBuffer's spare and the reader's page caches
+  // are deliberately NOT released: they are what make a page turn a memcpy
+  // instead of a layout, and a clicker exists to turn pages. Trading page-turn
+  // latency for radio headroom defeats the point of the feature.
+  //
+  // The index costs nothing to be without while a book is open — every screen
+  // reloads it from disk on demand — and the reading position is already on
+  // disk, so nothing here is the only copy.
   BookIndex::instance().release_memory();
 }
 
@@ -447,7 +453,9 @@ void Application::load_settings_() {
     if (std::sscanf(line, "book_path=%511[^\n]", sval) == 1)
       last_book_path = sval;
     else if (std::sscanf(line, "font_size=%u", &uval) == 1)
-      rs.font_size_idx = uval < ReaderSettings::kNumFontSizePresets ? static_cast<uint8_t>(uval) : 1;
+      // Anything out of range reads as the default. A settings file written by a
+      // build with the old five-size bundle will have an index past the end.
+      rs.font_size_idx = uval < ReaderSettings::kNumFontSizePresets ? static_cast<uint8_t>(uval) : 0;
     else if (std::sscanf(line, "rotate_reader=%u", &uval) == 1)
       rotate_reader_ = static_cast<uint8_t>(uval == 1 ? 1 : 0);
   }

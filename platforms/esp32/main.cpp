@@ -160,6 +160,11 @@ extern "C" void app_main(void) {
   font_mgr.init();
   app.set_font_manager(&font_mgr);
 
+  // The runtime's start_sync() reaches neither of these, and a sync needs both:
+  // the app for the book index and card paths, the buffer to stay off SPI2
+  // while the panel is mid-waveform.
+  wg_sync::bind(app, buf);
+
   app.start(buf, runtime);
 
   // Discard the power-button press that woke us from deep sleep.
@@ -250,6 +255,11 @@ extern "C" void app_main(void) {
     // unless a clicker MAC is configured; see bluetooth_clicker.h for why the
     // callback cannot tear its own stack down.
     wg_clicker::poll();
+
+    // Hold off auto-sleep while a sync is in flight: a multi-book transfer
+    // easily outlasts kAutoSleepMinutes, and sleeping mid-download would cut
+    // the radio with files half written.
+    wg_sync::poll();
 
     wintergreen::run_loop_iteration(app, buf, input, runtime);
   }

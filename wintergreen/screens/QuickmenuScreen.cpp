@@ -93,10 +93,14 @@ int QuickmenuScreen::header_h_() const {
     h += kBlockGap + static_cast<int>(chapter_lines_.size()) * chapter_font_().y_advance();
   // The rule under the header is drawn with the shared draw_separator_(), so it
   // occupies exactly kSeparatorH like every other hairline in the tree — half
-  // above the line, half below. It used to carry kBlockGap above and only
-  // kSeparatorH/2 below, which made this one divider sit differently from the
-  // settings/chapters one a few rows further down. Must match draw_all_.
-  return h + kSeparatorH;
+  // above the line, half below.
+  //
+  // kBlockGap on top of that, because kSeparatorH/2 is the whole gap between the
+  // rule and the last line of the header, whereas the settings/chapters hairline
+  // has a row's kRowPad on each side of it. Without this the header text sits
+  // hard against its rule while every other divider in the tree breathes. Must
+  // match draw_all_.
+  return h + kBlockGap + kSeparatorH;
 }
 
 // Build a "Label: Value" string into a fixed buffer.
@@ -174,8 +178,43 @@ void QuickmenuScreen::on_start() {
   // default action. Its row height is 0 everywhere the list measures itself.
   add_item("");
 
-  // Flat list, no section headers: the two settings, then Chapters.
+  // Flat list, no section headers: Page Turner, Orientation, Font Size, then
+  // Chapters. The clicker leads because it is the only row whose value changes
+  // on its own and the only one you press twice in a session.
+  //
+  // The clicker row exists only when a MAC is configured — on every other build
+  // clicker_state() is Unavailable and there is no row to select, rather than a
+  // control that can never do anything.
+  idx_clicker_ = -1;
+  clicker_shown_ = runtime_ ? runtime_->clicker_state() : ClickerState::Unavailable;
+  if (clicker_shown_ != ClickerState::Unavailable) {
+    idx_clicker_ = count();
+    // Three things: "Connecting", the clicker's battery percentage once it
+    // is connected, or "Disconnected". Every failure reads as Disconnected —
+    // the row is a switch, not a status console, and they all mean the same
+    // thing to the user: press it again.
+    //
+    // The percentage is captured once on connect and held, so it never changes
+    // under you mid-book. A clicker with no battery service reports nothing, so
+    // that case says Connected instead.
+    char val[16];
+    const uint8_t pct = runtime_ ? runtime_->clicker_battery_pct() : 0;
+    clicker_pct_shown_ = pct;
+    if (clicker_shown_ == ClickerState::Connecting)
+      snprintf(val, sizeof(val), "Connecting");
+    else if (clicker_shown_ == ClickerState::Connected && pct > 0)
+      snprintf(val, sizeof(val), "%u%%", static_cast<unsigned>(pct));
+    else if (clicker_shown_ == ClickerState::Connected)
+      snprintf(val, sizeof(val), "Connected");
+    else
+      snprintf(val, sizeof(val), "Disconnected");
+    add_item(fmt_setting(tmp, sizeof(tmp), "Page Turner", val));
+  }
+
   if (settings_) {
+    idx_reader_rotate_display_ = count();
+    add_item(fmt_setting(tmp, sizeof(tmp), "Orientation", rotation_label(app_ ? app_->rotate_reader() : 0)));
+
     idx_font_size_ = count();
     if (app_ && app_->font_manager() && app_->font_manager()->valid()) {
       auto* fonts = app_->font_manager()->font_set();
@@ -197,38 +236,6 @@ void QuickmenuScreen::on_start() {
     } else {
       add_item(fmt_setting(tmp, sizeof(tmp), "Font Size", ReaderSettings::kFontSizeNames[settings_->font_size_idx]));
     }
-
-    idx_reader_rotate_display_ = count();
-    add_item(fmt_setting(tmp, sizeof(tmp), "Orientation", rotation_label(app_ ? app_->rotate_reader() : 0)));
-  }
-
-  // The clicker row exists only when a MAC is configured — on every other build
-  // clicker_state() is Unavailable and there is no row to select, rather than a
-  // control that can never do anything.
-  idx_clicker_ = -1;
-  clicker_shown_ = runtime_ ? runtime_->clicker_state() : ClickerState::Unavailable;
-  if (clicker_shown_ != ClickerState::Unavailable) {
-    idx_clicker_ = count();
-    // A failure carries its GAP reason code, because there is no log to put it
-    // in and "Failed" on its own is exactly as useless as the silence it
-    // replaced. See bluetooth_clicker.h for how to read the number.
-    char val[24];
-    const int code = runtime_ ? runtime_->clicker_status_code() : 0;
-    const int rst = runtime_ ? runtime_->last_reset_reason() : 0;
-    if (clicker_shown_ == ClickerState::Failed && code != 0)
-      snprintf(val, sizeof(val), "Failed %d", code);
-    else if (clicker_shown_ == ClickerState::Connected && code < 0)
-      // Free internal RAM while the radio is up — the number that decides
-      // whether the reader can still lay out a page. See status_code().
-      snprintf(val, sizeof(val), "Connected %dk", -code);
-    else if (rst != 0)
-      // The device restarted abnormally. Say so here: a reset wipes any state
-      // that could have recorded why, and esp_reset_reason() is the only thing
-      // that survives it. Clears on the next clean boot.
-      snprintf(val, sizeof(val), "%s rst%d", clicker_label_(clicker_shown_), rst);
-    else
-      snprintf(val, sizeof(val), "%s", clicker_label_(clicker_shown_));
-    add_item(fmt_setting(tmp, sizeof(tmp), "Page Turner", val));
   }
 
   // Chapters, inline below the settings. Nested TOC entries keep their depth as
@@ -335,6 +342,7 @@ void QuickmenuScreen::draw_all_(DrawBuffer& buf, std::optional<uint8_t> battery_
   }
 
   // Same helper, same geometry as every other hairline — see header_h_().
+  y += kBlockGap;
   draw_separator_(buf, W, y);
   y += kSeparatorH;  // must match header_h_()
 
@@ -437,7 +445,7 @@ void QuickmenuScreen::on_select(int index) {
       // host task unable to start (11 KB free), or succeed and then abort the
       // reader on its next page layout.
       if (runtime_->clicker_state() != ClickerState::Connected && app_)
-        app_->release_index_for_radio();
+        app_->release_ram_for_radio();
       // Returns immediately: connecting takes seconds. The row redraws as
       // "Connecting", and update() below repaints it when the outcome lands.
       runtime_->toggle_clicker();

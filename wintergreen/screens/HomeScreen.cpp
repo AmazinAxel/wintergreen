@@ -272,7 +272,8 @@ void HomeScreen::on_start() {
   // instantiated for a list that is then truncated to five — and it built
   // path/title/author for every book ever opened just to discard all but those
   // five. This walks the index kMaxBooks times instead and copies nothing until
-  // a winner is known.
+  // a winner is known
+
   const auto& entries = BookIndex::instance().entries();
   const StringPool& pool = BookIndex::instance().pool();
   int chosen[kMaxBooks];

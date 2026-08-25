@@ -17,11 +17,11 @@ namespace wintergreen {
 // spacing and publisher font sizes are fixed: margins at what used to be the
 // "Normal" preset, and the other three deferring to the book's own CSS.
 struct ReaderSettings {
-  uint8_t font_size_idx = 1;  // base font size preset index (1 = Normal/24px)
+  uint8_t font_size_idx = 0;  // base font size preset index (0 = 32px)
 
   // Must match the sizes tools/make_font.py builds into the bundle, in order.
-  static constexpr const char* kFontSizeNames[] = {"20", "24", "28", "32", "36"};
-  static constexpr uint8_t kNumFontSizePresets = 5;
+  static constexpr const char* kFontSizeNames[] = {"32", "36"};
+  static constexpr uint8_t kNumFontSizePresets = 2;
 
   static constexpr uint16_t h_padding() {
     return 12;
@@ -114,9 +114,13 @@ class QuickmenuScreen final : public ListMenuScreen {
     // so the row that says "Connecting" has to be repainted when the outcome
     // arrives. This is the only thing on any screen that changes without a
     // button press, hence the explicit poll; everything else repaints on input.
+    // The battery percentage arrives on its own notification a moment *after*
+    // the connect completes, so watching the state alone would leave the row
+    // reading "Connected" until the next keypress.
     if (idx_clicker_ >= 0) {
       const ClickerState now = runtime.clicker_state();
-      if (now != clicker_shown_) {
+      const uint8_t pct = runtime.clicker_battery_pct();
+      if (now != clicker_shown_ || pct != clicker_pct_shown_) {
         refresh_items_(selected_index());
         request_redraw();
       }
@@ -140,23 +144,10 @@ class QuickmenuScreen final : public ListMenuScreen {
   IRuntime* runtime_ = nullptr;
 
   // What the Clicker row currently says, so update() can tell an asynchronous
-  // state change from a redraw it has already done.
+  // change from a redraw it has already done.
   ClickerState clicker_shown_ = ClickerState::Unavailable;
+  uint8_t clicker_pct_shown_ = 0;
 
-  static const char* clicker_label_(ClickerState s) {
-    switch (s) {
-      case ClickerState::Connected:
-        return "Connected";
-      case ClickerState::Connecting:
-        return "Connecting";
-      case ClickerState::NotFound:
-        return "Not found";
-      case ClickerState::Failed:
-        return "Failed";
-      default:
-        return "Disconnected";
-    }
-  }
 
   // Item 0 is the header block (book title + chapter + percentages), drawn by
   // draw_all_ rather than by the list loop and worth 0 rows to every height

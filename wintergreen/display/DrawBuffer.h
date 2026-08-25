@@ -3,6 +3,7 @@
 #include <algorithm>
 #include <cstddef>
 #include <cstdint>
+#include <cstdlib>
 #include <cstring>
 #include <utility>
 
@@ -36,8 +37,14 @@ class IDisplay {
  public:
   virtual ~IDisplay() = default;
 
-  // Full physical refresh. Both BW and RED RAM are set to `pixels`.
-  virtual void full_refresh(const uint8_t* pixels, RefreshMode mode, bool turnOffScreen = false) = 0;
+  // Full physical refresh. `pixels` is the new frame; `prev` is the one currently
+  // on the glass, or nullptr when it is not known.
+  //
+  // RefreshMode::Full drives each pixel from its actual old state to its new one,
+  // which needs `prev` in RED RAM — see EInkDisplay::full_refresh. Half ignores
+  // `prev` entirely and is the boot paint; don't change what it does.
+  virtual void full_refresh(const uint8_t* pixels, const uint8_t* prev, RefreshMode mode,
+                            bool turnOffScreen = false) = 0;
 
   // Partial refresh: new_pixels -> BW RAM, then fire the waveform without waiting.
   virtual void partial_refresh(const uint8_t* new_pixels) = 0;
@@ -89,6 +96,16 @@ class DrawBuffer {
     memset(bufs_[1], 0xFF, kBufSize);
     set_rotation(Rotation::Deg90);
   }
+
+  ~DrawBuffer() {
+    std::free(spare_);
+  }
+
+  // Owns a raw allocation; copying would double-free. There is exactly one
+  // DrawBuffer and it lives for the whole session, so deleting these costs
+  // nothing and makes the mistake unrepresentable.
+  DrawBuffer(const DrawBuffer&) = delete;
+  DrawBuffer& operator=(const DrawBuffer&) = delete;
 
   IDisplay& display() {
     return display_;
@@ -429,8 +446,10 @@ class DrawBuffer {
   }
 
   // Call full hardware refresh using the current inactive buffer, then sync both.
+  // The active buffer is what is on the glass, which RefreshMode::Full needs as
+  // its starting state.
   void full_refresh(RefreshMode mode = RefreshMode::Half, bool turnOffScreen = false) {
-    display_.full_refresh(inactive_(), mode, turnOffScreen || sunlight_fading_fix_);
+    display_.full_refresh(inactive_(), active_(), mode, turnOffScreen || sunlight_fading_fix_);
     memcpy(bufs_[active_idx_], bufs_[1 - active_idx_], kBufSize);
     active_idx_ = 1 - active_idx_;
   }
@@ -458,6 +477,8 @@ class DrawBuffer {
   enum class Spare : uint8_t { None, Snapshot, Offscreen };
 
   void save_snapshot() {
+    if (!spare_)
+      return;
     memcpy(spare_, active_(), kBufSize);
     spare_use_ = Spare::Snapshot;
   }
@@ -476,9 +497,14 @@ class DrawBuffer {
 
   // Redirect every draw call into the spare buffer until end_offscreen(). The
   // displayed frame and the inactive buffer are both untouched meanwhile.
-  void begin_offscreen() {
+  // Returns false when there is no spare; the caller must then skip the
+  // pre-draw entirely rather than drawing into the live buffer.
+  bool begin_offscreen() {
+    if (!spare_)
+      return false;
     draw_target_ = spare_;
     spare_use_ = Spare::None;  // not usable until end_offscreen says so
+    return true;
   }
 
   void end_offscreen() {
@@ -737,7 +763,9 @@ class DrawBuffer {
 
   IDisplay& display_;
   alignas(4) uint8_t bufs_[2][kBufSize];
-  alignas(4) uint8_t spare_[kBufSize];
+  // Heap, not BSS — see release_spare(). Allocated once at construction; a
+  // failed allocation just means every page turn renders normally.
+  uint8_t* spare_ = static_cast<uint8_t*>(std::malloc(kBufSize));
   Spare spare_use_ = Spare::None;
   // Non-null while begin_offscreen() is in effect; see draw_().
   uint8_t* draw_target_ = nullptr;

@@ -690,7 +690,8 @@ values. The project root is on the include path for both platform builds.
 | Constant | Default | Notes |
 |---|---|---|
 | `WG_BLUETOOTH_PAGE_TURNER` | *(commented out)* | A `#define`, not a constant — see "Bluetooth page-turner" for why it has to be. The clicker's MAC, `"AA:BB:CC:DD:EE:FF"`. Undefined keeps the whole NimBLE stack out of the build. |
-| `kWifiName` / `kWifiPassword` / `syncServer` | `""` | **Nothing reads these yet** — no Wi-Fi subsystem exists. Placeholders for the planned NAS sync; the one consumer-to-be is `MainMenu::run_sync_()`. |
+| `WG_WIFI_SYNC` | *(defined)* | A `#define`, like the clicker MAC and for the same reason — only the preprocessor keeps an IDF stack out of the image. Undefined drops Wi-Fi, lwIP and `esp_http_client` entirely. See "NAS book sync". |
+| `kWifiName` / `kWifiPassword` / `syncServer` | `""` | Read by `platforms/esp32/wifi_sync.h`. `syncServer` may be a hostname (resolved via `getaddrinfo`, so it needs your router to serve DNS for its leases) **or a literal IP**, which skips the lookup. |
 | `kSunlightFadingFix` | `false` | Powers the panel off at the end of every *full* refresh, which restores contrast lost to sunlight. There are no periodic full refreshes to trigger it (see "Panel health"), so in practice this affects the sleep image and the boot paint, and never a partial refresh — those never pass `turnOffScreen`. Read in `Application::start`. |
 | `kAutoSleepMinutes` | `1` | Read in `Application::update`. |
 | `kPowerHoldSleepMs` | `kHoldDelayMs` (250) | Power-button hold before sleeping; a shorter press acts as Select. Defined *as* `kHoldDelayMs` rather than as its own number, so every button on the device splits tap from hold at the same moment. Read in `Application::update`. |
@@ -947,77 +948,56 @@ for a minute, then "Disconnected" — with no way to tell them apart:
    the stack recognise a rotating private address.
 4. **The scan**, above.
 
-**Still untested against a real clicker.** Both build paths link and the four
-requirements above are now met, but nothing here has met the hardware. The
-likeliest remaining adjustment is the keycode set.
+**Confirmed working on hardware**: connects reliably, pages turn, stays up.
+Getting there took all four fixes above plus the heap work below.
 
-#### Reading a failure
+#### The failure codes are gone — here is what they found
 
-The quick-menu row is the **only diagnostic channel this firmware has** — there
-is no log anywhere (see "No logging"), `esp_hidh` stores the reason a connect
-failed in `dev->status` and frees `dev` before returning NULL, and every
-`ESP_LOGE` inside NimBLE is compiled out. So the row carries the reason itself.
+The row briefly carried numeric stage codes (`Failed 8003`), a free-heap
+readout, a GAP-status listener and an `esp_reset_reason()` display. All of it is
+**removed**; the row now says only Disconnected / Connecting / Connected /
+Not found / Failed. It was scaffolding, and it worked: keep this record instead.
 
-**Not found** means the scan ran and saw nothing: the clicker is off, asleep, or
-still bonded to another host. **Failed N** is everything else, where N is
-`stage * 1000 + gap_status`:
+- `8003` / `8011` — sync timed out with 3 KB, then 11 KB, of internal RAM free.
+  This is what established heap as the binding constraint. Note
+  `esp_nimble_enable` **ignores `xTaskCreatePinnedToCore`'s return and always
+  reports ESP_OK**, so a host task that could not be allocated is
+  indistinguishable from one that started and never synced.
+- The stage split proved a *first* failure could wedge the session — see "the
+  stack is never torn down".
+- `rst4` plus a backtrace named the real bug: `std::bad_alloc` in
+  `TextLayout::assemble_page`, not in any BLE code.
 
-| Stage | Meaning |
-|---|---|
-| 1 | `WG_BLUETOOTH_PAGE_TURNER` is not a MAC |
-| 2 | NVS (bond storage) unavailable |
-| 3 | `esp_bt_controller_init` — almost always heap |
-| 4 | `esp_bt_controller_enable` |
-| 5 | `esp_nimble_init` |
-| 6 | `esp_hidh_init` |
-| 7 | `esp_nimble_enable` |
-| 8 | host never synced with the controller |
-| 9 | `ble_gap_disc` / `ble_hs_id_infer_auto` refused — scan could not start |
-| 10 | found it; the GAP connect failed. `gap_status` says why |
-| 11 | refused before allocating: free internal RAM below `kMinHeapKb` (24). Reports free KB |
+If a failure ever needs diagnosing again, the cheapest reconstruction is a
+`FailStage` enum set at each bail-out in `bringup_stack()` and shown after
+"Failed". Do not leave it in.
 
-**`kMinHeapKb` is a floor for the hopeless case, not an estimate of what BLE
-needs.** It shipped at 64 — above what the device actually had free — and
-refused every attempt on hardware that had been connecting successfully. A
-threshold set at the real requirement rejects attempts that would have worked,
-which is worse than the wedge it prevents.
+`ClickerState` is down to Unavailable / Disconnected / Connecting / Connected —
+`NotFound` and `Failed` are gone. **Every failure now reads as Disconnected**:
+the row is a switch, not a status console, and each of those states meant the
+same thing to the user anyway (press it again).
 
-Stage 8 is special-cased: it reports **free internal heap in KB** rather than a
-GAP status, because NimBLE allocates from internal RAM only
-(`MEM_ALLOC_MODE_INTERNAL`) and `esp_nimble_enable` **ignores
-`xTaskCreatePinnedToCore`'s return value and always reports ESP_OK** — so a host
-task that could not be allocated is indistinguishable from one that started and
-never synced. `8045` means the sync timed out with 45 KB free.
+#### The row shows the clicker's own battery
 
-`gap_status` is a NimBLE `BLE_HS_*` code from `host/ble_hs.h`: 0x02 `EALREADY`,
-0x03 `EBUSY`, 0x07 `ENOMEM`, 0x0D `ETIMEOUT`, 0x0E `EDONE`. Values ≥ 0x200 are
-`BLE_HS_HCI_ERR(x)` — a controller or peer rejection carrying an HCI error, e.g.
-0x3E connection-establishment-failed, 0x08 connection-timeout.
+`ESP_HIDH_BATTERY_EVENT` carries the peer's battery level, so once connected the
+row reads `Page Turner: 89%` instead of "Connected". Three details:
 
-It is captured by a **global GAP event listener**
-(`ble_gap_event_listener_register`), which sees every GAP event regardless of
-which callback owns the connection, so it can record the status without
-displacing `esp_hidh`'s own handler. It is registered once, in
-`bringup_stack()`, and never unregistered — the stack it belongs to is never
-torn down either.
+**`ESP_HIDH_BATTERY_EVENT` is not enough and waiting for it shows nothing.**
+`nimble_hidh.c` posts that event *only* from a `notify_rx`, and most clickers
+notify only when the level changes — so the row sat on "Connected" for hours.
 
-Stages 1–7 and 9 report `gap_status` 0, and stage 9 is deliberately **not**
-collapsed into "Not found": a scan that could not start is a fault here, and
-showing it as "nothing was advertising" sends the user to inspect a clicker that
-was never the problem.
+`read_battery_once()` does an explicit `ble_gattc_read_by_uuid` of the Battery
+Level characteristic (0x2A19) over the whole handle range, immediately after the
+connect and before the state goes Connected. One round trip, no discovery of our
+own (esp_hidh has already walked the peer), bounded at 2 s so a clicker that
+ignores the read cannot hang the connect.
 
-#### The reset-reason readout
-
-The same row also shows `rst<N>` after an **abnormal** restart — panic (4),
-interrupt WDT (5), task WDT (6), WDT (7) or brownout (9) — from
-`IRuntime::last_reset_reason()`. Ordinary causes (power-on, deep-sleep wake, a
-flash) report 0 and print nothing.
-
-A device that resets otherwise has no way at all to say why: the panic text goes
-to a console this firmware does not enable, and the reset wipes anything that
-could have recorded it. `esp_reset_reason()` is the one thing that survives, and
-distinguishing a brownout from a stack overflow decides which fix is even
-plausible.
+- **Captured once**, then left alone: a percentage that twitches while you read
+  is worse than a slightly stale one. Cleared by `radio_off()`.
+- **Not every clicker has a battery service.** No answer means no number, and
+  the row says "Connected".
+- `QuickmenuScreen::update` watches the percentage as well as the state, since a
+  later notification can still update it.
 
 #### Stack sizes are not the defaults, deliberately
 
@@ -1041,11 +1021,10 @@ The copy has the payload at a known offset, so `hidh_event_cb` recomputes it as
 
 #### The stack comes up once per boot and is NEVER torn down
 
-`bringup_stack()` runs each init at most once, guarded by its **own** flag —
-`g_ctrl_up` / `g_nimble_up` / `g_hidh_up` / `g_host_up`. Toggling the clicker off
-calls `disconnect_only()` — cancel any scan, `esp_hidh_dev_close()`, back to
-Disconnected — and leaves the controller, NimBLE and esp_hidh initialised for
-the rest of the session.
+`bringup_stack()` runs each init at most once, guarded by its **own** flag.
+Toggling the clicker off calls `radio_off()`, which closes the link and disables
+the controller but leaves the NimBLE host and esp_hidh initialised for the rest
+of the session.
 
 **One flag for the whole function is not enough**, and the difference is the
 same panic: a bringup that reached `esp_nimble_init()` and then failed at the
@@ -1080,15 +1059,52 @@ this one; the first two each shipped a distinct bug:
 
 IDF's own examples init the stack once and never deinit; this now matches.
 
-**What it costs:** idle BLE current persists after toggling off, until the
-device sleeps. Acceptable only because deep-sleep wake is a full boot and
-`kAutoSleepMinutes` is 1 — putting the device down clears the whole stack within
-a minute, and the radio is only ever up during a session where the user asked
-for it.
+**The controller is a different matter, and this is the battery lever.**
+`esp_bt_controller_init`/`deinit` cannot be cycled, but
+**`esp_bt_controller_enable`/`disable` can** — that is the documented pair, and
+disabling is what actually stops the radio drawing current. So the flags split:
+
+| Flag | Lifetime |
+|---|---|
+| `g_ctrl_inited` | once per boot |
+| `g_ctrl_enabled` | **cycles** — cleared by `radio_off()` |
+| `g_nimble_up` / `g_hidh_up` / `g_host_task_started` | once per boot |
+| `g_host_up` | cleared by `radio_off()`, re-waited on each bringup |
+
+`radio_off()` closes the link, waits ~100 ms for the disconnect to reach the
+peer and the CLOSE event to land, then disables the controller. It is reached
+from every path: toggling off, a failed connect, and `poll()` acting on the
+clicker being switched off mid-book.
+
+`g_host_up` must be re-waited after a re-enable: the controller runs a fresh HCI
+reset when it comes back, and no GAP call is legal until the host has synced
+again. The host task itself is started once and never deleted —
+`esp_nimble_disable()` is a bare `vTaskDelete` and the host is not restartable.
 
 A stage-8 failure is no longer terminal: the retry skips straight to
 `esp_nimble_enable` and waits for sync again, because the steps below it are
 already marked done.
+
+#### The reader's own allocation spike
+
+Before blaming BLE for everything: `build_page_items` grew `PageContent::word_pool`
+by `insert()` with **no reserve**. A `std::vector` realloc holds the old and new
+blocks simultaneously, so a page of a couple of thousand `LayoutWord` (12 bytes
+each) transiently needed ~1.5-2x its final size. That spike is what actually
+threw `std::bad_alloc`; the radio only made the headroom small enough to notice.
+
+It now does one exact reservation from a pre-pass over the same cached
+paragraphs the main loop uses — no spike at all, and cheaper. `rev_items` /
+`items` in the collect passes are reserved to 64 for the same reason (a page
+cannot hold more lines than `height / y_advance`).
+
+**Reserve before growing anything sized by page content.** This is the single
+highest-value memory fix in the tree and it is invisible until the heap is tight.
+
+`TextLayout::kCacheCapacity` is **8**, not 16. Each entry is a laid-out
+paragraph holding per-line word vectors. A page spans a handful of paragraphs,
+so the hit rate is effectively unchanged; below ~6 a backward turn would thrash,
+since it crosses a paragraph boundary by definition.
 
 #### Heap is the binding constraint, confirmed twice
 
@@ -1109,10 +1125,36 @@ reader needed to lay out a page, and with exceptions disabled `bad_alloc` is an
 So the failure is not in the clicker code and cannot be fixed there. Either BLE
 gets smaller or the reader's peak allocation does.
 
-To stop sizing this blind, the quick-menu row shows **free internal RAM in KB
-while connected** (`Connected 34k`), via a negative `clicker_status_code()`.
-That is the number that decides whether the radio and the reader coexist, and
-there is nowhere else it can be printed.
+Measured on hardware: **~13 KB free with the radio up and a book open.** That is
+the working figure, and it is survivable only because the allocation *spike*
+described above is gone. Steady-state free heap was never the whole story.
+
+**`DrawBuffer`'s spare is on the heap, not in BSS.** Static RAM went 164,184 →
+116,168 with that one change. It is still allocated at construction and kept for
+the whole session — the point is that the 48 KB now sits in the pool the reader
+and the radio draw from, rather than being reserved whether or not anything
+needs it.
+
+**It is deliberately never released, and neither are the reader's page caches.**
+Both were wired to free on connect and that was wrong: they are exactly what
+makes a page turn a memcpy instead of a layout, and a clicker exists to turn
+pages. Trading page-turn latency for radio headroom defeats the feature. Only
+the book index is handed back, because being without it while a book is open
+costs nothing.
+
+**The index is handed back before the radio starts.** `Failed 8011` — the host
+task could not be created with 11 KB free — showed the two simply do not fit
+alongside a resident book index. `QuickmenuScreen::on_select` therefore calls
+`Application::release_ram_for_radio()` **synchronously, immediately before**
+`toggle_clicker()`, freeing ~30 KB. It must be synchronous: bringup allocates
+the moment the worker task spawns, so a next-frame release in
+`Application::update` is already too late.
+
+`BookIndex::release_memory()` swaps the vector rather than clearing it (a
+cleared vector keeps its capacity) and refuses when `dirty_`, since a reload
+cannot recover unsaved mutations. An empty index is the "never loaded" state
+everywhere — screens reload from disk, mutators call `ensure_loaded_()` — so
+nothing truncates the file.
 
 
 
@@ -1134,19 +1176,188 @@ which assume a multi-peripheral hub:
 | `BT_NIMBLE_MSYS_2_BLOCK_COUNT` | 24 | 8 | |
 | `BT_NIMBLE_TRANSPORT_EVT_COUNT` | 30 | 12 | |
 | `BT_NIMBLE_MAX_BONDS` | 3 | 2 | |
+| `BT_NIMBLE_ACL_BUF_COUNT` / `_SIZE` | 24 / 255 | 4 / 128 | reports are 8 bytes; the report map is the only bulk read and happens once |
+| `BT_NIMBLE_TRANSPORT_ACL_SIZE` | 255 | 128 | |
+| `BT_NIMBLE_ATT_PREFERRED_MTU` | 256 | 128 | sizes every ATT buffer |
+| `BT_NIMBLE_GATT_MAX_PROCS` | 4 | 2 | one service walked at connect, then notifications only |
+| `BT_NIMBLE_MAX_CCCDS` | 8 | 3 | report + battery |
+| `BT_NIMBLE_50_FEATURE_SUPPORT` | y | **n** | extended advertising/PHY is unreachable for a central talking to a legacy HID peripheral |
+| `BT_CTRL_BLE_SCAN_DUPL` | y | n | the scan runs 5 s once per connect |
 
-`bringup_stack()` also **refuses to start below `kMinHeapKb`**, reporting free KB
-as `Failed 11xxx`. That converts the worst failure mode — half initialise, time
-out at stage 8, and leave a session that cannot retry — into a clean refusal
-that names the number.
+`bringup_stack()` also **refuses to start below `kMinHeapKb` (24)**, which turns
+the worst failure mode — half initialise, time out at sync, leave a session that
+cannot retry — into a clean refusal. It is a floor for the hopeless case, not an
+estimate of what BLE needs: it shipped at 64, above what the device actually had
+free, and refused every attempt on hardware that had been connecting fine.
 
-**Any early bail-out from `bringup_stack()` reaches `disconnect_only()`**, via
-`connect_task`'s `if (!ok)`. That is why `disconnect_only()` guards
+**Any early bail-out from `bringup_stack()` reaches `radio_off()`**, via
+`connect_task`'s `if (!ok)`. That is why `radio_off()` guards
 `ble_gap_disc_cancel()` behind `g_host_up`: calling it before `esp_nimble_init()`
 dereferences a null `ble_hs_ctx` inside `ble_hs_is_enabled()` and takes a **load
 fault, not an error return**. The heap check above introduced exactly this — the
 device rebooted the instant the row was selected, before "Connecting" was drawn.
 Any new pre-NimBLE failure stage inherits the same hazard.
+
+### NAS book sync
+
+One button on the book list: pull newly converted books off the homelab, push
+reading positions, retire finished books. `platforms/esp32/wifi_sync.h`
+(header-only, `#ifdef WG_WIFI_SYNC`), reached through `IRuntime::start_sync()` /
+`sync_state()` so `MainMenu` stays portable.
+
+Costs, measured, `WG_WIFI_SYNC` defined vs not:
+
+| | Without | With | Δ |
+|---|---|---|---|
+| flash | 692,342 | 1,213,488 | **+521 KB** |
+| static RAM | 115,576 | 132,920 | **+17.3 KB** |
+
+`CONFIG_MBEDTLS_TLS_ENABLED=n` is part of that: `esp_http_client` drags in
+esp-tls and mbedtls **even for a plain-HTTP build**, and turning the client half
+off saved 36 KB. Image validation still needs the SHA code, so mbedtls does not
+leave entirely.
+
+**HTTP, not SMB, and this was a deliberate reversal of the original request.**
+There is no SMB client in ESP-IDF — check `components/`, there is no `smb`,
+`cifs` or `nfs`. The choices were vendoring `libsmb2` (~60-80 KB, a third-party
+dependency) or hand-rolling SMB3, which the homelab pins
+(`server min protocol = SMB3`) and which therefore **signs every packet** —
+AES-CMAC with the radio held open, on a device where one second awake costs more
+than half an hour asleep. SMB also has no "give me the diff" primitive: it is a
+listing plus a stat per book. The Pi already runs bun on port 80, so one POST
+carries the whole negotiation. Samba stays — it is still how EPUBs get *onto*
+the Pi; the reader simply never speaks it.
+
+**mDNS is not used and should not be added.** `esp_mdns` is a managed component,
+not part of IDF, so it would mean a component-manager fetch at build time.
+Resolution is: cached IP from NVS → literal IP in config → `getaddrinfo`. The
+cache makes the steady state a zero-lookup path anyway.
+
+#### What a sync costs
+
+Both budgets are properties of the design, and both are easy to regress:
+
+| Network | |
+|---|---|
+| nothing changed | one POST + response, a few hundred bytes |
+| N new books | + N × (`book.wgb` + up to 3 covers), **one** TCP connection |
+
+One round trip decides everything (no per-file HEAD or stat), one kept-alive
+`esp_http_client` handle covers the POST and every GET, and the reply carries
+only what the device lacks.
+
+| SD card | |
+|---|---|
+| nothing changed | **zero bytes** |
+| server ahead on a book | one `.pos` (~20 bytes) per book that moved |
+| N new books / deletions | the book files + **one** index save |
+
+Guaranteed by three things, all of which have a tempting wrong version:
+
+- **Never call `BookIndex::index_file()` / `remove_path()` / `rename_in_place()`
+  here.** Each ends with its own `save()`, so one call per downloaded book
+  rewrites the whole ~30 KB index per book. The sync uses the in-memory
+  `remove_entry()` / `add_entry()`, which only set `dirty_`, and saves once at
+  the end. `save()` returns immediately when `!dirty_`.
+- **The server only sends positions it is strictly ahead on**, so every `.pos`
+  write is a file that genuinely moved.
+- **Downloads stream to `.tmp` then rename** (`remove()` first — FatFs
+  `f_rename` does not replace). An interrupted download leaves a `.tmp`, never a
+  truncated `book.wgb` that the reader would happily open.
+
+#### Position, not percentage, is the merge key
+
+The wire format carries the four numbers from `book.pos` — chapter, paragraph,
+offset, text_offset — compared lexicographically, furthest-read wins.
+
+**`progress_pct` cannot be used for this and an earlier draft got it wrong.** It
+is a `uint8_t`, so on a 400-page book one percent spans four pages: read three
+pages, sync, and the two sides compare *equal* while the advance is silently
+discarded. The percentage stays in the index for the book-list row and is never
+transmitted. It survives in exactly one place in the sync — `>= 100` as the
+"finished" predicate, where four-pages-per-percent cannot matter because there
+is nothing past the end.
+
+The tuple is only comparable when both sides hold the same `book.wgb` (chapter
+and paragraph indices are properties of the converted file). That holds by
+construction — the server is the only source of books — and the conversion unit
+`POST`s `/booksync/dropped/<name>` when it rebuilds one, so a stale position is
+discarded rather than resumed at the wrong place.
+
+**Never write the `.pos` of the currently-open book.** `ReaderScreen::stop()`
+writes it on close and would put the stale in-memory position straight back over
+a synced one. `run_sync_()` skips it; the next sync carries it.
+
+#### Finished books are deleted only after the server confirms
+
+Ordering is the entire safety property:
+
+1. device sends `done[]` (books at `progress_pct >= 100`)
+2. server appends to `finished` in `.sync.json` and **fsyncs**
+3. only then does the server unlink, and reply with `delete[]`
+4. only on seeing `delete[]` does the device unlink
+
+A crash at any step leaves the book present somewhere. `finished` is
+append-only and never pruned — it is the permanent read history, deduplicated on
+`title|author`. A book at 100% is re-sent every sync until one succeeds, which
+is idempotent server-side and cheaper than tracking "already reported" state.
+
+#### The radio must be off when a sync ends, however it ends
+
+Teardown is bound to **scope destruction** (`WifiGuard`), not to control flow,
+so a `return` added later cannot leak it. Exceptions are off in this build, so
+early returns are the only path that matters. This is the requirement most
+likely to regress silently: a stuck radio is tens of mA against a ~15 mA idle
+and is invisible except on a meter.
+
+**Power save is deliberately OFF** (`WIFI_PS_NONE`). `MIN_MODEM` saves current
+while associated and *idle*, which this workload never is — it connects,
+transfers flat out, and leaves. Parking the radio between DTIM beacons adds
+latency to every round trip and **extends** total radio-on time. Same reasoning
+keeps `AMPDU_RX` enabled: a faster download is less radio-on time. The energy
+model is "finish and shut down", not "sip while connected".
+
+**BLE goes down first and does not come back on its own.** One radio, and
+CLAUDE.md's ~13 KB free figure with the clicker up leaves no room for Wi-Fi's
+~40-50 KB. `start()` calls `wg_clicker::radio_off()` and
+`Application::release_ram_for_radio()` **synchronously before the worker task
+spawns** — bring-up allocates the moment it does, so a next-frame release is too
+late. The clicker is re-armed by pressing its quick-menu row again; that resume
+path already works without a reboot (see the `g_ctrl_enabled` / `g_host_up`
+split under "Bluetooth page-turner").
+
+**Auto-sleep is held off while a sync runs.** `wg_sync::poll()` calls
+`keep_awake()` from the main loop; a multi-book transfer easily outlasts
+`kAutoSleepMinutes` and sleeping mid-download would cut the radio with files
+half written.
+
+Every SD write calls `DrawBuffer::wait_panel_idle()` first — the card shares
+SPI2 with the panel.
+
+#### The server side
+
+In the flake repo, not here: `hosts/alechomelab/webserver/booksync.js` bolted
+onto the existing bun server (no new service, no new port, port 80 already
+open), plus `hosts/alechomelab/books.nix` — a systemd `.path` unit watching
+`/media/books` that converts any new EPUB into `.compiled/<stem>/` with
+`epub2wgb`, staged in a temp dir and moved into place so a half-written book is
+never visible to a concurrent sync.
+
+`epub2wgb` is packaged by **this** repo's `flake.nix` and consumed as
+`inputs.wintergreen.packages.aarch64-linux.epub2wgb`. Note its `CMakeLists.txt`
+has no `install()` rule, so the derivation supplies its own `installPhase`.
+
+Endpoints: `POST /booksync` (the whole negotiation), `GET /booksync/<dir>/<file>`
+(one book file), `POST /booksync/dropped/<dir>` (internal; the converter
+invalidating a stored position). Book directory names are validated against
+`/^[A-Za-z0-9 ._-]+$/` and rejected if they contain `..` — they are used as path
+segments.
+
+Two host-side tests worth keeping green:
+`hosts/alechomelab/webserver/booksync.test.js` (the merge rule, including the
+same-percentage case) and `tools/tests/json_scan_test.cpp` (the device's
+hand-rolled JSON scanner, under ASan/UBSan, including every truncation of a
+valid reply).
 
 ### Serial protocol
 
@@ -1255,8 +1466,19 @@ capacity pressure — this is about upload time and instruction-cache pressure.
 | `.iram0.text` | 26,580 | 25,546 |
 | `.dram0.bss` | 157,200 | 109,816 |
 
-"Now" is the default build — `WG_BLUETOOTH_PAGE_TURNER` undefined. Defining it
-adds ~294 KB of flash and ~3.9 KB of static RAM; see "Bluetooth page-turner".
+"Now" is the bare build — both `WG_BLUETOOTH_PAGE_TURNER` and `WG_WIFI_SYNC`
+undefined. Each radio is opt-in and they stack:
+
+| Build | flash | static RAM |
+|---|---|---|
+| neither | 430,790 | 159,820 |
+| BLE only | 728,888 | 164,128 |
+| **BLE + Wi-Fi sync** (the configured default) | **1,213,488** | **132,920** |
+
+Wi-Fi adds ~521 KB of flash and ~17 KB of RAM over the BLE-only build; see "NAS
+book sync". The RAM figure being *lower* than the BLE-only row is not an error —
+`DrawBuffer`'s spare framebuffer moved from BSS to the heap in between, taking
+48 KB of static RAM with it.
 
 Where `.flash.text` actually goes, by symbol prefix (approximate — weak symbols
 and inlining blur the edges, and ~245 KB of it is not ours):
@@ -1386,9 +1608,15 @@ list.
 position in `populate_list_()` carries the same `kFirstBook = 2` offset; getting
 that wrong shows up as the wrong book opening, not as a drawing glitch.
 
-The row does nothing yet: `run_sync_()` is an empty hook, since no Wi-Fi
-subsystem exists (`kWifiSsid`/`kWifiPassword` are still placeholders). It is the
-single entry point for the planned NAS sync.
+`run_sync_()` calls `IRuntime::start_sync()` and returns immediately — see "NAS
+book sync". Its label reports progress (`Sync` / `Syncing...` / `Synced`), read
+from `sync_shown_` rather than the runtime because `get_item_label` is called
+per row draw. `MainMenu::update()` repaints when that state changes: the index
+`generation()` check above it only covers books *arriving*, so a sync that finds
+nothing new would otherwise leave the row on "Syncing..." forever.
+
+Idle and Failed both read `Sync`, the same collapse the clicker row makes — a
+failure and a fresh start call for the same action.
 
 `select_first_book_()` moves the cursor off Sync onto the first book when the
 screen opens. It is called from `on_start()` and from `update()`'s scan branch —
@@ -2071,64 +2299,57 @@ normalises a settings file left over from an older firmware with removed keys.
   `English`. Unknown language tags fall back to no hyphenation.
 - The README's attribution to upstream Nous/Microreader is intentional — keep it.
 
-## Planned — investigated, not yet done
+## Still open
 
-Everything that was on this list has shipped and been confirmed working on the
-device: dynamic frequency scaling, de-embedding the font and sleep image, the
-sort collapse, lazy serial startup, async bulk SPI, next-page pre-layout *and*
-pre-draw, the quick-menu frame snapshot, the resident book index, the deferred
-ghost-clearing full refresh, panel temperature compensation, SD write dedup, the
-state-file flattening (no `.wintergreen/` directory), the WGB/WGF rename with
-magic-as-version, pre-rasterised images (and the removal of every image decoder
-from the firmware), parallel conversion, the low-battery cutoff, and the idle
-panel-rails power-down.
+Everything previously listed here has shipped. What remains is small, and the
+size items are **not** worth doing on their own: app0 is 6.4 MB against a
+1.2 MB image, so flash is not scarce and none of them buy speed.
 
-Two things remain, both needing a device and a measurement rather than an opinion:
+The one with real upside is the **idle loop**, and it is the only place left
+where a serious battery win could hide:
 
-1. **Measure `-Os` against `-O2` with a stopwatch.** `-Os` is 30% smaller code
-   (see "Measured size budget") and the theory that a smaller hot path wins back
-   more from the 16 KB I-cache than it loses is untested. Only a device settles it.
-2. **Drop the unused OTA half of the flash.** `app1` (6.4 MB) and `otadata` are
-   reserved for an OTA path that does not exist. **Deliberately not done** — it
-   changes the partition table under an already-flashed device and needs a full
-   erase, so it is the owner's call.
+- **The CPU never sleeps between frames.** `wait_next_frame()` `vTaskDelay`s to
+  a 25 ms cadence, so the core wakes 40×/s to find nothing changed, at ~15 mA.
+  With no light sleep available (see "Idle power" — tickless idle breaks the
+  ADC-ladder buttons and cannot be re-enabled) the only lever is reaching **deep**
+  sleep sooner: `kAutoSleepMinutes` is the whole battery story, and it is already
+  exposed. A longer frame period would save a fraction of a milliamp and cost
+  input latency; that trade was measured and rejected under "Investigated and
+  rejected".
 
-### Smaller, still open
+Genuinely open, in rough order of value:
 
-- **Pre-draw backwards.** `prerender_next_page_()` only runs after a *forward*
-  turn. The symmetric version is **not** the same win, and the reason is worth
-  writing down before someone tries again: `prev_page_()` already runs
-  `layout_backward()` itself and caches the result, so a backward pre-draw would
-  save only the *glyph blit*, not the layout — and to save the layout too it
-  would need a second, backward-keyed page cache on top of a second spare
-  framebuffer, since the one spare is already shared between the quick-menu
-  snapshot and the forward pre-draw. That is 48 KB of BSS and a third
-  invalidation path for the rarer direction.
+- **Measure `-Os` against `-O2`.** 30% smaller code (see "Measured size budget").
+  The theory that a smaller hot path wins back more from the 16 KB I-cache than
+  it loses is untested and **only a device with a stopwatch settles it** — the
+  size number alone does not.
 - **Preload the neighbouring carousel cover.** `HomeScreen::load_cover_` reads
-  the selected book's cover off the card inside `draw_all_`. Preloading the
-  next one during the waveform would shave the SD read and scale — tens of
-  milliseconds off an operation whose floor is a ~300 ms waveform — at the cost
-  of another ~25 KB buffer and a cache to invalidate. Measure before building it.
+  the cover off the card inside `draw_all_`. Preloading during the waveform
+  would shave tens of ms off an operation whose floor is a ~300 ms waveform, for
+  ~25 KB and a cache to invalidate. Measure first.
 - **Pre-draw skips image pages.** `draw_image_()` must drain the waveform before
-  touching the card, so drawing an image page speculatively would block the UI
-  loop for the couple of hundred milliseconds the current page is still painting.
-  A second spare buffer, or an SD read that does not need the panel idle, would
-  lift the restriction.
-- **`__d_vfprintf` / `__d_vfscanf` are ~5 KB** of double-capable formatting,
-  pulled in by the tree's `snprintf`/`sscanf`/`fprintf`. `CONFIG_NEWLIB_NANO_FORMAT`
-  no longer exists under picolibc, so the only route is hand-rolled integer
-  formatting at every call site — and IDF's own panic path may keep them anyway.
-- **`f_mkfs` is 2,360 bytes** and unreachable (`format_if_mount_failed = false`),
-  but `esp_vfs_fat_sdspi_mount` references it unconditionally, so dropping it
-  means patching IDF — exactly what `patch_ffconf.py` was deleted for.
-- **The UI fonts and hyphenation trie are 81 KB of rodata** and could move to a
-  flash partition like the reader font did. mmapped flash and rodata are both XIP
-  through the same cache, so it would be free at runtime — but the app image is
-  not under pressure, so it has not been done.
-- **`settings` is written on book open** purely so a reboot resumes that book.
-  Dropping it would remove one SD write per session at the cost of booting to the
-  home screen after a power loss — and `.pos` is only written at close anyway, so
-  the resume would land on the previous position regardless.
+  touching the card, so a speculative draw would block the UI loop for the
+  couple of hundred ms the current page is still painting. Needs a second spare
+  buffer, or an SD read that does not need the panel idle.
+- **Drop the unused OTA half of the flash.** `app1` (6.4 MB) and `otadata` serve
+  an OTA path that does not exist. **Deliberately not done**: it changes the
+  partition table under an already-flashed device and needs a full erase, so it
+  is the owner's call.
+
+Size-only, listed so they are not re-investigated: the UI fonts and hyphenation
+trie are 81 KB of rodata that could move to a partition (free at runtime, since
+mmapped flash and rodata are both XIP); `__d_vfprintf`/`__d_vfscanf` are ~5 KB
+that only hand-rolled integer formatting at every call site would remove, and
+IDF's panic path may keep them anyway; `f_mkfs` is 2,360 unreachable bytes that
+`esp_vfs_fat_sdspi_mount` references unconditionally, so removing it means
+patching IDF — exactly what `patch_ffconf.py` was deleted for.
+
+**Pre-draw backwards is not on this list, deliberately.** `prev_page_()` already
+runs `layout_backward()` and caches the result, so a backward pre-draw saves
+only the glyph blit — and saving the layout too would need a second,
+backward-keyed page cache on top of a second spare framebuffer, the one spare
+being already shared between the quick-menu snapshot and the forward pre-draw.
+48 KB of BSS and a third invalidation path, for the rarer direction.
 
 ### Investigated and rejected
 

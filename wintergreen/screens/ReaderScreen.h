@@ -132,6 +132,18 @@ class ReaderScreen final : public IScreen {
   bool open_ok_ = false;
   bool buf_was_touched_ = false;
 
+  // Low-battery reminder bar, drawn along the bottom of a reading page only.
+  // Sampled from the runtime at the entry points that have one and cached here,
+  // because render_page_() is also reached from the pre-draw path, which has no
+  // runtime. A stale sample only delays the bar by one page turn.
+  //
+  // Latches at or below the threshold and clears only on USB — see
+  // sample_battery_().
+  static constexpr int kLowBatteryBarPct = 15;
+  static constexpr int kLowBatteryBarH = 5;
+  bool low_battery_ = false;
+  void sample_battery_(IRuntime& runtime);
+
   // Guards the resume() fast path — see pause().
   bool snapshot_ok_ = false;
   uint8_t snapshot_font_size_ = 0;

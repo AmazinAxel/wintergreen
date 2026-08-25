@@ -359,7 +359,16 @@ class TextLayout {
   PagePosition position_;
   HyphenationLang hyphenation_lang_ = HyphenationLang::None;
 
-  static constexpr size_t kCacheCapacity = 16;
+  // Laid-out paragraphs kept in memory. Each holds a vector of lines, each of
+  // which holds a vector of words, so this is one of the larger heap consumers
+  // in the reader.
+  //
+  // 8 rather than 16: a page spans a handful of paragraphs and both the forward
+  // and backward walk stay within that, so the hit rate is effectively
+  // unchanged while the resident cost halves. Dropping below ~6 would start
+  // thrashing on a backward turn, which crosses a paragraph boundary by
+  // definition.
+  static constexpr size_t kCacheCapacity = 8;
   mutable std::array<LaidOutParagraph, kCacheCapacity> para_cache_{};
   mutable size_t cache_next_ = 0;
   mutable bool cache_valid_ = false;

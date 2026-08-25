@@ -109,7 +109,25 @@ bool ReaderScreen::draw_image_(uint32_t offset, uint32_t size, DrawBuffer& buf, 
   return true;
 }
 
+// Latching: once the bar is up it stays up until the device is plugged in.
+// A cell sags a few hundred millivolts under an e-ink refresh, so an unlatched
+// threshold would flicker the bar on and off between page turns right around
+// 15%, which is exactly where it matters.
+void ReaderScreen::sample_battery_(IRuntime& runtime) {
+  if (app_ && app_->usb_powered()) {
+    low_battery_ = false;
+    return;
+  }
+  if (low_battery_)
+    return;
+  const std::optional<uint8_t> pct = runtime.battery_percentage();
+  // No reading at all (no cell, uncalibrated ADC) means no bar — the same rule
+  // the low-battery cutoff follows.
+  low_battery_ = pct.has_value() && *pct <= kLowBatteryBarPct;
+}
+
 void ReaderScreen::start(DrawBuffer& buf, IRuntime& runtime) {
+  sample_battery_(runtime);
   buf_ = &buf;
   snapshot_ok_ = false;  // a fresh book must never resume into a previous one's pixels
   predrawn_.valid = false;
@@ -183,6 +201,7 @@ void ReaderScreen::pause() {
 }
 
 void ReaderScreen::resume(DrawBuffer& buf, IRuntime& runtime) {
+  sample_battery_(runtime);
   buf_ = &buf;
   if (app_)
     buf.set_rotation(rotation_from_setting(app_->rotate_reader()));
@@ -339,6 +358,9 @@ void ReaderScreen::update(const ButtonState& buttons, DrawBuffer& buf, IRuntime&
   }
 
   if (changed) {
+    // One ADC read per page turn, not per frame. A pre-drawn page carries the
+    // sample taken when it was drawn, so the bar can lag one turn.
+    sample_battery_(runtime);
     // A forward turn may already have the page drawn and waiting.
     if (page_delta <= 0 || !take_predrawn_(buf))
       render_page_(buf);
@@ -410,8 +432,11 @@ void ReaderScreen::prerender_next_page_(DrawBuffer& buf) {
   page_pos_ = next;
   cache_page_(std::move(pc));
 
-  if (!has_image) {
-    buf.begin_offscreen();
+  // No spare (released to the heap for the BLE stack) means no pre-draw — the
+  // layout above is still cached, so the turn is a normal render rather than a
+  // memcpy. Must not fall through: begin_offscreen would otherwise leave
+  // draw_target_ pointing at the live buffer.
+  if (!has_image && buf.begin_offscreen()) {
     render_page_(buf);  // consumes the cached layout and draws into the spare buffer
     buf.end_offscreen();
 
@@ -601,6 +626,12 @@ void ReaderScreen::render_page_(DrawBuffer& buf) {
       buf.fill_rect(itd.x, itd.y, itd.w, itd.h, true);
     }
   }
+
+  // Charge reminder. Drawn last so an image reaching the bottom margin cannot
+  // paint over it, and in logical coordinates so it sits along the bottom edge
+  // in both orientations.
+  if (low_battery_)
+    buf.fill_rect(0, H - kLowBatteryBarH, W, kLowBatteryBarH, false);
 }
 
 uint16_t ReaderScreen::bottom_padding_(bool landscape) {

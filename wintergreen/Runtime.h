@@ -17,16 +17,28 @@ namespace wintergreen {
 // full boot, so the device always comes up Disconnected with the radio cold —
 // the radio is by far the largest current draw available to this firmware, and
 // nothing turns it on except the user.
-// NotFound and Failed are both "off" — the radio is down and toggling starts a
-// fresh attempt. They exist because the two failures need completely different
-// things from the user (switch the clicker on / unpair it from whatever else
-// holds it), and this firmware has no log to say which happened.
+// Three states, and the UI shows two: "Disconnected" or the clicker's battery
+// percentage. Connecting is only distinct so a second press during a connect is
+// ignored rather than queued; it reads as Disconnected on screen, because to the
+// user every not-connected state means the same thing — press it again.
+//
+// Failure detail deliberately does not appear here. It did while the feature
+// was being brought up; see "The failure codes are gone" in CLAUDE.md.
 enum class ClickerState : uint8_t {
   Unavailable = 0,
   Disconnected,
   Connecting,
   Connected,
-  NotFound,
+};
+
+// NAS sync, shown on the book list's Sync row. Same collapse as above: Idle and
+// Failed both display as "Sync", since a failure and a fresh start call for the
+// same action.
+enum class SyncState : uint8_t {
+  Unavailable = 0,
+  Idle,
+  Working,
+  Done,
   Failed,
 };
 
@@ -59,24 +71,24 @@ class IRuntime {
   // when on. Returns immediately — connecting takes seconds and must not block
   // the UI — so the caller watches clicker_state() for the outcome.
   virtual void toggle_clicker() {}
-  // Platform-specific reason code for the last failure, 0 when there is none.
-  // Shown beside "Failed" in the quick menu — with no logging anywhere in this
-  // firmware, that row is the only channel a diagnosis can travel down.
-  virtual int clicker_status_code() const {
+
+  // Clicker battery percentage, 0 when it has not reported one. Sampled once on
+  // connect and then held: a number that drifts while you read is worse than a
+  // slightly stale one.
+  virtual uint8_t clicker_battery_pct() const {
     return 0;
   }
 
-  // Why the device last restarted, when that was *abnormal* — a panic, a
-  // watchdog or a brownout — and 0 for the ordinary causes (power-on, deep-sleep
-  // wake, a flash). Shown in the quick menu beside the clicker row.
+  // ── NAS book sync ─────────────────────────────────────────────────────────
   //
-  // A device that resets has no way to tell anyone why: the panic text goes to a
-  // console this firmware does not enable, and the reset wipes any state that
-  // could have recorded it. esp_reset_reason() survives the reset, so it is the
-  // one thing that can be reported afterwards. Distinguishing a brownout from a
-  // stack overflow matters enormously and is otherwise pure guesswork.
-  virtual int last_reset_reason() const {
-    return 0;
+  // Like the clicker, the UI collapses this to what the user can act on: the
+  // row reads "Sync" for both Idle and Failed, because the only useful response
+  // to either is to press it again.
+  virtual SyncState sync_state() const {
+    return SyncState::Unavailable;
   }
+  // Returns immediately; a sync takes seconds and runs on its own task. The
+  // caller watches sync_state() for the outcome.
+  virtual void start_sync() {}
 };
 }  // namespace wintergreen

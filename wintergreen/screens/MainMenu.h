@@ -164,6 +164,12 @@ class MainMenu final : public ListMenuScreen {
   std::vector<BookEntry> hidden_;
   bool show_hidden_ = false;
 
+  // Last sync state painted, so the Sync row repaints when it changes.
+  SyncState sync_shown_ = SyncState::Unavailable;
+  // Cached in update(): on_select() gets no runtime and the base class keeps
+  // its own pointer private.
+  IRuntime* sync_runtime_ = nullptr;
+
 };
 
 }  // namespace wintergreen

@@ -15,6 +15,7 @@
 #include "wintergreen/Runtime.h"
 
 #include "bluetooth_clicker.h"
+#include "wifi_sync.h"
 
 // Battery sense sits on GPIO0 = ADC1 channel 0, behind a 2:1 divider.
 #define BATTERY_ADC_CHANNEL ADC_CHANNEL_0
@@ -128,24 +129,17 @@ class Esp32Runtime final : public wintergreen::IRuntime {
   void toggle_clicker() override {
     wg_clicker::toggle();
   }
-  int clicker_status_code() const override {
-    return wg_clicker::status_code();
+  uint8_t clicker_battery_pct() const override {
+    return wg_clicker::battery_pct();
   }
 
-  // Only the abnormal causes. POWERON/SW/DEEPSLEEP/USB/JTAG are the ordinary
-  // ways this device restarts and would just be noise on screen.
-  //   4 PANIC   5 INT_WDT   6 TASK_WDT   7 WDT   9 BROWNOUT
-  int last_reset_reason() const override {
-    switch (esp_reset_reason()) {
-      case ESP_RST_PANIC:
-      case ESP_RST_INT_WDT:
-      case ESP_RST_TASK_WDT:
-      case ESP_RST_WDT:
-      case ESP_RST_BROWNOUT:
-        return static_cast<int>(esp_reset_reason());
-      default:
-        return 0;
-    }
+  // NAS sync. Thin for the same reason as the clicker above: everything lives
+  // in wifi_sync.h and compiles away when WG_WIFI_SYNC is undefined.
+  wintergreen::SyncState sync_state() const override {
+    return wg_sync::state();
+  }
+  void start_sync() override {
+    wg_sync::start();
   }
 
  private:

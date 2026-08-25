@@ -96,6 +96,10 @@ struct WordSpan {
 
 static std::vector<WordSpan> split_words(const char* text, size_t text_len) {
   std::vector<WordSpan> spans;
+  // One span per word; ~6 bytes per word in English prose is a close upper
+  // bound and overshooting costs a few hundred bytes, where growing costs a
+  // realloc that holds both blocks at once. See build_page_items.
+  spans.reserve(text_len / 6 + 8);
   size_t i = 0;
   while (i < text_len) {
     // Skip whitespace.
@@ -602,6 +606,32 @@ template <typename GetLP>
 static uint16_t build_page_items(PageContent& page, std::vector<TextLayout::PageItem>& raw, const PageOptions& opts,
                                  const IFont& font, IParagraphSource& source, bool is_chapter_start, GetLP get_lp) {
   page.items.reserve(raw.size());
+
+  // Reserve word_pool exactly, in one pass over the same cached paragraphs the
+  // main loop uses.
+  //
+  // **This is a memory fix, not a speed one.** Growing it by insert() reallocs
+  // geometrically, and a vector realloc holds the old and new blocks at once —
+  // so the transient peak is roughly 1.5-2x the final size, on a page that can
+  // carry a couple of thousand words. That spike is what threw std::bad_alloc
+  // out of assemble_page (and, exceptions being off, aborted the device) once
+  // the BLE stack had taken its share of internal RAM. One exact allocation has
+  // no spike at all.
+  {
+    size_t total_words = 0;
+    uint16_t pre_para = UINT16_MAX;
+    const TextLayout::LaidOutParagraph* pre_lp = nullptr;
+    for (const auto& item : raw) {
+      if (item.kind != TextLayout::PageItem::TextLine)
+        continue;
+      if (item.para_idx != pre_para) {
+        pre_lp = &get_lp(item.para_idx);
+        pre_para = item.para_idx;
+      }
+      total_words += pre_lp->lines[item.line_idx].words.size();
+    }
+    page.word_pool.reserve(total_words);
+  }
 
   const uint16_t dy = font.y_advance();
   const uint16_t cw = opts.width - opts.padding_left - opts.padding_right;
@@ -1156,6 +1186,7 @@ TextLayout::CollectResult TextLayout::collect_page_items(PagePosition pos) const
   const size_t pcnt = source_->paragraph_count();
 
   std::vector<PageItem> items;
+  items.reserve(64);  // see collect_page_items_backward
   uint16_t used = 0, pending_desc = 0;
   bool has_content = false, page_full = false, pending_page_break = false;
   PagePosition boundary = pos;
@@ -1300,6 +1331,9 @@ TextLayout::CollectResult TextLayout::collect_page_items_backward(PagePosition e
     };
 
   std::vector<PageItem> rev_items;
+  // A page holds at most height/y_advance lines; 64 covers the smallest font
+  // with room to spare, so this never reallocs in practice.
+  rev_items.reserve(64);
   uint16_t used = 0, pending_desc = 0;
   bool page_full = false;
   bool stopped_at_page_break = false;

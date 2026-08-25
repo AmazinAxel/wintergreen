@@ -121,12 +121,31 @@ void MainMenu::update(const ButtonState& buttons, DrawBuffer& buf, IRuntime& run
     cached_generation_ = BookIndex::instance().generation();
   }
 
+  sync_runtime_ = &runtime;
+
+  // Repaint when the Sync row's text changes. The index generation above covers
+  // books arriving, but a sync that finds nothing new never bumps it — without
+  // this the row would sit on "Syncing..." forever.
+  const SyncState sync_now = runtime.sync_state();
+  if (sync_now != sync_shown_) {
+    sync_shown_ = sync_now;
+    draw_all_(buf, runtime.battery_percentage());
+    buf.refresh();
+  }
+
   ListMenuScreen::update(buttons, buf, runtime);
 }
 
 void MainMenu::run_sync_() {
-  // to do!!!
-  // break out to different file?
+  // Everything lives behind IRuntime: the Wi-Fi stack, the HTTP client and the
+  // book transfer are all platform code (platforms/esp32/wifi_sync.h), and this
+  // screen is portable. Returns immediately — a sync takes seconds and runs on
+  // its own task, so the row's label is what reports progress.
+  //
+  // The runtime is cached by update() because on_select() does not receive one
+  // and the base class keeps its own pointer private.
+  if (sync_runtime_)
+    sync_runtime_->start_sync();
 }
 
 void MainMenu::select_first_book_() {
@@ -292,7 +311,17 @@ bool MainMenu::is_separator(int index) const {
 }
 
 std::string_view MainMenu::get_item_label(int index) const {
-  if (is_action_row_(index)) return "Sync";
+  if (is_action_row_(index)) {
+    // Read from the cached state rather than the runtime: this is called per
+    // row draw, and update() already tracks the value. Idle and Failed both
+    // read "Sync" — a failure and a fresh start call for the same action, so
+    // distinguishing them would only be noise.
+    switch (sync_shown_) {
+      case SyncState::Working: return "Syncing...";
+      case SyncState::Done:    return "Synced";
+      default:                 return "Sync";
+    }
+  }
   if (is_separator(index)) {
     for (const auto& s : separators_)
       if (s.first == index) return s.second;

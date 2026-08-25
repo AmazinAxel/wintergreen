@@ -147,7 +147,7 @@ class Application {
   //
   // The reader does not need the index while a book is open, and every screen
   // reloads it from disk when empty — see BookIndex::release_memory.
-  void release_index_for_radio();
+  void release_ram_for_radio();
 
   // Called when a book is opened: bumps the open-order counter in the in-memory
   // index and persists settings. The index itself is written once per session,
@@ -196,6 +196,12 @@ class Application {
     inactivity_ms_ = 0;
     usb_powered_ = true;
     low_battery_ms_ = 0;
+  }
+  // True while a USB host is attached, i.e. the device is being charged rather
+  // than drained. Valid only during update() — main.cpp asserts it each frame
+  // via keep_awake() and update() clears it on the way out.
+  bool usb_powered() const {
+    return usb_powered_;
   }
   // Auto-open a book by path (skips menu, for debugging).
   void auto_open_book(const char* epub_path, DrawBuffer& buf, IRuntime& runtime);

@@ -22,7 +22,8 @@ set(lib_sources
 idf_component_register(
     SRCS ${app_sources} ${lib_sources}
     INCLUDE_DIRS "." "${CMAKE_CURRENT_LIST_DIR}/../.."
-    REQUIRES fatfs driver wear_levelling)
+    REQUIRES fatfs driver wear_levelling
+             esp_wifi esp_netif esp_event esp_http_client lwip nvs_flash)
 
 # IDF 5.x adds -Wno-old-style-declaration (C-only) globally; GCC -Werror rejects
 # it when compiling C++ files. Remove both flags from the entire IDF build so that:

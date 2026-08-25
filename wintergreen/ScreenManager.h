@@ -8,7 +8,8 @@
 namespace wintergreen {
 
 // Stack-based screen manager. Screens are pushed/popped; only the top screen
-// is active (receives start/stop and update calls).
+// is active (receives start/stop and update calls)
+
 class ScreenManager {
  public:
   static constexpr int kMaxDepth = 8;

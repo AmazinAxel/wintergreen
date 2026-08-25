@@ -27,26 +27,26 @@ Paste and fill the following settings into the `WintergreenConfig.h` file in you
 #pragma once
 
 #include <cstdint>
+#define WG_BLUETOOTH_PAGE_TURNER "7B:70:25:80:D8:27"
+#define WG_WIFI_SYNC
 
 namespace wintergreen::config {
-    inline constexpr const char* kWifiName = "";
-    inline constexpr const char* kWifiPassword = "";
-    inline constexpr const char* syncServer = "alechomelab.local";
+  inline constexpr const char* kWifiName = "";
+  inline constexpr const char* kWifiPassword = "";
+  inline constexpr const char* syncServer = "alechomelab.local";
 
-    inline constexpr const char* pageTurner = "7B:70:25:80:D8:27"
+  inline constexpr bool kSunlightFadingFix = false;
+  inline constexpr uint8_t kAutoSleepMinutes = 2;
 
-    inline constexpr bool kSunlightFadingFix = false;
-    inline constexpr uint8_t kAutoSleepMinutes = 2;
-
-    inline constexpr uint32_t kHoldDelayMs = 300;
-    inline constexpr uint32_t kHoldRepeatMs = 200;
-    inline constexpr int kHoldAccelStep = 0;
+  inline constexpr uint32_t kHoldDelayMs = 300;
+  inline constexpr uint32_t kHoldRepeatMs = 200;
+  inline constexpr int kHoldAccelStep = 0;
 }
 ```
 
 If you use a white Xteink in the sun, I recommend enabling the fading fix, but it can cause more full screen refreshes. If you own a newer Xteink, you may not need the fix since I've used the device in the sun without needing to enable the option (which I have kept from nous). Auto sleep should be set to as low a value as comfortably possible. I personally recommend 1-2 minutes, depending on your reading speed.
 
-The button timing should also be modified to your liking! Especially to scroll through a large library of books or chapters, I suggest lower values for repeating and hold.
+The button timing should also be modified to your liking! Especially to scroll through a large library of books or chapters, I suggest lower values for repeating and hold. Be warned that below 200ms repeat, it can get a little disorientating since the e-ink panel can only refresh so fast! The defaults are very sensible.
 
 The prebuilt binaries ship with the default config from above! If you want to modify those values, you'd have to build it from scratch.
 
@@ -61,3 +61,4 @@ This is a VERY opinionated custom firmware! I want people to flash this firmware
 | English only | This cfw is made only for English and some special characters. This firmware will not be internationalized or support other languages. |
 | No stats | You don't *really* need stats. It's a nice-to-have but also unnecessary and distracting. There is no other menus than the homescreen and book menu, and I want to keep it that way! |
 | Just chapter control | There is no link support. It keeps book builds faster and this is a mostly unused feature for many books. Chapters get first class support! |
+| Bluetooth & networking stack | I personally use a 2 key clicker and want syncing, so these are a must for me. |

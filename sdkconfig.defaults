@@ -217,3 +217,69 @@ CONFIG_BT_NIMBLE_ATT_PREFERRED_MTU=128
 # 4 concurrent GATT procedures is for a client juggling several services. This
 # one walks the HID service at connect and then only receives notifications.
 CONFIG_BT_NIMBLE_GATT_MAX_PROCS=2
+
+# BLE 5 extended advertising/PHY machinery. This is a central talking to one
+# legacy HID peripheral; none of it is reachable, and it carries per-instance
+# state.
+CONFIG_BT_NIMBLE_50_FEATURE_SUPPORT=n
+# CCCD subscriptions: a HID clicker has a report characteristic and a battery
+# one. 8 is sized for a rich peripheral.
+CONFIG_BT_NIMBLE_MAX_CCCDS=3
+# Controller-side duplicate-scan filtering. The scan runs for 5 seconds once per
+# connect and the filtering is a convenience, not a requirement.
+CONFIG_BT_CTRL_BLE_SCAN_DUPL=n
+
+# ACL buffers. A HID clicker's traffic is an 8-byte report and, once at connect,
+# a report map of a few hundred bytes. 255-byte buffers eight deep are sized for
+# a data link. 128 x 4 still carries a report map fragment per buffer.
+CONFIG_BT_NIMBLE_ACL_BUF_COUNT=4
+CONFIG_BT_NIMBLE_ACL_BUF_SIZE=128
+CONFIG_BT_NIMBLE_TRANSPORT_ACL_SIZE=128
+CONFIG_BT_NIMBLE_TRANSPORT_ACL_FROM_LL_COUNT=4
+CONFIG_BT_NIMBLE_TRANSPORT_EVT_COUNT=8
+CONFIG_BT_NIMBLE_MSYS_1_BLOCK_COUNT=4
+CONFIG_BT_NIMBLE_MSYS_2_BLOCK_COUNT=4
+
+# ── Wi-Fi book sync ────────────────────────────────────────────────────────
+#
+# The workload is one HTTP POST and a handful of sequential file GETs on a LAN,
+# then the radio goes off. Almost every IDF default is sized for a device that
+# stays associated and serves traffic; none of that applies.
+#
+# The energy model is "finish and shut down", not "sip while connected": the
+# radio is tens of mA against a ~15 mA idle, so a sync that runs twice as fast
+# at full power costs less than one that dawdles while power-saving. That is
+# also why WIFI_PS_NONE is set in code rather than trimming buffers to nothing.
+
+# Buffers: bulk sequential TCP, one socket at a time.
+CONFIG_ESP_WIFI_STATIC_RX_BUFFER_NUM=6
+CONFIG_ESP_WIFI_DYNAMIC_RX_BUFFER_NUM=12
+CONFIG_ESP_WIFI_TX_BUFFER_TYPE=1
+CONFIG_ESP_WIFI_DYNAMIC_TX_BUFFER_NUM=12
+CONFIG_ESP_WIFI_RX_BA_WIN=6
+
+# RX aggregation stays ON. It is what makes a bulk download fast, and a faster
+# download is less radio-on time. Turning it off looks like a saving and costs
+# more by stretching the transfer. TX is off: the device sends almost nothing.
+CONFIG_ESP_WIFI_AMPDU_RX_ENABLED=y
+CONFIG_ESP_WIFI_AMPDU_TX_ENABLED=n
+
+# Unreachable features. SoftAP is the largest single saving here.
+CONFIG_ESP_WIFI_SOFTAP_SUPPORT=n
+CONFIG_ESP_WIFI_ENTERPRISE_SUPPORT=n
+CONFIG_ESP_WIFI_NVS_ENABLED=n
+
+# lwIP: one outbound connection to one server, plain HTTP, nothing listening.
+CONFIG_LWIP_MAX_SOCKETS=4
+CONFIG_LWIP_IPV6=n
+CONFIG_LWIP_DHCPS=n
+CONFIG_LWIP_TCP_SND_BUF_DEFAULT=5760
+CONFIG_LWIP_TCP_WND_DEFAULT=5760
+
+# esp_http_client drags in esp-tls and mbedtls unconditionally, even for a
+# plain-HTTP build. The sync is HTTP on a LAN and there is no other TLS user in
+# the tree, so the client half of mbedtls is dead weight — see the "TLS" entry
+# under Skipped in the sync design. Turning it off does not remove mbedtls
+# entirely: image validation still needs the SHA code.
+CONFIG_MBEDTLS_TLS_ENABLED=n
+CONFIG_MBEDTLS_CERTIFICATE_BUNDLE=n
