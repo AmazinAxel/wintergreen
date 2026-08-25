@@ -7,7 +7,7 @@
 namespace wintergreen {
 
 // Abstract interface for accessing paragraphs.
-// Lets TextLayout work with in-memory Chapter or on-disk MRB files.
+// Lets TextLayout work with in-memory Chapter or on-disk WGB files.
 struct IParagraphSource {
   virtual ~IParagraphSource() = default;
   virtual size_t paragraph_count() const = 0;

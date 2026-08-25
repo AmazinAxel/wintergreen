@@ -8,25 +8,23 @@
 
 #include "../ContentModel.h"
 #include "../IParagraphSource.h"
-#include "../ImageDecoder.h"
 #include "../TextLayout.h"
-#include "../ZipReader.h"
-#include "MrbFormat.h"
+#include "WgbFormat.h"
 
 namespace wintergreen {
 
-// Reads an MRB file.  Loads the chapter table and image refs into RAM on
+// Reads an WGB file.  Loads the chapter table and image refs into RAM on
 // open(), then provides paragraph loading by file offset.  Paragraphs are
 // linked (prev/next offsets) so they can be traversed sequentially.
-class MrbReader {
+class WgbReader {
  public:
-  MrbReader() = default;
-  ~MrbReader() {
+  WgbReader() = default;
+  ~WgbReader() {
     close();
   }
 
-  MrbReader(const MrbReader&) = delete;
-  MrbReader& operator=(const MrbReader&) = delete;
+  WgbReader(const WgbReader&) = delete;
+  WgbReader& operator=(const WgbReader&) = delete;
 
   bool open(const char* path);
   void close();
@@ -50,7 +48,7 @@ class MrbReader {
   uint16_t chapter_paragraph_count(uint16_t chapter_idx) const;
   uint32_t chapter_char_count(uint16_t chapter_idx) const;
 
-  // Sum of char_count across all chapters (0 if not stored, i.e. old MRB file).
+  // Sum of char_count across all chapters (0 if not stored, i.e. old WGB file).
   uint64_t total_char_count() const;
 
   // Load a single paragraph at a given file offset.
@@ -61,7 +59,7 @@ class MrbReader {
   LoadResult load_paragraph(uint32_t file_offset, Paragraph& out);
 
   // Image references
-  const MrbImageRef& image_ref(uint16_t index) const {
+  const WgbImageRef& image_ref(uint16_t index) const {
     return images_[index];
   }
 
@@ -69,6 +67,13 @@ class MrbReader {
   const EpubMetadata& metadata() const {
     return metadata_;
   }
+  // The open file handle, shared with ReaderScreen::draw_image_ so drawing a
+  // figure does not reopen the book. Every read here seeks first, so a borrowed
+  // read cannot disturb this class's position.
+  FILE* file() const {
+    return f_;
+  }
+
   const TableOfContents& toc() const {
     return toc_;
   }
@@ -77,9 +82,9 @@ class MrbReader {
 
  private:
   FILE* f_ = nullptr;
-  MrbHeader header_{};
-  std::vector<MrbChapterEntry> chapters_;
-  std::vector<MrbImageRef> images_;
+  WgbHeader header_{};
+  std::vector<WgbChapterEntry> chapters_;
+  std::vector<WgbImageRef> images_;
   EpubMetadata metadata_;
   TableOfContents toc_;
 
@@ -88,27 +93,27 @@ class MrbReader {
   std::string read_string();
   bool deserialize_text(const uint8_t* data, size_t size, Paragraph& out);
 
-  friend class MrbChapterSource;
+  friend class WgbChapterSource;
 };
 
 // ---------------------------------------------------------------------------
-// IParagraphSource backed by MrbReader — loads paragraphs on demand
+// IParagraphSource backed by WgbReader — loads paragraphs on demand
 // for a single chapter, with a sliding-window cache.
 //
 // On construction, scans the chapter's linked list to build a local
 // vector of file offsets (~4 bytes per paragraph).  This replaces the
-// old global paragraph index that was stored in the MRB file.
+// old global paragraph index that was stored in the WGB file.
 //
 // Only kWindowSize paragraphs are kept in memory at once. When a
 // paragraph outside the window is requested, the window slides to
 // center on the new access point, evicting old entries.
 // ---------------------------------------------------------------------------
 
-class MrbChapterSource : public IParagraphSource {
+class WgbChapterSource : public IParagraphSource {
  public:
   static constexpr size_t kWindowSize = 32;
 
-  MrbChapterSource(MrbReader& reader, uint16_t chapter_idx) : reader_(reader) {
+  WgbChapterSource(WgbReader& reader, uint16_t chapter_idx) : reader_(reader) {
     uint16_t count = reader.chapter_paragraph_count(chapter_idx);
     if (count == 0)
       return;
@@ -121,16 +126,25 @@ class MrbChapterSource : public IParagraphSource {
     offsets_.resize(count);
     para_char_offsets_.resize(count);
 
-    fseek(reader.f_, static_cast<long>(table_off), SEEK_SET);
-    for (uint16_t i = 0; i < count; ++i) {
-      uint8_t buf[8];
-      if (fread(buf, 1, 8, reader.f_) != 8) {
+    // One fread for the whole descriptor table, parsed from memory. Reading the
+    // 8-byte entries one at a time cost a FATFS + SPI round trip per paragraph,
+    // and a chapter can have hundreds — it dominated chapter-load time, which is
+    // on the path for every book open and every chapter jump. The staging buffer
+    // is freed before layout begins, so the peak is 8 bytes per paragraph on top
+    // of the two vectors that are kept anyway.
+    {
+      std::vector<uint8_t> table(static_cast<size_t>(count) * 8);
+      fseek(reader.f_, static_cast<long>(table_off), SEEK_SET);
+      if (fread(table.data(), 1, table.size(), reader.f_) != table.size()) {
         offsets_.clear();
         para_char_offsets_.clear();
         return;
       }
-      offsets_[i] = mrb_read_u32(buf);
-      para_char_offsets_[i] = mrb_read_u32(buf + 4);
+      for (uint16_t i = 0; i < count; ++i) {
+        const uint8_t* p = table.data() + static_cast<size_t>(i) * 8;
+        offsets_[i] = wgb_read_u32(p);
+        para_char_offsets_[i] = wgb_read_u32(p + 4);
+      }
     }
     total_chars_ = reader.chapter_char_count(chapter_idx);
 
@@ -172,7 +186,7 @@ class MrbChapterSource : public IParagraphSource {
   }
 
  private:
-  MrbReader& reader_;
+  WgbReader& reader_;
   std::vector<uint32_t> offsets_;            // file offsets of each paragraph
   std::vector<uint32_t> para_char_offsets_;  // cumulative chars before each paragraph
   uint32_t total_chars_ = 0;                 // total chars in this chapter
@@ -198,80 +212,28 @@ class MrbChapterSource : public IParagraphSource {
 };
 
 // ---------------------------------------------------------------------------
-// Build an ImageSizeQuery that resolves image dimensions from an MRB file.
-// Fast path: width/height stored in MrbImageRef (from HTML attributes).
+// Build an ImageSizeQuery that resolves image dimensions from an WGB file.
+// Fast path: width/height stored in WgbImageRef (from HTML attributes).
 // Slow path: stream the image header from the EPUB local file entry.
 // Scales to fit max_w preserving aspect ratio. Results are cached.
 // Mirrors the logic in ReaderScreen::resolve_image_size_().
 // ---------------------------------------------------------------------------
-inline ImageSizeQuery make_image_size_query(const MrbReader& mrb, const std::string& mrb_path, uint16_t max_w) {
-  struct Cache {
-    std::vector<uint16_t> w, h;
-    const MrbReader* mrb;
-    std::string mrb_path;
-    uint16_t max_w;
-  };
-  auto cache = std::make_shared<Cache>();
-  cache->mrb = &mrb;
-  cache->mrb_path = mrb_path;
-  cache->max_w = max_w;
-  cache->w.assign(mrb.image_count(), 0);
-  cache->h.assign(mrb.image_count(), 0);
-
-  return [cache](uint16_t key, uint16_t& w, uint16_t& h) -> bool {
-    if (key >= static_cast<uint16_t>(cache->w.size()))
+// Image dimensions, straight out of the image table.
+//
+// The table is authoritative: the converter rasterised every image to the size
+// it will be drawn at, so there is nothing to scale and nothing to sniff. This
+// used to fall back to streaming the embedded JPEG/PNG header to recover
+// dimensions the EPUB markup had not declared, and then scale them to the page —
+// all of which now happens on the build machine.
+inline ImageSizeQuery make_image_size_query(const WgbReader& wgb) {
+  const WgbReader* r = &wgb;
+  return [r](uint16_t key, uint16_t& w, uint16_t& h) -> bool {
+    if (key >= r->image_count())
       return false;
-    if (cache->w[key] != 0 || cache->h[key] != 0) {
-      w = cache->w[key];
-      h = cache->h[key];
-      return true;
-    }
-    const auto& ref = cache->mrb->image_ref(key);
-    uint16_t src_w = ref.width, src_h = ref.height;
-    if (src_w == 0 || src_h == 0) {
-      // v12: sniff the dimensions out of the blob embedded in the MRB. Same
-      // trick as ReaderScreen — describe it as a stored ZIP entry so the
-      // existing streaming reader works with no inflate and no EPUB.
-      if (ref.data_offset == 0 || ref.data_size == 0)
-        return false;
-      StdioZipFile file;
-      if (!file.open(cache->mrb_path.c_str()))
-        return false;
-      ZipEntry entry;
-      entry.compression = 0;
-      entry.data_offset = ref.data_offset;
-      entry.compressed_size = ref.data_size;
-      entry.uncompressed_size = ref.data_size;
-      uint8_t small_buf[256];
-      ZipEntryInput inp;
-      std::unique_ptr<uint8_t[]> heap_buf;
-      auto zerr = inp.open(file, entry, small_buf, sizeof(small_buf));
-      if (zerr != ZipError::Ok) {
-        heap_buf.reset(new (std::nothrow) uint8_t[ZipEntryInput::kMinWorkBufSize]);
-        if (!heap_buf)
-          return false;
-        zerr = inp.open(file, entry, heap_buf.get(), ZipEntryInput::kMinWorkBufSize);
-        if (zerr != ZipError::Ok)
-          return false;
-      }
-      ImageSizeStream stream;
-      uint8_t chunk[256];
-      for (;;) {
-        size_t n = inp.read(chunk, sizeof(chunk));
-        if (n == 0)
-          break;
-        if (stream.feed(chunk, n))
-          break;
-      }
-      if (!stream.ok())
-        return false;
-      src_w = stream.width();
-      src_h = stream.height();
-    }
-    scaled_size(src_w, src_h, cache->max_w, cache->max_w, cache->w[key], cache->h[key]);
-    w = cache->w[key];
-    h = cache->h[key];
-    return w != 0 || h != 0;
+    const auto& ref = r->image_ref(key);
+    w = ref.width;
+    h = ref.height;
+    return w != 0 && h != 0;
   };
 }
 

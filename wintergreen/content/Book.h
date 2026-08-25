@@ -103,6 +103,13 @@ class Book {
                        int max_w, int max_h,
                        uint8_t* work_buf = nullptr, size_t work_buf_size = 0);
 
+  // Write the sleep-screen cover: exactly W x H, artwork scaled to fit and
+  // centred, letterbox bars filled at the tone of the artwork edge beside them.
+  // The device blits the result 1:1 — see the body for why none of this can be
+  // left to runtime.
+  bool write_sleep_cover_bin(const char* cover_path, int W, int H,
+                             uint8_t* work_buf = nullptr, size_t work_buf_size = 0);
+
  private:
   StdioZipFile file_;
   Epub epub_;

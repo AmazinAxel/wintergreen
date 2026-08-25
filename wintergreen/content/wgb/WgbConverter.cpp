@@ -1,11 +1,13 @@
-#include "MrbConverter.h"
+#include "WgbConverter.h"
 
 #include <cstring>
 
 #include "../../display/DrawBuffer.h"
 #include "../Book.h"
 #include "../EpubParser.h"
+#include "../ImageDecoder.h"
 #include "../ZipReader.h"
+#include "../CoverPaths.h"
 
 namespace wintergreen {
 
@@ -13,22 +15,22 @@ namespace wintergreen {
 namespace {
 struct ImageMapping {
   uint16_t zip_key;
-  uint16_t mrb_idx;
+  uint16_t wgb_idx;
 };
 
-uint16_t get_or_add_image(MrbWriter& writer, std::vector<ImageMapping>& image_map, uint16_t zip_key,
+uint16_t get_or_add_image(WgbWriter& writer, std::vector<ImageMapping>& image_map, uint16_t zip_key,
                           uint32_t local_offset, uint16_t w, uint16_t h) {
   bool caller_has_size = (w != 0 || h != 0);
   for (const auto& m : image_map) {
-    if (m.zip_key == zip_key && writer.image_size_known(m.mrb_idx) == caller_has_size)
-      return m.mrb_idx;
+    if (m.zip_key == zip_key && writer.image_size_known(m.wgb_idx) == caller_has_size)
+      return m.wgb_idx;
   }
   uint16_t idx = writer.add_image_ref(local_offset, w, h);
   image_map.push_back({zip_key, idx});
   return idx;
 }
 
-void remap_paragraph_images(Paragraph& para, MrbWriter& writer, std::vector<ImageMapping>& image_map,
+void remap_paragraph_images(Paragraph& para, WgbWriter& writer, std::vector<ImageMapping>& image_map,
                             const ZipReader& zip) {
   if (para.type == ParagraphType::Image) {
     uint32_t offset = zip.entry(para.image.key).local_header_offset;
@@ -59,7 +61,7 @@ static size_t estimated_body_size(const TextParagraph& text) {
   return sz;
 }
 
-bool write_split_paragraph(MrbWriter& writer, Paragraph& para) {
+bool write_split_paragraph(WgbWriter& writer, Paragraph& para) {
   if (para.type != ParagraphType::Text)
     return writer.write_paragraph(para);
 
@@ -80,7 +82,7 @@ bool write_split_paragraph(MrbWriter& writer, Paragraph& para) {
   meta.line_height_pct = para.text.line_height_pct;
   meta.indent = para.text.indent;
   meta.inline_image = para.text.inline_image;
-  const uint16_t first_spacing = para.spacing_before.value_or(kMrbSpacingDefault);
+  const uint16_t first_spacing = para.spacing_before.value_or(kWgbSpacingDefault);
 
   size_t chunk_start = 0;
   size_t chunk_est = kParaHeaderBytes;
@@ -90,7 +92,7 @@ bool write_split_paragraph(MrbWriter& writer, Paragraph& para) {
   auto flush_range = [&](size_t start, size_t end) {
     if (start == end)
       return;
-    if (!writer.write_text_paragraph(meta, is_first ? first_spacing : kMrbSpacingDefault, runs.data() + start,
+    if (!writer.write_text_paragraph(meta, is_first ? first_spacing : kWgbSpacingDefault, runs.data() + start,
                                      end - start))
       ok = false;
     if (is_first) {
@@ -127,9 +129,9 @@ bool write_split_paragraph(MrbWriter& writer, Paragraph& para) {
 
 }  // namespace
 
-bool convert_epub_to_mrb_streaming(Book& book, const char* output_path, uint8_t* work_buf, uint8_t* xml_buf,
+bool convert_epub_to_wgb_streaming(Book& book, const char* output_path, uint8_t* work_buf, uint8_t* xml_buf,
                                    std::function<void(int, int)> progress_cb) {
-  MrbWriter writer;
+  WgbWriter writer;
   if (!writer.open(output_path)) {
     return false;
   }
@@ -173,7 +175,7 @@ bool convert_epub_to_mrb_streaming(Book& book, const char* output_path, uint8_t*
 
   // Context for the streaming paragraph + ID sinks.
   struct SinkCtx {
-    MrbWriter* writer;
+    WgbWriter* writer;
     std::vector<ImageMapping>* image_map;
     const ZipReader* zip;
     bool error;
@@ -181,8 +183,7 @@ bool convert_epub_to_mrb_streaming(Book& book, const char* output_path, uint8_t*
     std::vector<FragmentNeed>* fragment_needs;
     TableOfContents* toc_work;
     uint16_t current_zip_file_idx;
-    uint16_t current_chapter_idx;
-    // (anchors are written directly to the MrbWriter as they arrive)
+    // (anchors are written directly to the WgbWriter as they arrive)
   };
   SinkCtx ctx{};
   ctx.writer = &writer;
@@ -192,10 +193,8 @@ bool convert_epub_to_mrb_streaming(Book& book, const char* output_path, uint8_t*
   ctx.fragment_needs = &fragment_needs;
   ctx.toc_work = &toc_work;
   ctx.current_zip_file_idx = 0;
-  ctx.current_chapter_idx = 0;
 
-  // ID sink: always active.
-  // Resolves TOC fragment anchors AND collects all id→para mappings for runtime link navigation.
+  // ID sink: resolves TOC fragment anchors to paragraph indices.
   IdSink id_sink = [](void* raw_ctx, const char* id_p, size_t id_len, uint32_t para_idx) {
     auto& c = *static_cast<SinkCtx*>(raw_ctx);
     // TOC fragment resolution.
@@ -207,12 +206,9 @@ bool convert_epub_to_mrb_streaming(Book& book, const char* output_path, uint8_t*
           entry.para_index = static_cast<uint16_t>(para_idx < 0xFFFFu ? para_idx : 0xFFFFu);
       }
     }
-    // Anchor collection: write directly to MRB to avoid buffering all anchors in RAM.
-    if (id_len > 0 && id_len <= 255 && para_idx < 0xFFFFu)
-      c.writer->add_anchor(c.current_chapter_idx, static_cast<uint16_t>(para_idx), id_p, id_len);
   };
 
-  // Non-text paragraph sink: remap image keys, split large text paragraphs, and write to MRB.
+  // Non-text paragraph sink: remap image keys, split large text paragraphs, and write to WGB.
   auto sink = [](void* raw_ctx, Paragraph&& para) {
     auto& c = *static_cast<SinkCtx*>(raw_ctx);
     if (c.error)
@@ -230,7 +226,6 @@ bool convert_epub_to_mrb_streaming(Book& book, const char* output_path, uint8_t*
     writer.begin_chapter();
 
     ctx.current_zip_file_idx = static_cast<uint16_t>(book.epub().spine()[ci].file_idx);
-    ctx.current_chapter_idx = static_cast<uint16_t>(ci);
     book.load_chapter_streaming(ci, sink, &ctx, work_buf, xml_buf, id_sink, &ctx);
     if (ctx.error) {
       return false;
@@ -255,57 +250,63 @@ bool convert_epub_to_mrb_streaming(Book& book, const char* output_path, uint8_t*
     }
   }
 
-  // Build spine filename table: base filename of each spine item for href resolution at runtime.
-  std::vector<std::string> spine_files;
-  spine_files.reserve(spine.size());
-  for (const auto& si : spine) {
-    std::string_view entry_name = zip.entry(si.file_idx).name;
-    auto slash_pos = entry_name.rfind('/');
-    std::string basename =
-        (slash_pos != std::string_view::npos) ? std::string(entry_name.substr(slash_pos + 1)) : std::string(entry_name);
-    spine_files.push_back(std::move(basename));
-  }
 
-  // --- Embed the image bytes -------------------------------------------------
-  // v12: the MRB carries its images, so a converted book needs no EPUB at read
-  // time. The bytes go in verbatim — they are already JPEG/PNG, so re-deflating
-  // them would cost size and force an inflate pass on the device for nothing.
+  // --- Rasterise the images --------------------------------------------------
+  // Each image is decoded, scaled to fit the panel's portrait page box and
+  // dithered to 1 bit *here*, and only that bitmap goes into the WGB. The device
+  // then draws an image by reading rows and blitting them.
+  //
+  // This is the single biggest thing the format does for the reader. Storing the
+  // original JPEG/PNG meant the device carried a JPEG decoder, a PNG decoder, an
+  // inflate implementation and a ditherer; decoded a multi-megapixel image on a
+  // 160 MHz core the first time a figure appeared; and wrote the result back to
+  // the SD card so it would not have to do it twice. None of that exists now, and
+  // a book is roughly 70% smaller because the source images were most of it.
   {
-    std::vector<uint8_t> img_bytes;
     for (const auto& m : image_map) {
-      if (writer.image_has_data(m.mrb_idx))
+      if (writer.image_has_data(m.wgb_idx))
         continue;  // the same EPUB entry can back several image refs
       if (m.zip_key >= zip.entry_count())
         continue;
+      DecodedImage img;
       const ZipEntry& e = zip.entry(m.zip_key);
-      img_bytes.clear();
-      const ZipError err = zip.extract(book.file(), e, img_bytes);
-      if (err != ZipError::Ok || img_bytes.empty())
-        continue;  // leave data_size 0; the reader renders blank for that image
-      writer.set_image_data(m.mrb_idx, std::move(img_bytes));
-      img_bytes = std::vector<uint8_t>();
+      const ImageError err = decode_image_from_entry(book.file(), e, kWgbImageBoxW, kWgbImageBoxH, img, work_buf,
+                                                     work_buf ? (ZipEntryInput::kDecompSize + ZipEntryInput::kDictSize + 1024) : 0,
+                                                     /*scale_to_fill=*/false);
+      if (err != ImageError::Ok || img.data.empty() || img.width == 0 || img.height == 0)
+        continue;  // leave data_size 0; the reader draws blank space for that image
+      // The stored size is the drawn size: layout reads these dimensions back out
+      // of the image table and scale_image() never enlarges.
+      writer.update_image_size(m.wgb_idx, img.width, img.height);
+      writer.set_image_data(m.wgb_idx, std::move(img.data));
     }
   }
 
-  bool ok = writer.finish(book.metadata(), toc_work, spine_files);
+  bool ok = writer.finish(book.metadata(), toc_work);
   writer.close();  // explicit close so fclose() happens before we return
 
-  // Extract both covers alongside the MRB if the EPUB has one. The device
+  // Extract the covers alongside the WGB if the EPUB has one. The device
   // cannot generate these itself for a converted book — there is no EPUB on the
   // card — so anything not written here is simply absent.
-  //   cover.bin        160x240, book list and home screen
-  //   cover_sleep.bin  480x786, sleep screen
+  //   cover.bin        160x240, book list
+  //   cover_home.bin   kHomeCoverW x kHomeCoverH, home carousel — sized to the
+  //                    box so the device blits it 1:1 and dithers only once
+  //   cover_sleep.bin  kSleepCoverW x kSleepCoverH, composed exactly as the
+  //                    panel shows it (letterbox bars included)
   if (ok) {
     const std::string base(output_path);
-    const size_t pos = base.rfind("book.mrb");
+    const size_t pos = base.rfind("book.wgb");
     if (pos != std::string::npos) {
       const size_t work_sz = work_buf ? (ZipEntryInput::kDecompSize + ZipEntryInput::kDictSize + 1024) : 0;
       std::string p = base;
       p.replace(pos, 8, "cover.bin");
       book.write_cover_bin(p.c_str(), 160, 240, work_buf, work_sz);
       p = base;
+      p.replace(pos, 8, "cover_home.bin");
+      book.write_cover_bin(p.c_str(), kHomeCoverW, kHomeCoverH, work_buf, work_sz);
+      p = base;
       p.replace(pos, 8, "cover_sleep.bin");
-      book.write_cover_bin(p.c_str(), 480, 786, work_buf, work_sz);
+      book.write_sleep_cover_bin(p.c_str(), kSleepCoverW, kSleepCoverH, work_buf, work_sz);
     }
   }
 

@@ -10,9 +10,6 @@
 #include "../content/TextLayout.h"
 #include "ui_font_small.h"
 
-#ifdef ESP_PLATFORM
-#include "asset_blob.h"
-#endif
 
 namespace wintergreen {
 
@@ -33,8 +30,8 @@ struct DisplayFrame {
   static constexpr int kStride = kPanelWidth / 8;  // 100 bytes/row (800 divisible by 8)
   static constexpr std::size_t kPixelBytes = static_cast<std::size_t>(kStride) * kPhysicalHeight;  // 48000
 };
-
-// Display driver interface implemented by each platform.
+// Display driver interface. EInkDisplay is the only implementation left now that
+// the desktop build is gone — see the note in CLAUDE.md about collapsing it.
 class IDisplay {
  public:
   virtual ~IDisplay() = default;
@@ -42,65 +39,25 @@ class IDisplay {
   // Full physical refresh. Both BW and RED RAM are set to `pixels`.
   virtual void full_refresh(const uint8_t* pixels, RefreshMode mode, bool turnOffScreen = false) = 0;
 
-  // Partial refresh: new_pixels -> BW RAM. Driver tracks previous frame for RED RAM.
-  // prev_pixels is the previous BW frame (used to restore BW RAM after grayscale revert).
-  virtual void partial_refresh(const uint8_t* new_pixels, const uint8_t* prev_pixels) = 0;
+  // Partial refresh: new_pixels -> BW RAM, then fire the waveform without waiting.
+  virtual void partial_refresh(const uint8_t* new_pixels) = 0;
 
-  // Write data to BW RAM only (no refresh). Used for grayscale LSB plane.
+  // Write data to BW / RED RAM only (no refresh). The two planes of a sleep image.
   virtual void write_ram_bw(const uint8_t* data) {
     (void)data;
   }
-
-  // Write data to RED RAM only (no refresh). Used for grayscale MSB plane.
   virtual void write_ram_red(const uint8_t* data) {
     (void)data;
   }
-
-  // Trigger a grayscale display refresh using the multi-pass anti-aliasing LUT (kLutGrayscale).
-  // Assumes BW RAM and RED RAM have already been written via write_ram_bw/write_ram_red.
-  virtual void grayscale_refresh(bool turnOffScreen = false) {}
 
   // Trigger a one-pass grayscale refresh using kLutFactoryQuality.
   // RAM encoding: state = (red_bit << 1) | bw_bit; 0=white, 1=light, 2=dark, 3=black.
   virtual void grayscale_refresh_1pass(bool turnOffScreen = false) {}
 
-  // Revert grayscale overlay and restore prev_pixels into RED RAM.
-  // Must be called while the buffer holding the pre-grayscale BW frame is still valid.
-  virtual void revert_grayscale(const uint8_t* prev_pixels) {
-    (void)prev_pixels;
-  }
-
-  // Partially refresh a physical sub-rectangle of the display.
-  // new_buf: 1-bit packed, row-major, stride_bytes per row.
-  // phys_x is a raw hardware column — caller must add DisplayFrame::kPanelOffsetX and
-  // ensure the result is byte-aligned (multiple of 8).
-  // Default: no-op - platforms may override for efficient region updates.
-  virtual void partial_refresh_region(int phys_x, int phys_y, int phys_w, int phys_h, const uint8_t* new_buf,
-                                      int stride_bytes) {
-    (void)phys_x;
-    (void)phys_y;
-    (void)phys_w;
-    (void)phys_h;
-    (void)new_buf;
-    (void)stride_bytes;
-  }
-
   // Put the display controller into deep sleep (low-power mode).
   virtual void deep_sleep() {}
 
-  // Notify the display of the logical rotation used by the caller.
-  // Used by the desktop emulator to resize/orient the SDL window.
-  virtual void set_rotation(Rotation r) {
-    (void)r;
-  }
-
-  // Query if display is currently in grayscale mode.
-  virtual bool in_grayscale_mode() const {
-    return false;
-  }
-
   // Returns true if the display hardware is currently busy refreshing.
-  // Default: always ready. Platforms may override for non-blocking region updates.
   virtual bool is_busy() const {
     return false;
   }
@@ -117,8 +74,9 @@ class IDisplay {
 // The "inactive" buffer is drawn to; "active" is what's currently displayed.
 // refresh() swaps and does a partial hardware refresh.
 //
-// Scratch buffer loan: scratch_buf1()/scratch_buf2() expose both ~48KB buffers
-// for callers (e.g. EPUB->MRB conversion). Call reset_after_scratch() when done.
+// The framebuffers are never loaned out as scratch: image decoding and EPUB
+// conversion, the two things that used to borrow them, are both gone from the
+// firmware.
 class DrawBuffer {
  public:
   // Logical portrait dimensions.
@@ -139,20 +97,12 @@ class DrawBuffer {
     return display_;
   }
 
-  // Set logical rotation; updates both the display driver and the draw-transform in DrawBuffer.
+  // Set the logical rotation used by every draw call. There is no driver-side
+  // rotation: the panel is always written in physical coordinates and the
+  // transform is applied here.
   void set_rotation(Rotation r) {
     rotation_ = r;
-    display_.set_rotation(r);
   }
-
-  // Override only the local coordinate transform without touching the display driver.
-  // Use to draw UI elements in a fixed orientation regardless of current rotation.
-  // Restore with set_rotation_transform(rotation()) before the next display commit.
-  void set_rotation_transform(Rotation r) {
-    rotation_ = r;
-  }
-
-  // Runtime logical dimensions (depend on rotation).
   int width() const {
     return (rotation_ == Rotation::Deg0 || rotation_ == Rotation::Deg180) ? DisplayFrame::kPhysicalWidth : kWidth;
   }
@@ -169,7 +119,7 @@ class DrawBuffer {
 
   // Fill the entire inactive buffer.
   void fill(bool white = true) {
-    memset(inactive_(), white ? 0xFF : 0x00, kBufSize);
+    memset(draw_(), white ? 0xFF : 0x00, kBufSize);
   }
 
   // Fill a logical rectangle.
@@ -228,7 +178,7 @@ class DrawBuffer {
     const uint16_t max_width = static_cast<uint16_t>(DisplayFrame::kPhysicalWidth - x);
     const uint16_t draw_width = std::min<uint16_t>(w, max_width);
     const uint16_t draw_bytes = static_cast<uint16_t>((draw_width + 7) / 8);
-    uint8_t* buf = inactive_();
+    uint8_t* buf = draw_();
 
     // Add panel offset so app-space x=0 maps to buffer column 12.
     const uint16_t x_buf = static_cast<uint16_t>(x + DisplayFrame::kPanelOffsetX);
@@ -292,7 +242,7 @@ class DrawBuffer {
       px = DisplayFrame::kPhysicalWidth - 1 - ly;
       py = lx;
     }
-    uint8_t* buf = inactive_();
+    uint8_t* buf = draw_();
     const int px_buf = px + DisplayFrame::kPanelOffsetX;
     const size_t bidx = static_cast<size_t>(py * DisplayFrame::kStride + px_buf / 8);
     const uint8_t bit = static_cast<uint8_t>(0x80u >> (px_buf & 7));
@@ -305,7 +255,7 @@ class DrawBuffer {
   // Blit a horizontal row of 1-bit packed pixels at logical position (lx, ly).
   // data_1bit is MSB-first packed, width pixels long.
   void blit_1bit_row(int lx, int ly, const uint8_t* data_1bit, int width) {
-    uint8_t* buf = inactive_();
+    uint8_t* buf = draw_();
     if (rotation_ == Rotation::Deg0) {
       if (ly < 0 || ly >= DisplayFrame::kPhysicalHeight || width <= 0)
         return;
@@ -394,23 +344,6 @@ class DrawBuffer {
     }
   }
 
-  // Draw a filled circle.
-  void draw_circle(int cx, int cy, int r, bool white) {
-    if (r <= 0)
-      return;
-    const int r2 = r * r;
-    int dx = r;
-    for (int dy = 0; dy <= r; ++dy) {
-      while (dx * dx + dy * dy > r2)
-        --dx;
-      if (dx < 0)
-        break;
-      fill_row(cy + dy, cx - dx, cx + dx + 1, white);
-      if (dy != 0)
-        fill_row(cy - dy, cx - dx, cx + dx + 1, white);
-    }
-  }
-
   // -- Text & Glyph rendering --
 
   // Draw text with the UI font, including background fill.
@@ -425,20 +358,6 @@ class DrawBuffer {
     const int h = static_cast<int>(f.glyph_height());
     fill_rect(x, y, w, h, white);
     draw_text_proportional(x, y + static_cast<int>(f.baseline()), text, f, !white);
-  }
-
-  // Draw text centered at (cx, y) using the UI font.
-  // fill_bg=true (default): fills a background rect behind the text.
-  // fill_bg=false: only paints text pixels, leaving the background untouched.
-  void draw_text_centered(int cx, int y, const char* text, bool white, bool fill_bg = true) {
-    if (!text || !*text)
-      return;
-    const BitmapFont& f = ui_font_();
-    const int w = static_cast<int>(f.word_width(text, strlen(text), FontStyle::Regular));
-    if (fill_bg)
-      draw_text(cx - w / 2, y, text, white);
-    else
-      draw_text_no_bg(cx - w / 2, y, text, !white);
   }
 
   void draw_text_no_bg(int x, int y, const char* text, bool white, int /*scale*/ = 1) {
@@ -472,48 +391,41 @@ class DrawBuffer {
   void draw_layout_line(uint8_t* buf, int x_offset, int baseline_y, const PageLine& line, const BitmapFontSet& fonts,
                         GrayPlane plane, bool white);
 
-  // -- Grayscale display operations
-  // -------------------------------------
-
-  // Write the inactive buffer to BW RAM only (no refresh).
-  void write_ram_bw() {
-    display_.write_ram_bw(inactive_());
-  }
-
-  // Draw text glyphs only (no background fill). Glyph color = white param.
-  // The scale parameter is accepted for API compatibility but ignored.
-
-  // Write the inactive buffer to RED RAM only (no refresh).
-  void write_ram_red() {
-    display_.write_ram_red(inactive_());
-  }
-
   void set_sunlight_fading_fix(bool v) { sunlight_fading_fix_ = v; }
   bool sunlight_fading_fix() const { return sunlight_fading_fix_; }
 
-  // Trigger grayscale refresh (assumes BW/RED RAM already written).
-  void grayscale_refresh(bool turnOffScreen = false) {
-    display_.grayscale_refresh(turnOffScreen || sunlight_fading_fix_);
-  }
-
-  // Revert grayscale using the active (displayed) buffer as prev_pixels.
-  void revert_grayscale() {
-    display_.revert_grayscale(active_());
-  }
-
   // Provide direct access to the inactive buffer for multi-pass rendering.
   uint8_t* render_buf() {
-    return inactive_();
+    return draw_();
   }
 
   // -- Display operations
   // --------------------------------------------------
 
-  // Swap active<->inactive, then do a partial hardware refresh.
+  // Swap active<->inactive and push the new frame to the panel.
+  //
+  // **There is no periodic full-refresh flush**, and this is the third and final
+  // position on that question. A run of fast partial waveforms is not
+  // DC-balanced — each leaves a little residual charge, which accumulates as
+  // ghosting — so the obvious design promotes every Nth update to a full
+  // refresh, and that is what this used to do.
+  //
+  // It was removed because on this device the flush is redundant and the flash
+  // is not. Deep-sleep wake is a full boot, so a session is bracketed by two
+  // full-panel waveforms anyway: the sleep image on the way down and
+  // Application::start()'s full_refresh() on the way up. With
+  // kAutoSleepMinutes = 1 that happens every time the device is put down. The
+  // in-session flush only ever added an interruption the sleep cycle had already
+  // made unnecessary — inline it landed mid page turn, deferred it landed mid
+  // *sentence*, and pushed out far enough not to be felt it never ran at all.
+  //
+  // Gone with it: partials_since_full_, flush_pending(), flush_ghosting(),
+  // Application::kGhostFlushIdleMs and config::kFullRefreshEveryNUpdates. To
+  // bring it back, count here and call full_refresh(RefreshMode::Full) from
+  // wherever the interruption is acceptable — but read "Panel health" first.
   void refresh() {
-    display_.partial_refresh(inactive_(), active_());
+    display_.partial_refresh(inactive_());
     active_idx_ = 1 - active_idx_;
-    active_valid_ = true;
   }
 
   // Call full hardware refresh using the current inactive buffer, then sync both.
@@ -521,9 +433,75 @@ class DrawBuffer {
     display_.full_refresh(inactive_(), mode, turnOffScreen || sunlight_fading_fix_);
     memcpy(bufs_[active_idx_], bufs_[1 - active_idx_], kBufSize);
     active_idx_ = 1 - active_idx_;
-    active_valid_ = true;
   }
 
+
+  // -- Spare buffer: snapshot and offscreen draw ---------------------------
+  //
+  // One extra 48 KB framebuffer serving two jobs that never overlap in time:
+  //
+  //   Snapshot   a copy of the displayed frame, so a screen overlaying another
+  //              (the quick menu over the reader) can be dismissed without the
+  //              screen underneath rebuilding its content.
+  //   Offscreen  a place to draw the *next* page while the panel is still
+  //              running the current page's waveform, so a forward turn becomes
+  //              a memcpy plus an SPI write — no layout and no glyph blitting.
+  //
+  // They share storage because a reader is either in the quick menu or turning
+  // pages, never both, and 48 KB is worth more as heap than as a second spare.
+  // spare_use_ records which one is live; claiming it for one purpose silently
+  // invalidates the other, and both consumers re-check validity before trusting
+  // it (see ReaderScreen::resume and take_predrawn_).
+  //
+  // The framebuffers are never loaned out as scratch, so nothing else can
+  // clobber this.
+  enum class Spare : uint8_t { None, Snapshot, Offscreen };
+
+  void save_snapshot() {
+    memcpy(spare_, active_(), kBufSize);
+    spare_use_ = Spare::Snapshot;
+  }
+
+  bool has_snapshot() const {
+    return spare_use_ == Spare::Snapshot;
+  }
+
+  // Copy the snapshot into the inactive buffer, ready for the caller's refresh().
+  bool restore_snapshot() {
+    if (spare_use_ != Spare::Snapshot)
+      return false;
+    memcpy(inactive_(), spare_, kBufSize);
+    return true;
+  }
+
+  // Redirect every draw call into the spare buffer until end_offscreen(). The
+  // displayed frame and the inactive buffer are both untouched meanwhile.
+  void begin_offscreen() {
+    draw_target_ = spare_;
+    spare_use_ = Spare::None;  // not usable until end_offscreen says so
+  }
+
+  void end_offscreen() {
+    draw_target_ = nullptr;
+    spare_use_ = Spare::Offscreen;
+  }
+
+  bool has_offscreen() const {
+    return spare_use_ == Spare::Offscreen;
+  }
+
+  // Move the offscreen frame into the inactive buffer, ready for refresh().
+  bool commit_offscreen() {
+    if (spare_use_ != Spare::Offscreen)
+      return false;
+    memcpy(inactive_(), spare_, kBufSize);
+    spare_use_ = Spare::None;
+    return true;
+  }
+
+  void invalidate_spare() {
+    spare_use_ = Spare::None;
+  }
   // Block until the panel has finished any outstanding refresh. Call before SD
   // access: the card shares SPI2 with the display and concurrent traffic corrupts
   // an update in flight.
@@ -536,141 +514,32 @@ class DrawBuffer {
     display_.deep_sleep();
   }
 
-  // Write the active (currently-displayed) buffer to BW RAM so that BW and RED
-  // RAM are in sync before a grayscale pass. No-op if active buffer is stale.
+
+  // Write the displayed frame to BW RAM. The panel drives the whole screen from
+  // BW RAM, so this is how a caller guarantees the controller agrees with what is
+  // on the glass before doing something that reads it back.
   void sync_bw_ram() {
-    if (active_valid_)
-      display_.write_ram_bw(active_());
+    display_.write_ram_bw(active_());
   }
 
-  // Write pre-built LSB/MSB plane arrays to display RAM, trigger a grayscale
-  // refresh with screen power-off, then deep sleep. Intended for the power-off splash screen.
-  // Uses draw_image() so that images wider than kPhysicalWidth (e.g. 800px) are clipped correctly.
-  void show_grayscale_image(const uint8_t* lsb, const uint8_t* msb, uint16_t w, uint16_t h) {
-    fill(true);
-    draw_image(lsb, 0, 0, w, h);
-    display_.write_ram_bw(inactive_());
-    fill(true);
-    draw_image(msb, 0, 0, w, h);
-    display_.write_ram_red(inactive_());
-    display_.grayscale_refresh(/*turnOffScreen=*/true);
-    display_.deep_sleep();
+  // Point at the MGR2 sleep image. On device this is the mmapped `sleep`
+  // partition (see font_partition.h) — no copy, no decompression, no file I/O
+  // at sleep time, which matters because the SD card shares SPI2 with the panel.
+  void set_sleep_image(const uint8_t* data, size_t size) {
+    sleep_img_ = data;
+    sleep_img_size_ = size;
   }
 
-  // Load and show sleep image from MGR2 file (2bpp, 4 gray levels).
+  // Show the sleep image (2bpp, 4 gray levels).
   // state = (RED_bit << 1) | BW_bit; 0=black, 1=dark gray, 2=light gray, 3=white.
-  bool show_sleep_image(const char* path, bool show_text = true) {
-    FILE* f = std::fopen(path, "rb");
-    if (!f)
+  bool show_sleep_image_embedded() {
+    if (!sleep_img_)
       return false;
-    Mgr2Source_ src = Mgr2Source_::from_file(f);
-    if (src.valid())
-      show_mgr2_sleep_(src, false, show_text);
-    std::fclose(f);
-    return src.valid();
-  }
-
-  bool show_sleep_image_embedded(bool show_text = true) {
-    Mgr2Source_ src;
-
-#ifdef ESP_PLATFORM
-    const char* name = "sleep.mgr";
-    size_t size = 0;
-    esp_partition_mmap_handle_t mmap_h = 0;
-    const uint8_t* data = static_cast<const uint8_t*>(asset_blob::g_assets.map(name, size, mmap_h));
-    if (!data)
+    Mgr2Source_ src = Mgr2Source_::from_memory(sleep_img_, sleep_img_size_);
+    if (!src.valid())
       return false;
-    src = Mgr2Source_::from_memory(data, size);
-#else
-    FILE* f = std::fopen("resources/sleep.mgr", "rb");
-    if (!f)
-      return false;
-    src = Mgr2Source_::from_file(f);
-#endif
-
-    if (src.valid())
-      show_mgr2_sleep_(src, true, show_text);
-
-#ifdef ESP_PLATFORM
-    asset_blob::g_assets.unmap(mmap_h);
-#else
-    std::fclose(f);
-#endif
-    return src.valid();
-  }
-
-  // -- Scratch buffer loan (for EPUB conversion / image decode) ------------
-
-  // Loan the inactive buffer as scratch (will be overwritten before next refresh).
-  uint8_t* scratch_buf1() {
-    return bufs_[1 - active_idx_];
-  }
-  // Loan the active buffer as scratch (for operations needing two buffers).
-  uint8_t* scratch_buf2() {
-    return bufs_[active_idx_];
-  }
-
-  // Reset both buffers after scratch use, before drawing new content.
-  // Marks the active buffer as no longer reflecting the display, so sync_bw_ram()
-  // becomes a no-op until the next refresh().
-  void reset_after_scratch(bool white = true) {
-    memset(bufs_[0], white ? 0xFF : 0x00, kBufSize);
-    memset(bufs_[1], white ? 0xFF : 0x00, kBufSize);
-    active_idx_ = 0;
-    active_valid_ = false;
-  }
-
-  // -- Loading box region update
-  // --------------------------------------------
-  //
-  // A small fixed region at the bottom-centre of the logical screen, used to
-  // show a "Converting..." indicator while both display buffers are in use as
-  // scratch.  The region is byte-aligned in physical space so the extraction
-  // can be done with plain memcpy (no bit-shifting).
-  //
-  // Logical box: 256 x 32 px, centred horizontally, flush to the bottom.
-  //   lx = (480 - 256) / 2 = 112,  ly = 788 - 32 = 756
-  // Physical (Deg90 rotation):
-  //   px = kLoadPhysX = 750  (byte-aligned: 750 + kPanelOffsetX(10) = 760 = 95*8)
-  //   py = PhysH - lx - lw = 480 - 112 - 256 = 112
-  //   pw = lh = 32   ->  stride = 4 bytes
-  //   ph = lw = 256
-  // Mini-buffer size: 4 x 256 = 1024 bytes each (stack-allocated).
-
-  static constexpr int kLoadLogW = 256;
-  static constexpr int kLoadLogH = 32;
-  static constexpr int kLoadLogX = (kWidth - kLoadLogW) / 2;  // 112
-  static constexpr int kLoadLogY = kHeight - kLoadLogH;       // - 4;   // 744
-
-  // kLoadPhysX must satisfy: (kLoadPhysX + kPanelOffsetX) % 8 == 0 for byte-aligned hardware writes.
-  // With kPanelOffsetX=10: 750+10=760 ✓  (box ends at 782, 4px from logical bottom edge 786).
-  static constexpr int kLoadPhysX = 750;
-  static constexpr int kLoadPhysY = DisplayFrame::kPhysicalHeight - kLoadLogX - kLoadLogW;  // 112
-  static constexpr int kLoadPhysW = kLoadLogH;                                              // 32
-  static constexpr int kLoadPhysH = kLoadLogW;                                              // 256
-  static constexpr int kLoadStride = (kLoadPhysW + 7) / 8;                                  // 4
-  static constexpr int kLoadBufBytes = kLoadStride * kLoadPhysH;                            // 1024
-
-  // Bar geometry.
-  static constexpr int kBarW = 160;
-  static constexpr int kBarH = 7;
-  static constexpr int kBarX = kWidth / 2 - kBarW / 2;
-  static constexpr int kBarY = kLoadLogY + kLoadLogH - kBarH - 4;
-
-  // Draw a loading box (label + progress bar) and push it to the display
-  // via a region-only hardware update.  The main draw buffers are NEVER
-  // touched - all rendering goes directly into the 1280-byte mini-buffer.
-  // Both display buffers may be used as scratch before or after this call.
-  //
-  //   text         - label shown inside the box (e.g. "Converting...")
-  //   progress_pct - 0-100; controls how much of the bar is filled
-  void show_loading(const char* text, int progress_pct) {
-    if (display_.is_busy())
-      return;  // skip if panel is still refreshing
-    uint8_t new_buf[kLoadBufBytes];
-    render_loading_box_(new_buf, text, progress_pct, rotation_);
-    display_.partial_refresh_region(kLoadPhysX + DisplayFrame::kPanelOffsetX, kLoadPhysY, kLoadPhysW, kLoadPhysH,
-                                    new_buf, kLoadStride);
+    show_mgr2_sleep_(src);
+    return true;
   }
 
  private:
@@ -868,10 +737,24 @@ class DrawBuffer {
 
   IDisplay& display_;
   alignas(4) uint8_t bufs_[2][kBufSize];
+  alignas(4) uint8_t spare_[kBufSize];
+  Spare spare_use_ = Spare::None;
+  // Non-null while begin_offscreen() is in effect; see draw_().
+  uint8_t* draw_target_ = nullptr;
   int active_idx_ = 0;
-  bool active_valid_ = true;  // false after reset_after_scratch(); restored by refresh()/full_refresh()
   Rotation rotation_ = Rotation::Deg90;
   bool sunlight_fading_fix_ = false;
+
+  // MGR2 sleep image, pointing into memory-mapped flash (set_sleep_image).
+  const uint8_t* sleep_img_ = nullptr;
+  size_t sleep_img_size_ = 0;
+
+  // Where draw calls land: the inactive buffer normally, the spare while an
+  // offscreen pass is in effect. Commit paths (refresh, full_refresh,
+  // write_ram_bw, restore_snapshot) always use inactive_() directly.
+  uint8_t* draw_() {
+    return draw_target_ ? draw_target_ : inactive_();
+  }
 
   uint8_t* inactive_() {
     return bufs_[1 - active_idx_];
@@ -882,47 +765,24 @@ class DrawBuffer {
 
   // Returns the shared UI font backed by ui_font_small.h data.
   static const BitmapFont& ui_font_() {
-    static BitmapFont font(kFontData_ui_small_mbf, sizeof(kFontData_ui_small_mbf));
+    static BitmapFont font(kFontData_ui_small_wgf, sizeof(kFontData_ui_small_wgf));
     return font;
   }
 
-  // Unified source for MGR2 sleep images — wraps either a file or a memory blob.
-  // Parses the 8-byte MGR2 header on construction; get_row() returns a pointer to
-  // the 2bpp data for any given row (reads from file into row_buf_ or returns a
-  // direct pointer into the memory blob).
+  // Reads MGR2 rows straight out of memory-mapped flash. There is no file-backed
+  // variant any more: the image is always the mmapped `sleep` partition, so a row
+  // fetch is a pointer add rather than an fseek+fread.
   struct Mgr2Source_ {
     uint16_t w = 0, h = 0;
     size_t src_stride = 0;
-    FILE* file_ = nullptr;
-    long file_data_start_ = 0;
-    uint8_t row_buf_[256]{};
     const uint8_t* mem_ = nullptr;
 
     bool valid() const {
-      return (file_ || mem_) && w > 0 && h > 0;
+      return mem_ && w > 0 && h > 0;
     }
 
-    const uint8_t* get_row(uint16_t y) {
-      if (mem_)
-        return mem_ + static_cast<size_t>(y) * src_stride;
-      std::fseek(file_, file_data_start_ + static_cast<long>(static_cast<size_t>(y) * src_stride), SEEK_SET);
-      size_t n = std::fread(row_buf_, 1, std::min(src_stride, static_cast<size_t>(sizeof(row_buf_))), file_);
-      if (n < src_stride)
-        std::fseek(file_, static_cast<long>(src_stride - n), SEEK_CUR);
-      return row_buf_;
-    }
-
-    static Mgr2Source_ from_file(FILE* f) {
-      Mgr2Source_ s;
-      char magic[4];
-      if (std::fread(magic, 1, 4, f) != 4 || std::memcmp(magic, "MGR2", 4) != 0)
-        return s;
-      if (std::fread(&s.w, 2, 1, f) != 1 || std::fread(&s.h, 2, 1, f) != 1)
-        return s;
-      s.src_stride = (static_cast<size_t>(s.w) + 3) / 4;
-      s.file_ = f;
-      s.file_data_start_ = std::ftell(f);
-      return s;
+    const uint8_t* get_row(uint16_t y) const {
+      return mem_ + static_cast<size_t>(y) * src_stride;
     }
 
     static Mgr2Source_ from_memory(const uint8_t* data, size_t size) {
@@ -939,7 +799,7 @@ class DrawBuffer {
     }
   };
 
-  void show_mgr2_sleep_(Mgr2Source_& src, bool deep_sleep_after, bool show_text = true) {
+  void show_mgr2_sleep_(Mgr2Source_& src) {
     auto decode_pass = [&](bool red_bit) {
       fill(false);
       for (uint16_t y = 0; y < src.h && y < DisplayFrame::kPhysicalHeight; ++y) {
@@ -954,32 +814,23 @@ class DrawBuffer {
     };
 
     decode_pass(false);
-    if (show_text) draw_text_centered(kWidth / 2, kHeight - 24, "sleeping...", false, false);
     display_.write_ram_bw(inactive_());
     decode_pass(true);
-    if (show_text) draw_text_centered(kWidth / 2, kHeight - 24, "sleeping...", false, false);
     display_.write_ram_red(inactive_());
     display_.grayscale_refresh_1pass(/*turnOffScreen=*/true);
-    if (deep_sleep_after)
-      display_.deep_sleep();
+    display_.deep_sleep();
   }
 
   // Render target for the full inactive buffer.
   // buf_x0 = -kPanelOffsetX so that app-space X=0 maps to buffer column kPanelOffsetX.
   RenderTarget full_target_() {
-    return {inactive_(),
+    return {draw_(),
             DisplayFrame::kStride,
             0,
             0,
             DisplayFrame::kPhysicalWidth,
             DisplayFrame::kPhysicalHeight,
             -DisplayFrame::kPanelOffsetX};
-  }
-
-  // Render target for the mini loading-box buffer (absolute physical coords of the box).
-  // buf_x0 = phys_x0 because the mini buffer is self-contained (no panel offset needed).
-  static RenderTarget mini_target_(uint8_t* buf) {
-    return {buf, kLoadStride, kLoadPhysX, kLoadPhysY, kLoadPhysW, kLoadPhysH, kLoadPhysX};
   }
 
   // Fill a physical horizontal span [x1, x2) on physical row `row` (absolute physical coords).
@@ -1053,68 +904,6 @@ class DrawBuffer {
   static int draw_text_impl_(const RenderTarget& t, int x, int baseline_y, const char* text, size_t len,
                              const BitmapFont& font, GrayPlane plane, bool white, FontStyle style,
                              Rotation rotation = Rotation::Deg90);
-
-  // Render the loading box into a mini-buffer via the unified helpers.
-  // Never reads or writes bufs_.
-  // rot: current display rotation. Portrait modes (Deg90/Deg270) orient content
-  // correctly; landscape modes (Deg0/Deg180) fall back to Deg90 portrait content
-  // since the fixed physical mini-buffer region is only 32px wide in landscape space.
-  static void render_loading_box_(uint8_t* mini, const char* text, int progress_pct,
-                                  Rotation rot = Rotation::Deg90) {
-    const RenderTarget t = mini_target_(mini);
-    memset(mini, 0xFF, kLoadBufBytes);  // white fill
-
-    // In Deg270 (portrait flipped) the mini-buffer appears near the top of the
-    // logical screen; compute its logical-top accordingly.
-    // For all other rotations keep the original Deg90 logical coordinates.
-    const bool deg270 = (rot == Rotation::Deg270);
-    const int box_lx = kLoadLogX;
-    const int box_ly = deg270
-                           ? (DisplayFrame::kPhysicalWidth - kLoadPhysX - kLoadPhysW)  // = 4
-                           : kLoadLogY;
-
-    // Content rotation: portrait modes render correctly oriented; landscape falls
-    // back to Deg90 (text appears 90° rotated but still occupies the strip).
-    const Rotation content_rot = deg270 ? Rotation::Deg270 : Rotation::Deg90;
-
-    // Fill a logical rect in black using content_rot coordinate mapping.
-    auto fill = [&](int lx, int ly, int lw, int lh) {
-      if (content_rot == Rotation::Deg270)
-        fill_rect_physical_(t, DisplayFrame::kPhysicalWidth - ly - lh, lx, lh, lw, /*white=*/false);
-      else  // Deg90
-        fill_rect_physical_(t, ly, DisplayFrame::kPhysicalHeight - lx - lw, lh, lw, /*white=*/false);
-    };
-
-    // Text centred horizontally, near top of loading region.
-    const BitmapFont& font = ui_font_();
-    if (text && *text) {
-      const int tw = static_cast<int>(font.word_width(text, strlen(text), FontStyle::Regular));
-      const int text_lx = box_lx + kLoadLogW / 2 - tw / 2;
-      const int baseline_ly = box_ly + 3 + static_cast<int>(font.baseline());
-      draw_text_impl_(t, text_lx, baseline_ly, text, strlen(text), font, GrayPlane::BW, false,
-                      FontStyle::Regular, content_rot);
-    }
-
-    // Bar: centred within the content box.
-    const int barX = box_lx + (kLoadLogW - kBarW) / 2;
-    const int barY = box_ly + kLoadLogH - kBarH - 4;
-
-    // Outline: 160x7, rounded corners (corner pixels stay white).
-    fill(barX + 1, barY, kBarW - 2, 1);              // top edge
-    fill(barX + 1, barY + kBarH - 1, kBarW - 2, 1);  // bottom edge
-    fill(barX, barY + 1, 1, kBarH - 2);              // left edge
-    fill(barX + kBarW - 1, barY + 1, 1, kBarH - 2);  // right edge
-
-    // Inner bar: 3 rows (kBarH=7 -> border(0), pad(1), bar(2,3,4), pad(5), border(6)).
-    // Sloped right side: bottom row widest, each row above is 1px shorter.
-    const int max_fill = kBarW - 4;  // usable width inside border
-    const int filled = (progress_pct * max_fill) / 100;
-    if (filled > 0) {
-      fill(barX + 2, barY + 4, std::min(filled + 2, max_fill), 1);  // bottom row - widest
-      fill(barX + 2, barY + 3, std::min(filled + 1, max_fill), 1);  // middle row
-      fill(barX + 2, barY + 2, std::min(filled, max_fill), 1);      // top row - narrowest
-    }
-  }
 };
 
 }  // namespace wintergreen

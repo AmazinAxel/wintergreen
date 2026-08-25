@@ -1,11 +1,13 @@
 cmake_minimum_required(VERSION 3.16)
-project(epub2mrb CXX C)
+project(epub2wgb CXX C)
 
 set(CMAKE_CXX_STANDARD 17)
 set(CMAKE_CXX_STANDARD_REQUIRED ON)
 if(NOT CMAKE_BUILD_TYPE)
   set(CMAKE_BUILD_TYPE Release)
 endif()
+
+find_package(Threads REQUIRED)
 
 get_filename_component(REPO_ROOT "${CMAKE_CURRENT_SOURCE_DIR}/../.." ABSOLUTE)
 set(LIB ${REPO_ROOT}/wintergreen)
@@ -19,9 +21,9 @@ add_library(miniz STATIC
     ${MINIZ_DIR}/miniz_zip.c)
 target_include_directories(miniz PUBLIC ${MINIZ_DIR})
 
-# The content pipeline only. No display, no SDL: MrbConverter includes
+# The content pipeline only. No display, no SDL: WgbConverter includes
 # DrawBuffer.h purely for kWidth/kHeight, which are header constants.
-add_executable(epub2mrb
+add_executable(epub2wgb
     ${CMAKE_CURRENT_SOURCE_DIR}/main.cpp
     ${LIB}/content/HtmlEntities.cpp
     ${LIB}/content/ZipReader.cpp
@@ -34,9 +36,9 @@ add_executable(epub2mrb
     ${LIB}/content/Book.cpp
     ${LIB}/content/TextLayout.cpp
     ${LIB}/content/hyphenation/Hyphenation.cpp
-    ${LIB}/content/mrb/MrbWriter.cpp
-    ${LIB}/content/mrb/MrbReader.cpp
-    ${LIB}/content/mrb/MrbConverter.cpp)
+    ${LIB}/content/wgb/WgbWriter.cpp
+    ${LIB}/content/wgb/WgbReader.cpp
+    ${LIB}/content/wgb/WgbConverter.cpp)
 
-target_include_directories(epub2mrb PRIVATE ${REPO_ROOT} ${REPO_ROOT})
-target_link_libraries(epub2mrb PRIVATE miniz)
+target_include_directories(epub2wgb PRIVATE ${REPO_ROOT})
+target_link_libraries(epub2wgb PRIVATE miniz Threads::Threads)

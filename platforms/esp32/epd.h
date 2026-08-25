@@ -1,4 +1,4 @@
-﻿#pragma once
+#pragma once
 
 // EInkDisplay driver for ESP-IDF (SSD1677).
 
@@ -7,7 +7,7 @@
 
 #include "driver/gpio.h"
 #include "driver/spi_master.h"
-#include "esp_log.h"
+#include "esp_memory_utils.h"
 #include "esp_timer.h"
 #include "freertos/FreeRTOS.h"
 #include "freertos/task.h"
@@ -43,82 +43,16 @@
 #define CMD_SOURCE_VOLTAGE 0x04
 #define CMD_WRITE_VCOM 0x2C
 #define CMD_WRITE_LUT 0x32
+#define CMD_WRITE_TEMP 0x1A
 #define CMD_AUTO_WRITE_BW_RAM 0x46
 #define CMD_AUTO_WRITE_RED_RAM 0x47
 #define CMD_DEEP_SLEEP 0x10
-#define CMD_WRITE_TEMP 0x1A
 
 // clang-format off
 // ---- Grayscale LUT tables (112 bytes each) ----
 // Layout: 50 bytes VS waveform (5 levels × 10), 50 bytes TP/RP timing (10 groups × 5),
 //         5 bytes frame rate, 1 byte VGH, 3 bytes VSH1/VSH2/VSL, 1 byte VCOM, 2 reserved.
-static const uint8_t kLutGrayscale[] = {
-    // VS L0–L3 (voltage patterns per transition)
-    // Black → Black: [VSS → VSS → VSS → VSS → VSS → VSS → VSS → VSS]
-    0x00,0x00,0x00,0x00,0x00,0x00,0x00,0x00,0x00,0x00,
-    // Black → White: [VSL → VSL → VSL → VSL → VSL → VSL → VSL → VSH1 → VSL → VSH1 → VSH1 → VSH1 → VSH1 → VSH1 → VSH1 → VSS → VSS]
-    0xAA,0xA9,0x95,0x54,0x00,0x00,0x00,0x00,0x00,0x00,
-    // White → Black: [VSH1 → VSH1 → VSH1 → VSH1 → VSH1 → VSH1 → VSL → VSL → VSL → VSL → VSL → VSL → VSL → VSL → VSL → VSL → VSS]
-    0x55,0x5A,0xAA,0xAA,0x00,0x00,0x00,0x00,0x00,0x00,
-    // White → White: [VSH1 → VSH1 → VSH1 → VSH1 → VSL → VSL → VSL → VSL → VSL → VSL → VSS → VSS → VSS → VSS → VSS → VSS → VSS]
-    0x55,0xAA,0xA0,0x00,0x00,0x00,0x00,0x00,0x00,0x00,
-    // L4 VCOM: [VSS → VSS → VSS → VSS → VSS → VSS → VSS → VSS]
-    0x00,0x00,0x00,0x00,0x00,0x00,0x00,0x00,0x00,0x00,
 
-    // TP/RP groups
-    0x01,0x01,0x01,0x01,0x00,  // G0: A=1 B=1 C=1 D=1 RP=0 (4 frames)
-    0x01,0x01,0x01,0x01,0x00,  // G1: A=1 B=1 C=1 D=1 RP=0 (4 frames)
-    0x01,0x01,0x01,0x01,0x00,  // G2: A=1 B=1 C=1 D=1 RP=0 (4 frames)
-    0x01,0x01,0x01,0x01,0x00,  // G3: A=1 B=1 C=1 D=1 RP=0 (4 frames)
-    0x01,0x00,0x00,0x00,0x00,  // G4: A=1 B=0 C=0 D=0 RP=0 (1 frames)
-    0x01,0x00,0x00,0x00,0x00,  // G5: A=1 B=0 C=0 D=0 RP=0 (1 frames)
-    0x00,0x00,0x00,0x00,0x00,  // G6: A=0 B=0 C=0 D=0 RP=0
-    0x00,0x00,0x00,0x00,0x00,  // G7: A=0 B=0 C=0 D=0 RP=0
-    0x00,0x00,0x00,0x00,0x00,  // G8: A=0 B=0 C=0 D=0 RP=0
-    0x00,0x00,0x00,0x00,0x00,  // G9: A=0 B=0 C=0 D=0 RP=0
-
-    // Frame rate
-    0x88,0x88,0x88,0x88,0x88,
-
-    // Voltages (VGH, VSH1, VSH2, VSL, VCOM)
-    0x17,0x41,0x8E,0x3A,0x30,
-    // Reserved
-    0x00, 0x00,
-};
-
-static const uint8_t kLutGrayscaleRevert[] = {
-    // VS L0–L3 (voltage patterns per transition)
-    // Black → Black: [VSS]
-    0x00,0x00,0x00,0x00,0x00,0x00,0x00,0x00,0x00,0x00,
-    // Black → White: [VSH1 → VSH1 → VSH1 → VSH1 → VSH1 → VSH1 → VSH1 → VSH1 → VSH1 → VSH1 → VSH1 → VSH1 → VSH1 → VSH1 → VSH1 → VSH1 → VSH1 → VSH1 → VSH1 → VSH1 → VSH1 → VSH1 → VSH1 → VSH1 → VSH1]
-    0x55,0x55,0x55,0x55,0x55,0x55,0x40,0x00,0x00,0x00,
-    // White → Black: [VSH1 → VSH1 → VSL → VSL → VSH1 → VSH1 → VSL → VSL → VSH1 → VSH1 → VSL → VSL → VSL → VSL → VSL → VSL → VSL → VSL → VSL → VSL → VSS]
-    0x5A,0x5A,0x5A,0xAA,0xAA,0x00,0x00,0x00,0x00,0x00,
-    // White → White: [VSH1 → VSH1 → VSH1 → VSH1 → VSH1 → VSH1 → VSH1 → VSH1 → VSH1 → VSH1 → VSH1 → VSH1 → VSH1 → VSH1 → VSH1 → VSH1 → VSH1 → VSH1 → VSH1 → VSH1 → VSH1 → VSH1 → VSH1 → VSH1 → VSH1]
-    0x55,0x55,0x55,0x55,0x55,0x55,0x40,0x00,0x00,0x00,
-    // L4 VCOM: [VSS]
-    0x00,0x00,0x00,0x00,0x00,0x00,0x00,0x00,0x00,0x00,
-
-    // TP/RP groups
-    0x01,0x01,0x01,0x01,0x00,  // G0: A=1 B=1 C=1 D=1 RP=0 (4 frames)
-    0x01,0x01,0x01,0x01,0x00,  // G1: A=1 B=1 C=1 D=1 RP=0 (4 frames)
-    0x01,0x01,0x01,0x01,0x00,  // G2: A=1 B=1 C=1 D=1 RP=0 (4 frames)
-    0x01,0x01,0x01,0x01,0x00,  // G3: A=1 B=1 C=1 D=1 RP=0 (4 frames)
-    0x01,0x01,0x01,0x01,0x00,  // G4: A=1 B=1 C=1 D=1 RP=0 (4 frames)
-    0x01,0x01,0x01,0x01,0x00,  // G5: A=1 B=1 C=1 D=1 RP=0 (4 frames)
-    0x01,0x00,0x00,0x00,0x00,  // G6: A=1 B=0 C=0 D=0 RP=0 (1 frames)
-    0x00,0x00,0x00,0x00,0x00,  // G7: A=0 B=0 C=0 D=0 RP=0
-    0x00,0x00,0x00,0x00,0x00,  // G8: A=0 B=0 C=0 D=0 RP=0
-    0x00,0x00,0x00,0x00,0x00,  // G9: A=0 B=0 C=0 D=0 RP=0
-
-    // Frame rate
-    0x88,0x88,0x88,0x88,0x88,
-
-    // Voltages (VGH, VSH1, VSH2, VSL, VCOM)
-    0x17,0x4B,0x8E,0x3A,0x30,
-    // Reserved
-    0x00, 0x00,
-};
 
 // One-pass 4-level grayscale LUT.
 // State bits are (RED_bit << 1 | BW_bit), mapping directly to 4 gray levels:
@@ -167,13 +101,9 @@ class EInkDisplay : public wintergreen::IDisplay {
   bool isScreenOn = false;
   bool inDeepSleep_ = false;
   // millis() at MASTER_ACTIVATION of a refresh that was fired without waiting;
-  // 0 = nothing outstanding. Collected and logged by waitWhileBusy().
+  // 0 = nothing outstanding. Collected by waitWhileBusy().
   uint32_t pending_refresh_start_ = 0;
-  bool in_grayscale_mode_ = false;
   bool custom_lut_active_ = false;
-  bool in_grayscale_mode() const override {
-    return in_grayscale_mode_;
-  }
 
   bool is_busy() const override {
     return gpio_get_level(EPD_BUSY) == 1;
@@ -181,24 +111,6 @@ class EInkDisplay : public wintergreen::IDisplay {
 
   void wait_idle() override {
     waitWhileBusy();
-  }
-
-  // Custom grayscale LUT buffer (112 bytes, matches kLutSize in serial_communication.h)
-  uint8_t custom_grayscale_lut_[112] = {};
-  bool has_custom_grayscale_lut_ = false;
-
-  // Custom grayscale revert LUT buffer (112 bytes)
-  uint8_t custom_grayscale_revert_lut_[112] = {};
-  bool has_custom_grayscale_revert_lut_ = false;
-  // Set a custom grayscale revert LUT (112 bytes)
-  void set_grayscale_revert_lut(const uint8_t* lut) {
-    memcpy(custom_grayscale_revert_lut_, lut, 112);
-    has_custom_grayscale_revert_lut_ = true;
-  }
-
-  // Clear the custom grayscale revert LUT (revert to default)
-  void clear_grayscale_revert_lut() {
-    has_custom_grayscale_revert_lut_ = false;
   }
 
   spi_device_handle_t spi_;
@@ -238,7 +150,7 @@ class EInkDisplay : public wintergreen::IDisplay {
     dev.clock_speed_hz = 40 * 1000 * 1000;
     dev.mode = 0;
     dev.spics_io_num = -1;
-    dev.queue_size = 1;
+    dev.queue_size = 2;  // one in flight + one queued for the async bulk path
     spi_bus_add_device(SPI2_HOST, &dev, &spi_);
 
     resetDisplay();
@@ -248,7 +160,7 @@ class EInkDisplay : public wintergreen::IDisplay {
   // ---- wintergreen::IDisplay ----
 
   void full_refresh(const uint8_t* pixels, wintergreen::RefreshMode mode, bool turnOffScreen) override {
-    in_grayscale_mode_ = false;  // full refresh resets display state
+
     wakeIfNeeded();
     waitWhileBusy();
     // Buffer covers all 800 columns; panel offset is baked into draw-function coordinates.
@@ -258,22 +170,14 @@ class EInkDisplay : public wintergreen::IDisplay {
     refreshDisplay(mode == wintergreen::RefreshMode::Half ? EPD_HALF_REFRESH : EPD_FULL_REFRESH, turnOffScreen);
   }
 
-  void partial_refresh(const uint8_t* new_pixels, const uint8_t* prev_pixels) override {
-    if (in_grayscale_mode_) {
-      grayscale_revert_();
-      wakeIfNeeded();
-      waitWhileBusy();
-      setRamArea(0, 0, DISPLAY_WIDTH, DISPLAY_HEIGHT);
-      writeRamBuffer(CMD_WRITE_RAM_RED, prev_pixels, BUFFER_SIZE);
-    }
-
+  // Fire and return: the controller now holds the pixels in its own RAM, so both
+  // host buffers are free and the app can lay out and draw the next frame while
+  // the waveform runs. This is the whole page-turn/menu latency win.
+  void partial_refresh(const uint8_t* new_pixels) override {
     wakeIfNeeded();
     waitWhileBusy();
     setRamArea(0, 0, DISPLAY_WIDTH, DISPLAY_HEIGHT);
     writeRamBuffer(CMD_WRITE_RAM_BW, new_pixels, BUFFER_SIZE);
-    // Fire and return: the controller now holds the pixels in its own RAM, so both
-    // host buffers are free and the app can lay out and draw the next frame while
-    // the waveform runs. This is the whole page-turn/menu latency win.
     refreshDisplay(EPD_FAST_REFRESH, /*turnOffScreen=*/false, /*wait=*/false);
   }
 
@@ -291,45 +195,44 @@ class EInkDisplay : public wintergreen::IDisplay {
     writeRamBuffer(CMD_WRITE_RAM_RED, data, BUFFER_SIZE);
   }
 
-  // Set a custom grayscale LUT (112 bytes)
-  void set_grayscale_lut(const uint8_t* lut) {
-    memcpy(custom_grayscale_lut_, lut, 112);
-    has_custom_grayscale_lut_ = true;
-  }
-
-  // Clear the custom grayscale LUT (revert to default)
-  void clear_grayscale_lut() {
-    has_custom_grayscale_lut_ = false;
-  }
-
-  void grayscale_refresh(bool turnOffScreen = false) override {
-    in_grayscale_mode_ = true;
-    if (has_custom_grayscale_lut_) {
-      setCustomLUT_(custom_grayscale_lut_);
-    } else {
-      setCustomLUT_(kLutGrayscale);
-    }
-    refreshDisplay(EPD_FAST_REFRESH, turnOffScreen);
-    setCustomLUT_(nullptr);  // clear flag; OTP LUT restored on next normal refresh
-  }
-
+  // The only grayscale path left. kLutFactoryQuality drives each pixel to an
+  // absolute level with no dependence on its prior state, so the sleep image
+  // lands in one update. The multi-pass kLutGrayscale/kLutGrayscaleRevert pair
+  // is gone: it was unreachable once antialiased reader text was removed, and
+  // the serial LUT-upload commands that tuned it went with the debug console.
   void grayscale_refresh_1pass(bool turnOffScreen = false) override {
     setCustomLUT_(kLutFactoryQuality);
     refreshDisplay(EPD_FAST_REFRESH, turnOffScreen);
     setCustomLUT_(nullptr);
   }
 
-  void revert_grayscale(const uint8_t* prev_pixels) override {
-    if (!in_grayscale_mode_)
-      return;
-    grayscale_revert_();
-    // Re-upload the previous BW frame so the controller's RED RAM matches
-    // what was on screen before grayscale, enabling correct partial update.
-    wakeIfNeeded();
-    waitWhileBusy();
-    setRamArea(0, 0, DISPLAY_WIDTH, DISPLAY_HEIGHT);
-    writeRamBuffer(CMD_WRITE_RAM_RED, prev_pixels, BUFFER_SIZE);
-  }
+
+  // ---------------------------------------------------------------------------
+  // There is deliberately NO idle rails-off here. Do not add one back.
+  //
+  // It shipped: after Application::kPanelIdleOffMs (5 s) of no input the app
+  // sent ANALOG_OFF_PHASE | CLOCK_OFF (0x03) with MASTER_ACTIVATION and no
+  // DISPLAY_START, on the reasoning that e-ink is bistable so the page stays on
+  // the glass, and that the next refresh would OR in CLOCK_ON | ANALOG_ON and
+  // bring the pumps back by itself.
+  //
+  // On hardware the *first* page turn after the rails went down did nothing
+  // visible — the old page stayed — and the turn after that drew correctly. So
+  // the fast waveform runs before the analog rails have actually come up, and
+  // one page turn is silently lost. The user-visible bug is "go forward, screen
+  // does not change; go back and forward again and it does".
+  //
+  // Two reasons not to try again. The 0x03 shutdown-only sequence is unproven:
+  // those two bits are marked "best guess" in refreshDisplay() and are only
+  // documented in combination with a refresh. And the fix — a settling delay or
+  // a power-up activation before the waveform — would land on the *first page
+  // turn after a pause*, which is the common case, paying back the whole saving
+  // as added latency exactly where this firmware is tuned not to have any.
+  //
+  // The rails are still powered down where it is free: refreshDisplay()'s
+  // turnOffScreen path, at the end of a full refresh, which is what the sleep
+  // image uses.
+  // ---------------------------------------------------------------------------
 
   void deep_sleep() override {
     // partial_refresh() may have left a waveform running; CMD_DEEP_SLEEP mid-update
@@ -341,42 +244,11 @@ class EInkDisplay : public wintergreen::IDisplay {
     inDeepSleep_ = true;
   }
 
-  // Partially refresh a physical sub-rectangle.
-  // phys_x is a raw hardware column (0 = first panel column); caller is responsible for
-  // adding any panel offset before calling. phys_x must be byte-aligned (multiple of 8).
-  //
-  //
-  // NOTE: this only produces a correct screen when BW RAM outside the window already
-  // matches what is on the panel. setRamArea() bounds where the *write* lands, but
-  // refreshDisplay() drives the whole panel from BW RAM — a partial update looks
-  // localized only because unchanged pixels have BW RAM == RED RAM and get a no-op
-  // waveform. Its one caller, show_loading(), satisfies that because the rest of the
-  // screen is static during conversion. Do not reach for this as a general
-  // "refresh just the changed rows" primitive; see the note in CLAUDE.md.
-  void partial_refresh_region(int phys_x, int phys_y, int phys_w, int phys_h, const uint8_t* new_buf,
-                              int stride_bytes) override {
-    const uint16_t x_start = static_cast<uint16_t>(phys_x);
-    const uint32_t total_bytes = static_cast<uint32_t>(stride_bytes * phys_h);
-    wakeIfNeeded();
-    waitWhileBusy();  // wait for any previous refresh to finish before writing RAM
-    setRamArea(x_start, static_cast<uint16_t>(phys_y), static_cast<uint16_t>(phys_w), static_cast<uint16_t>(phys_h));
-    writeRamBuffer(CMD_WRITE_RAM_BW, new_buf, total_bytes);
-    // Fire the refresh and return immediately — don't block waiting for the panel.
-    // The next waitWhileBusy() call (at the start of this function) will catch up.
-    sendCommand(CMD_DISPLAY_UPDATE_CTRL1);
-    sendData(CTRL1_NORMAL);
-    sendCommand(CMD_DISPLAY_UPDATE_CTRL2);
-    sendData(custom_lut_active_ ? 0x0C : 0x1C);  // EPD_FAST_REFRESH bits, no screen power change
-    sendCommand(CMD_MASTER_ACTIVATION);
-    // No waitWhileBusy() here — conversion continues while panel refreshes.
-  }
-
  private:
   // Exit deep sleep via hardware reset + controller re-init.
   void wakeIfNeeded() {
     if (!inDeepSleep_)
       return;
-    ESP_LOGI("epd", "waking from deep sleep (HWRESET)");
     gpio_set_level(EPD_RST, 1);
     delay(10);
     gpio_set_level(EPD_RST, 0);
@@ -417,8 +289,20 @@ class EInkDisplay : public wintergreen::IDisplay {
     gpio_set_level(EPD_CS, 1);
   }
 
+  // Bulk pixel/LUT push.
+  //
+  // Bulk transfers wait on an interrupt rather than polling. A framebuffer plane
+  // is 48,000 bytes — ~10 ms at 40 MHz, and full_refresh writes two — and polling
+  // spun the CPU for all of it. The transfer is DMA either way; only the waiting
+  // changed, so this is a battery optimisation rather than a speed one.
+  //
+  // Small writes always poll: a 105-byte LUT costs less than the interrupt round
+  // trip, and LUT tables live in rodata, which is not DMA-capable — hence the
+  // esp_ptr_dma_capable() guard rather than a plain size test.
   void sendData(const uint8_t* data, uint32_t length) {
     static constexpr size_t kChunk = 4092;
+    static constexpr size_t kAsyncMin = 1024;
+    const bool async = length >= kAsyncMin && esp_ptr_dma_capable(data);
     gpio_set_level(EPD_DC, 1);
     size_t offset = 0;
     while (offset < length) {
@@ -427,7 +311,10 @@ class EInkDisplay : public wintergreen::IDisplay {
       spi_transaction_t t{};
       t.length = chunk * 8;
       t.tx_buffer = data + offset;
-      spi_device_polling_transmit(spi_, &t);
+      if (async)
+        spi_device_transmit(spi_, &t);
+      else
+        spi_device_polling_transmit(spi_, &t);
       gpio_set_level(EPD_CS, 1);
       offset += chunk;
     }
@@ -438,18 +325,15 @@ class EInkDisplay : public wintergreen::IDisplay {
     while (gpio_get_level(EPD_BUSY) == 1) {
       vTaskDelay(1);  // 1 tick; pdMS_TO_TICKS(1) rounds to 0 and busy-spins
       if (millis() - start > 10000) {
-        ESP_LOGW("epd", "waitWhileBusy timeout%s", comment ? comment : "");
         break;
       }
     }
     // A non-blocking refreshDisplay() left its waveform running; this is where it
     // gets collected, so report its true duration from the activation timestamp.
     if (pending_refresh_start_ != 0) {
-      ESP_LOGI("epd", "refreshDisplay(async): duration=%lums", millis() - pending_refresh_start_);
       pending_refresh_start_ = 0;
     }
     if (comment) {
-      ESP_LOGI("epd", "waitWhileBusy done: %s (%lu ms)", comment, millis() - start);
     }
   }
 
@@ -483,6 +367,38 @@ class EInkDisplay : public wintergreen::IDisplay {
     // 1   | 02  | ANALOG_OFF_PHASE        | Shutdown step 1 (undocumented)
     // 0   | 01  | CLOCK_OFF               | Disable internal oscillator
 
+    // TEMP_LOAD (0x20) makes the controller sample the sensor selected by
+    // CMD_TEMP_SENSOR_CONTROL — the internal one, chosen in
+    // initDisplayController() — into the temperature register, and the OTP
+    // waveform is then picked for *that* reading.
+    //
+    // Without it the register only ever holds what the host last wrote, which is
+    // the fixed 0x5A below: every waveform on this device ran as though the panel
+    // were at one unchanging temperature. e-ink waveform timing is genuinely
+    // temperature-dependent, and driving a cold panel with a warm panel's
+    // waveform under-develops the pixels — which reads as ghosting and washed-out
+    // contrast, the exact symptoms the periodic full refresh exists to fix.
+    //
+    // **Only EPD_FULL_REFRESH takes it**, and the other two are excluded for
+    // different reasons. EPD_FAST_REFRESH runs the custom LUT — a fixed table no
+    // temperature can select between — and is the page-turn hot path.
+    // EPD_HALF_REFRESH is the boot paint, which on a device that deep-sleeps
+    // after a minute runs every time it is picked up; a correct, colder, longer
+    // waveform there was simply too visible. See the note in that case.
+    //
+    // What is left is exactly the set of updates that recondition the panel: the
+    // periodic DC-balancing flush and the sleep image, neither of which anybody
+    // is waiting on.
+    //
+    // The temperature cannot be read back: CMD_READ_TEMP needs MISO and the
+    // panel is wired write-only. The controller acts on it; nothing can print it.
+    //
+    // If a future panel revision disagrees, setting this to 0x00 restores the
+    // previous fixed-temperature behaviour exactly — the 0x5A seed write below
+    // is kept for that reason. It is a constant rather than a config option
+    // because it is a property of the controller, not a preference.
+    static constexpr uint8_t kTempLoad = 0x20;
+
     uint8_t displayMode = 0x00;
     if (!isScreenOn) {
       isScreenOn = true;
@@ -496,9 +412,35 @@ class EInkDisplay : public wintergreen::IDisplay {
 
     switch (mode) {
       case EPD_FULL_REFRESH:
-        displayMode |= 0x34;
+        displayMode |= 0x34 | kTempLoad;
         break;
       case EPD_HALF_REFRESH:
+        // This temperature-register write is NOT redundant, however much it
+        // looks it. initDisplayController() does select the internal sensor
+        // (CMD_TEMP_SENSOR_CONTROL = 0x80), and on that basis this was removed
+        // once as vestigial — the result was a panel that ran its waveform (a
+        // black flash) and then showed nothing at all. 0xD4 includes LUT_LOAD,
+        // and the OTP waveform this loads is selected by the temperature
+        // register; without the write it does not come up with a usable LUT.
+        // Application::start()'s full_refresh() defaults to Half, so this is the
+        // path that draws the very first screen. Leave it alone.
+        //
+        // **This path deliberately does NOT take TEMP_LOAD**, and the reason is
+        // what the user sees rather than what the panel wants.
+        //
+        // Half is the boot paint — Application::start() ends with
+        // full_refresh(), whose default is Half — and because deep-sleep wake is
+        // a full boot, that is the waveform that runs *every time the device is
+        // picked up*. Letting the controller sample its sensor here made it
+        // visibly longer: 0x5A corresponds to a much warmer panel than a room,
+        // and e-ink waveforms get longer and invert more times as they get
+        // colder. Correct, and far too distracting several times an hour.
+        //
+        // EPD_FULL_REFRESH keeps TEMP_LOAD, and that is where it earns its keep:
+        // the periodic DC-balancing flush and the sleep image are the updates
+        // that actually recondition the panel, and they happen when nobody is
+        // waiting on them. Any under-driving this path leaves behind is cleared
+        // by the next flush.
         sendCommand(CMD_WRITE_TEMP);
         sendData(0x5A);
         displayMode |= 0xD4;
@@ -522,14 +464,7 @@ class EInkDisplay : public wintergreen::IDisplay {
         pending_refresh_start_ = 1;  // 0 is the "nothing pending" sentinel
       return;
     }
-
-    const uint32_t t0 = millis();
     waitWhileBusy();
-    ESP_LOGI("epd", "refreshDisplay: mode=%s displayMode=0x%02X duration=%lums",
-             mode == EPD_FULL_REFRESH   ? "FULL"
-             : mode == EPD_HALF_REFRESH ? "HALF"
-                                        : "FAST",
-             displayMode, millis() - t0);
   }
 
   void initDisplayController(bool clearBuffer) {
@@ -558,7 +493,6 @@ class EInkDisplay : public wintergreen::IDisplay {
       clearDisplay();
     }
 
-    ESP_LOGI("epd", "finish initDisplayController: clearBuffer=%d", clearBuffer);
   }
 
   void clearDisplay() {
@@ -630,16 +564,4 @@ class EInkDisplay : public wintergreen::IDisplay {
     }
   }
 
-  // Revert from grayscale mode: the revert LUT reads the {BW,RED} RAM
-  // (still containing LSB/MSB plane data) and drives each pixel back to BW.
-  void grayscale_revert_() {
-    in_grayscale_mode_ = false;
-    if (has_custom_grayscale_revert_lut_) {
-      setCustomLUT_(custom_grayscale_revert_lut_);
-    } else {
-      setCustomLUT_(kLutGrayscaleRevert);
-    }
-    refreshDisplay(EPD_FAST_REFRESH);
-    setCustomLUT_(nullptr);
-  }
 };

@@ -22,7 +22,6 @@
 #include <cstring>
 #include <memory>
 
-#include "../HeapLog.h"
 #include "ImageDecoder.h"
 #include "ZipReader.h"
 #include "miniz.h"
@@ -358,7 +357,6 @@ ImageError decode_png_from_entry(IZipFile& file, const ZipEntry& entry, uint16_t
                                  ImageRowSink* sink, ImagePixelSink* pixel_sink) {
   // If no work_buf, allocate one
 #ifdef ESP_PLATFORM
-  int64_t _t_entry = esp_timer_get_time();
 #endif
   std::unique_ptr<uint8_t[]> owned_work;
   if (!work_buf || work_buf_size < ZipEntryInput::kMinWorkBufSize) {
@@ -781,8 +779,6 @@ ImageError decode_png_from_entry(IZipFile& file, const ZipEntry& entry, uint16_t
 
   // ---- IDAT streaming decompression + row processing ----
 #ifdef ESP_PLATFORM
-  int64_t _t_idat = esp_timer_get_time();
-  int64_t _t_pre = _t_idat - _t_entry;
 #endif
   for (;;) {
     // Top up input buffer from the IDAT stream
@@ -895,11 +891,6 @@ ImageError decode_png_from_entry(IZipFile& file, const ZipEntry& entry, uint16_t
   }
 
   out.height = static_cast<uint16_t>(out_y);
-#ifdef ESP_PLATFORM
-  MR_LOGI("pngd", "ct=%u bd=%u src=%ux%u pre=%ldms idat=%ldms", (unsigned)hdr.color_type, (unsigned)hdr.bit_depth,
-          (unsigned)hdr.src_width, (unsigned)hdr.src_height, (long)(_t_pre / 1000),
-          (long)((esp_timer_get_time() - _t_idat) / 1000));
-#endif
   return ImageError::Ok;
 }
 

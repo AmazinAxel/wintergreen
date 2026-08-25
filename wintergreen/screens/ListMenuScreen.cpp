@@ -4,7 +4,6 @@
 #include <cstdio>
 #include <cstring>
 
-#include "../HeapLog.h"
 
 #include "../Application.h"
 #include "../display/ui_font_header.h"
@@ -12,17 +11,6 @@
 #include "../display/ui_font_small.h"
 
 namespace wintergreen {
-
-int ListMenuScreen::font_size_idx_ = 0;
-
-void ListMenuScreen::apply_ui_font(BitmapFont& out) {
-  if (font_size_idx_ == 2)
-    out.init(kFontData_ui_large_mbf, kFontData_ui_large_mbf_size);
-  else if (font_size_idx_ == 3)
-    out.init(kFontData_ui_header_mbf, kFontData_ui_header_mbf_size);
-  else
-    out.init(kFontData_ui_small_mbf, kFontData_ui_small_mbf_size);
-}
 
 static constexpr int kHeaderY = 15;         // top padding before the title text
 static constexpr int kHeaderBottomGap = 4;  // gap between last header line and first list item
@@ -36,25 +24,14 @@ static constexpr int kItemSpacing = 6;      // vertical gap between list item ro
 void ListMenuScreen::start(DrawBuffer& buf, IRuntime& runtime) {
   buf_ = &buf;
   runtime_ = &runtime;
-  // Re-init ui_font_ whenever the font_size_idx_ setting may have changed.
   ui_font_ = BitmapFont{};
-  if (font_size_idx_ == 2)
-    ui_font_.init(kFontData_ui_large_mbf, kFontData_ui_large_mbf_size);
-  else if (font_size_idx_ == 3)
-    ui_font_.init(kFontData_ui_header_mbf, kFontData_ui_header_mbf_size);
-  else
-    ui_font_.init(kFontData_ui_small_mbf, kFontData_ui_small_mbf_size);
+  ui_font_.init(kFontData_ui_header_wgf, kFontData_ui_header_wgf_size);
   if (!header_font_.valid())
-    header_font_.init(kFontData_ui_header_mbf, kFontData_ui_header_mbf_size);
+    header_font_.init(kFontData_ui_header_wgf, kFontData_ui_header_wgf_size);
   subtitle_font_ = BitmapFont{};
-  subtitle_font_.init(kFontData_ui_small_mbf, kFontData_ui_small_mbf_size);
+  subtitle_font_.init(kFontData_ui_small_wgf, kFontData_ui_small_wgf_size);
   section_font_ = BitmapFont{};
-  if (font_size_idx_ >= 2)
-    section_font_.init(kFontData_ui_large_mbf, kFontData_ui_large_mbf_size);
-  else
-    section_font_.init(kFontData_ui_small_mbf, kFontData_ui_small_mbf_size);
-  if (app_)
-    list_align_ = app_->list_align();
+  section_font_.init(kFontData_ui_large_wgf, kFontData_ui_large_wgf_size);
   const int prev_selected = selected_;
   clear_items();
   on_start_set_selection_ = false;
@@ -76,19 +53,21 @@ void ListMenuScreen::start(DrawBuffer& buf, IRuntime& runtime) {
   draw_all_(buf, runtime.battery_percentage());
 }
 
-int ListMenuScreen::wintergreen_slot_h_() const {
+int ListMenuScreen::wintergreen_slot_h_(int index) const {
   static constexpr int kPadT = 5, kGap = 3, kPadB = 6;
   if (!subtitle_font_.valid()) return ui_font_.y_advance() + kItemSpacing;
+  // A row that will never carry a subtitle gets the title line only — reserving
+  // the second line leaves it looking like a row with something missing.
+  if (index >= 0 && is_single_line_row(index))
+    return kPadT + ui_font_.y_advance() + kPadB + 1;
   const int sub_h = section_font_.valid() ? section_font_.y_advance() : subtitle_font_.y_advance();
   return kPadT + ui_font_.y_advance() + kGap + sub_h + kPadB + 1;
 }
 
 int ListMenuScreen::wintergreen_visible_from_(int scroll_off, int available_h) const {
-  static constexpr int kSepH = 8;
-  const int sh = wintergreen_slot_h_();
   int cnt = 0, h = 0, n = count();
   for (int i = scroll_off; i < n; i++) {
-    const int ih = is_separator(i) ? kSepH : sh;
+    const int ih = is_separator(i) ? kSeparatorH : wintergreen_slot_h_(i);
     if (h + ih > available_h) break;
     h += ih; cnt++;
   }
@@ -183,9 +162,10 @@ int ListMenuScreen::compute_header_h_() const {
     return h;
   }
   if (!plain_list_) {
-    const int hf = header_font_.valid() ? header_font_.y_advance()
-                                        : (ui_font_.valid() ? ui_font_.y_advance() : 0);
-    return 10 + hf + 8;  // top pad + battery row + gap; no rule
+    // Measured from the font the battery is actually drawn in (battery_row_h_),
+    // not the header face. Sizing it off header_font_ reserved a 41 px row for
+    // 31 px of text, which read as a lopsided gap above the first entry.
+    return battery_row_h_() + kHeaderBottomGap;
   }
   int subtitle_h = 0;
   if (ui_font_.valid()) {
@@ -251,13 +231,12 @@ int ListMenuScreen::draw_header_(DrawBuffer& buf, int W, int H, std::optional<ui
   }
   if (!plain_list_) {
     if (!ui_font_.valid()) return 0;
-    const int hf_adv = header_font_.valid() ? header_font_.y_advance() : ui_font_.y_advance();
-    const BitmapFont& bf = section_font_.valid() ? section_font_ : ui_font_;
 
     // Battery percentage and nothing else: no wordmark, and no rule under it.
-    // Same helper the home screen calls, so the two land on the same pixel.
+    // Same helper the home screen calls, so the two land on the same pixel, and
+    // the same height compute_header_h_ uses — the two must not diverge.
     draw_battery_(buf, W, battery_pct);
-    return 10 + hf_adv + 8;
+    return battery_row_h_() + kHeaderBottomGap;
   }
   if (title_ && header_font_.valid()) {
     const size_t len = std::strlen(title_);
@@ -342,13 +321,10 @@ void ListMenuScreen::draw_list_(DrawBuffer& buf, int W, int H, int header_h, int
     if (plain_list_)
       buf.fill_rect(0, header_h, W, 1, false);
 
-    static constexpr int kPadT = 5, kGap = 3, kPadB = 6;
+    static constexpr int kPadT = 5, kGap = 3;  // slot height comes from wintergreen_slot_h_
     static constexpr int kLM = 14, kRM = 12;
-    static constexpr int kSepH = 8;
     const int title_h = ui_font_.y_advance();
     const BitmapFont& sub_font = section_font_.valid() ? section_font_ : subtitle_font_;
-    const int sub_h = sub_font.y_advance();
-    const int slot_h = kPadT + title_h + kGap + sub_h + kPadB + 1;
     const int available_h = H - header_h - bottom_h;
 
     const int visible = wintergreen_visible_from_(scroll_offset_, available_h);
@@ -366,12 +342,12 @@ void ListMenuScreen::draw_list_(DrawBuffer& buf, int W, int H, int header_h, int
       const bool sel = (i == selected_);
 
       if (is_separator(i)) {
-        // Full-width hairline rule centered in kSepH space
-        buf.fill_rect(0, y + kSepH / 2, W, 1, false);
-        y += kSepH;
+        draw_separator_(buf, W, y);
+        y += kSeparatorH;
         continue;
       }
 
+      const int slot_h = wintergreen_slot_h_(i);
       if (sel)
         buf.fill_rect(0, y, W, slot_h - 1, false);
 
@@ -451,8 +427,9 @@ void ListMenuScreen::draw_list_(DrawBuffer& buf, int W, int H, int header_h, int
       }
 
       // Full-width per-book divider. The last row has nothing below it to be
-      // divided from, so it gets none.
-      if (i != n - 1)
+      // divided from, so it gets none — nor does a row followed by a section
+      // hairline, which would otherwise draw two rules a few pixels apart.
+      if (i != n - 1 && !is_separator(i + 1))
         buf.fill_rect(0, y + slot_h - 1, W, 1, false);
       y += slot_h;
     }
@@ -472,7 +449,6 @@ void ListMenuScreen::draw_list_(DrawBuffer& buf, int W, int H, int header_h, int
   // ── Book-details mode: centred rows under the details card ───────────────
   if (!subtitle_.empty() && subtitle_font_.valid()) {
     static constexpr int kPadT = 6, kGap = 2, kPadB = 6;
-    static constexpr int kSepH = 12;
     static constexpr int kDivW = 80;
     const int title_h = ui_font_.y_advance();
     const int sub_h = subtitle_font_.y_advance();
@@ -486,7 +462,7 @@ void ListMenuScreen::draw_list_(DrawBuffer& buf, int W, int H, int header_h, int
     // Compute visible items total height for vertical centering
     int total_h = 0;
     for (int i = scroll_offset_; i < end; ++i)
-      total_h += is_separator(i) ? kSepH : slot_h;
+      total_h += is_separator(i) ? kSeparatorH : slot_h;
     const int start_y = header_h + std::max(0, (available_h - total_h) / 2);
 
     static const char kEll[] = "...";
@@ -497,8 +473,8 @@ void ListMenuScreen::draw_list_(DrawBuffer& buf, int W, int H, int header_h, int
       const bool sel = (i == selected_);
 
       if (is_separator(i)) {
-        buf.fill_rect(0, y + kSepH / 2, W, 1, false);
-        y += kSepH;
+        draw_separator_(buf, W, y);
+        y += kSeparatorH;
         continue;
       }
 
@@ -599,7 +575,7 @@ void ListMenuScreen::draw_list_(DrawBuffer& buf, int W, int H, int header_h, int
   int total_h = 0;
   for (int i = scroll_offset_; i < end; ++i) {
     if (is_separator(i))
-      total_h += !get_item_label(i).empty() ? line_h : line_h / 2;
+      total_h += !get_item_label(i).empty() ? line_h : kSeparatorH;
     else
       total_h += line_h;
   }
@@ -645,7 +621,9 @@ void ListMenuScreen::draw_list_(DrawBuffer& buf, int W, int H, int header_h, int
         buf.draw_text_proportional((W - hw) / 2, y + baseline, hdr.data(), hdr.size(), ui_font_, false);
         y += line_h;
       } else {
-        y += line_h / 2;
+        // Same hairline, same gap, as every other list.
+        draw_separator_(buf, W, y);
+        y += kSeparatorH;
       }
       continue;
     }
@@ -656,9 +634,7 @@ void ListMenuScreen::draw_list_(DrawBuffer& buf, int W, int H, int header_h, int
     size_t len = label_str.size();
     int iw = ui_font_.word_width(label, len, FontStyle::Regular);
 
-    const int landscape_pad = (buf.rotation() == Rotation::Deg0) ? 10 : 0;
-    const int indent_px = (list_align_ == 1) ? (32 + ((i < (int)indents_.size() ? indents_[i] : 0) * 20)) : 0;
-    const int max_item_w = (list_align_ == 1) ? (W - 32 - landscape_pad - indent_px) : (W - 48);
+    const int max_item_w = W - 48;
 
     if (iw > max_item_w) {
       const int budget = max_item_w - ellipsis_w;
@@ -681,31 +657,15 @@ void ListMenuScreen::draw_list_(DrawBuffer& buf, int W, int H, int header_h, int
       iw = ui_font_.word_width(label, len, FontStyle::Regular);
     }
 
-    int ix;
-    if (list_align_ == 1)
-      ix = indent_px;
-    else if (list_align_ == 2)
-      ix = std::max(0, W - 16 - landscape_pad - iw);
-    else
-      ix = (W - iw) / 2;
+    const int ix = (W - iw) / 2;
 
     if (i == selected_) {
       const int bar_w = 3;
-      const int sel_top = (font_size_idx_ == 0) ? y - 1 : y;
-      const int bar_h = ui_font_.y_advance() + (font_size_idx_ == 0 ? 1 : 0);
-      if (list_align_ == 1 || list_align_ == 2) {
-        const int bar_x = 16;
-        const int bar_width = W - 32 - landscape_pad;
-        buf.fill_rect(bar_x + 1, sel_top, bar_width - 2, bar_h, false);
-        buf.fill_rect(bar_x, sel_top + 1, 1, bar_h - 2, false);
-        buf.fill_rect(bar_x + bar_width - 1, sel_top + 1, 1, bar_h - 2, false);
-        buf.draw_text_proportional(ix, y + baseline, label, len, ui_font_, true);
-      } else {
-        buf.fill_rect(ix - bar_w, sel_top, iw + bar_w * 2, bar_h, false);
-        buf.fill_rect(ix - bar_w - 1, sel_top + 1, 1, bar_h - 2, false);
-        buf.fill_rect(ix + iw + bar_w, sel_top + 1, 1, bar_h - 2, false);
-        buf.draw_text_proportional(ix, y + baseline, label, len, ui_font_, true);
-      }
+      const int bar_h = ui_font_.y_advance();
+      buf.fill_rect(ix - bar_w, y, iw + bar_w * 2, bar_h, false);
+      buf.fill_rect(ix - bar_w - 1, y + 1, 1, bar_h - 2, false);
+      buf.fill_rect(ix + iw + bar_w, y + 1, 1, bar_h - 2, false);
+      buf.draw_text_proportional(ix, y + baseline, label, len, ui_font_, true);
     } else {
       buf.draw_text_proportional(ix, y + baseline, label, len, ui_font_, false);
     }
@@ -716,7 +676,7 @@ void ListMenuScreen::draw_list_(DrawBuffer& buf, int W, int H, int header_h, int
   if (n > visible) {
     const int sb_w = 4;
     const int sb_x = (buf.rotation() == Rotation::Deg0) ? 8 : W - 12;
-    const int sb_top = items_y - (font_size_idx_ == 0 ? 1 : 0);
+    const int sb_top = items_y;
     // total_h = N*line_h - kItemSpacing (trailing gap removed), so the bottom
     // pixel of the last item's glyph is exactly items_y + total_h.
     const int sb_bottom = items_y + total_h;
@@ -756,12 +716,11 @@ void ListMenuScreen::update(const ButtonState& buttons, DrawBuffer& buf, IRuntim
   bool moved = false;       // selection changed — needs a redraw
   bool needs_draw = false;  // on_select returned true — needs a redraw
 
-  bool inv_menu = app_ && app_->invert_menu_buttons();
-  // Default (inv_menu=false): Button3=up, Button2=down, Up=up, Down=down.
-  Button logical_up_front = inv_menu ? Button::Button2 : Button::Button3;
-  Button logical_down_front = inv_menu ? Button::Button3 : Button::Button2;
-  Button logical_up_side = Button::Up;
-  Button logical_down_side = Button::Down;
+  // Front row: Button3=up, Button2=down. Side rocker: Up=up, Down=down.
+  constexpr Button logical_up_front = Button::Button3;
+  constexpr Button logical_down_front = Button::Button2;
+  constexpr Button logical_up_side = Button::Up;
+  constexpr Button logical_down_side = Button::Down;
 
   Button btn;
   while (buttons.next_press(btn)) {

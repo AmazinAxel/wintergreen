@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Validate an MBF4 blob / FNTS bundle the way BitmapFont.h parses it.
+"""Validate a WGF1 blob / WGFS bundle the way BitmapFont.h parses it.
 
 Catches layout mistakes that would silently render blank on device. Also draws
 a sample string so the rasterization can be eyeballed without a flash.
@@ -12,12 +12,12 @@ import sys
 import zlib
 
 
-HEADER_SIZE = 50
+HEADER_SIZE = 49
 STYLE_NAMES = ["Regular", "Bold", "Italic", "BoldItalic"]
 
 def load(path):
     raw = open(path, "rb").read()
-    if raw[:4] in (b"FNTS", b"MBF4"):
+    if raw[:4] in (b"WGFS", b"WGF1"):
         return raw
     size = struct.unpack_from("<I", raw, 0)[0]
     out = zlib.decompress(raw[4:])
@@ -25,16 +25,15 @@ def load(path):
     return out
 
 
-class Mbf:
+class Wgf:
     def __init__(self, d, base=0):
         self.d, self.b = d, base
-        (magic, ver, self.glyph_h, self.baseline, self.yadv, self.dadv,
-         self.style_flags, self.n_ranges, self.n_glyphs, self.nominal) = struct.unpack_from("<IBBBBBBHHH", d, base)
-        assert magic == 0x3446424D, f"bad magic {magic:#x}"
-        assert ver == 4, f"bad version {ver}"
+        (magic, self.glyph_h, self.baseline, self.yadv, self.dadv,
+         self.style_flags, self.n_ranges, self.n_glyphs, self.nominal) = struct.unpack_from("<IBBBBBHHH", d, base)
+        assert magic == 0x31464757, f"bad magic {magic:#x} (expected WGF1)"
         (self.kern_len, self.bmp_off, self.bold_off, self.italic_off,
-         self.bi_off, self.kern_off, self.lsb_off, self.msb_off) = struct.unpack_from("<8I", d, base + 16)
-        self.ul_pos, self.ul_th = struct.unpack_from("<bB", d, base + 48)
+         self.bi_off, self.kern_off, self.lsb_off, self.msb_off) = struct.unpack_from("<8I", d, base + 15)
+        self.ul_pos, self.ul_th = struct.unpack_from("<bB", d, base + 47)
 
     def style(self, which):
         """(ranges_off, glyphs_off, n_ranges, n_glyphs, kern_len, kern_off)."""
@@ -167,20 +166,19 @@ def main():
     text = sys.argv[2] if len(sys.argv) > 2 else "Wave AVATAR, To fj. “quick”"
     d = load(path)
     ok = True
-    if d[:4] == b"FNTS":
-        n, ver = d[4], d[5]
-        name = d[8:40].split(b"\0")[0].decode()
-        sizes = [struct.unpack_from("<I", d, 40 + 4 * i)[0] for i in range(n)]
-        print(f"FNTS v{ver} \"{name}\": {n} size(s), {len(d):,} bytes")
-        o = 40 + 4 * n
+    if d[:4] == b"WGFS":
+        n = d[4]
+        sizes = [struct.unpack_from("<I", d, 8 + 4 * i)[0] for i in range(n)]
+        print(f"WGFS: {n} size(s), {len(d):,} bytes")
+        o = 8 + 4 * n
         for i, s in enumerate(sizes):
-            m = Mbf(d, o)
+            m = Wgf(d, o)
             ok &= check(m, f"  [{i}] {s:,}B")
             o += s
-        m = Mbf(d, 40 + 4 * n)
+        m = Wgf(d, 8 + 4 * n)
         draw(m, text)
     else:
-        m = Mbf(d, 0)
+        m = Wgf(d, 0)
         ok &= check(m, path)
         draw(m, text)
     print("OK" if ok else "FAILED")

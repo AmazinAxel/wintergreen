@@ -14,6 +14,7 @@ namespace wintergreen {
 
 // Filled diamond (a square on its corner), one fill_rect per row. Hard edges —
 // the panel is 1-bit, so anything rounded only reads as a ragged circle.
+
 static void draw_diamond(DrawBuffer& buf, int cx, int cy, int r) {
   for (int dy = -r; dy <= r; ++dy) {
     const int span = r - std::abs(dy);
@@ -109,14 +110,15 @@ void HomeScreen::load_cover_(int i, int box_w, int box_h) const {
   cover_slot_ = i;
   if (i < 0 || i >= num_books_) return;
 
-  // Prefer the full-res sleep cover (up to 480x786) over the 160x240 list
-  // thumbnail: the box is several hundred pixels tall, so the thumbnail can
-  // only be doubled into it, while the sleep cover carries enough detail to be
-  // scaled down. Both files are the same format — w,h then 1bpp rows, bit
-  // clear = ink.
+  // cover_home.bin first: the converter renders it to fit this box exactly
+  // (kHomeCoverW × kHomeCoverH), dithering once from the original grayscale, so
+  // the scaler below reduces to a 1:1 copy. The 160x240 list thumbnail is the
+  // only fallback and can only be pixel-doubled; cover_sleep.bin is no use here
+  // since it is composed with letterbox bars for the panel.
+  // Both files are the same format — w,h then 1bpp rows, bit clear = ink.
   FILE* f = nullptr;
-  if (!slots_[i].sleep_path.empty())
-    f = std::fopen(slots_[i].sleep_path.c_str(), "rb");
+  if (!slots_[i].home_path.empty())
+    f = std::fopen(slots_[i].home_path.c_str(), "rb");
   if (!f && !slots_[i].bin_path.empty())
     f = std::fopen(slots_[i].bin_path.c_str(), "rb");
   if (!f) return;
@@ -242,10 +244,13 @@ void HomeScreen::on_start() {
     set_buf_rotation_(Rotation::Deg90);
 
   if (!author_font_.valid())
-    author_font_.init(kFontData_ui_large_mbf, kFontData_ui_large_mbf_size);
+    author_font_.init(kFontData_ui_large_wgf, kFontData_ui_large_wgf_size);
 
-  if (app_ && app_->data_dir_) {
-    const std::string idx_path = std::string(app_->data_dir_) + "/book_index.dat";
+  // Same rule as MainMenu::on_start(): the resident index is authoritative, so
+  // only parse book_index.dat when nothing is loaded (a cold boot). Backing out
+  // of a book used to re-read and re-parse the whole file off the SD card here.
+  if (app_ && app_->data_dir_ && BookIndex::instance().entries().empty()) {
+    const std::string& idx_path = app_->index_path();
     BookIndex::instance().load(idx_path);
   }
 
@@ -261,32 +266,75 @@ void HomeScreen::on_start() {
   cover_data_.clear();
   cover_w_ = cover_h_ = 0;
 
-  // TODO rename this to just normal homescreen
-
-  struct Raw { uint32_t order; BookSlot s; };
-  std::vector<Raw> raw;
+  // Pick the kMaxBooks most recently opened, by selection rather than by
+  // sorting. std::stable_sort over a struct holding six std::strings cost
+  // ~20 KB of flash here — mergesort, insertion sort and __rotate all
+  // instantiated for a list that is then truncated to five — and it built
+  // path/title/author for every book ever opened just to discard all but those
+  // five. This walks the index kMaxBooks times instead and copies nothing until
+  // a winner is known.
+  const auto& entries = BookIndex::instance().entries();
   const StringPool& pool = BookIndex::instance().pool();
-  for (const auto& e : BookIndex::instance().entries()) {
-    if (e.last_open_order == 0) continue;
-    raw.push_back({e.last_open_order, {
-      e.path.to_string(pool),
-      std::string(e.title.view(pool)),
-      std::string(e.author.view(pool)),
-      {}, {},
-    }});
+  int chosen[kMaxBooks];
+  uint32_t taken_above = UINT32_MAX;  // strictly-less bound from the previous pick
+  for (int slot = 0; slot < kMaxBooks; ++slot) {
+    int best = -1;
+    uint32_t best_order = 0;
+    for (size_t i = 0; i < entries.size(); ++i) {
+      const uint32_t o = entries[i].last_open_order;
+      // 0 means never opened. Orders are unique per book (mark_opened derives
+      // each from max+1), so `< taken_above` cannot skip a tie.
+      if (o == 0 || o >= taken_above || o <= best_order)
+        continue;
+      best_order = o;
+      best = static_cast<int>(i);
+    }
+    if (best < 0)
+      break;
+    chosen[slot] = best;
+    taken_above = best_order;
+    ++num_books_;
   }
-  std::stable_sort(raw.begin(), raw.end(), [](const Raw& a, const Raw& b) {
-    return a.order > b.order;
-  });
 
-  num_books_ = static_cast<int>(std::min(raw.size(), static_cast<size_t>(kMaxBooks)));
+  // Nothing has been opened yet — a fresh card, or settings that were wiped.
+  // Rather than an empty carousel telling the reader there is nothing here, show
+  // the start of the library. Ordering matches the book list's never-opened
+  // group (alphabetical by title) so the same book is "first" in both places.
+  if (num_books_ == 0 && !entries.empty()) {
+    for (size_t i = 0; i < entries.size(); ++i) {
+      if (num_books_ < kMaxBooks) {
+        chosen[num_books_++] = static_cast<int>(i);
+        continue;
+      }
+      // Full: replace the current last if this title sorts before it.
+      int worst_slot = 0;
+      for (int s = 1; s < num_books_; ++s)
+        if (ci_less(entries[chosen[worst_slot]].title.view(pool), entries[chosen[s]].title.view(pool)))
+          worst_slot = s;
+      if (ci_less(entries[i].title.view(pool), entries[chosen[worst_slot]].title.view(pool)))
+        chosen[worst_slot] = static_cast<int>(i);
+    }
+    // Order the chosen few among themselves.
+    for (int a = 1; a < num_books_; ++a) {
+      const int v = chosen[a];
+      int b = a - 1;
+      while (b >= 0 && ci_less(entries[v].title.view(pool), entries[chosen[b]].title.view(pool))) {
+        chosen[b + 1] = chosen[b];
+        --b;
+      }
+      chosen[b + 1] = v;
+    }
+  }
 
   clear_items();
   for (int i = 0; i < num_books_; ++i) {
-    slots_[i] = std::move(raw[i].s);
+    const BookIndexEntry& e = entries[chosen[i]];
+    slots_[i].path = e.path.to_string(pool);
+    slots_[i].title.assign(e.title.view(pool));
+    slots_[i].author.assign(e.author.view(pool));
     if (app_ && app_->data_dir_) {
       slots_[i].bin_path = cover_bin_path(slots_[i].path.c_str(), app_->data_dir_);
-      slots_[i].sleep_path = cover_sleep_bin_path(slots_[i].path.c_str(), app_->data_dir_);
+      slots_[i].home_path = cover_home_bin_path(slots_[i].path.c_str(), app_->data_dir_);
     }
     add_item(slots_[i].title);
   }
@@ -391,9 +439,9 @@ void HomeScreen::draw_all_(DrawBuffer& buf, std::optional<uint8_t> battery_pct) 
   static constexpr int kAuthorGap  = 6;
   static constexpr int kDotsGap    = 26;
   static constexpr int kBottomPad  = 28;
-  static constexpr int kDotR       = 5;   // filled diamond, both states
+  static constexpr int kDotR       = 5;   // filled diamond, selected
   static constexpr int kDotRing    = 9;   // outline diamond around the selected one
-  static constexpr int kDotRSmall  = 3;
+  static constexpr int kDotRSmall  = 3;   // unselected: a step down from the filled one
   static constexpr int kDotStep    = 28;
   static constexpr int kFrameGap   = 10;  // white gap between cover and its frame
   static constexpr int kFrameW     = 2;   // frame thickness
@@ -419,7 +467,9 @@ void HomeScreen::draw_all_(DrawBuffer& buf, std::optional<uint8_t> battery_pct) 
   if (num_books_ == 0) {
     draw_outline(buf, kPad, box_y, box_w, box_h);
     const int mid = box_y + box_h / 2;
-    static const char kEmpty[] = "No books opened yet";
+    // Only reachable if the card is genuinely empty, and Application::start
+    // normally routes that case to the book list instead — kept as a safety net.
+    static const char kEmpty[] = "No books on the card";
     static const char kHint[]  = "Press Back for all books";
     draw_centred(buf, W / 2, mid, kEmpty, std::strlen(kEmpty), tf, box_w);
     draw_centred(buf, W / 2, mid + af.y_advance() + 8, kHint, std::strlen(kHint), af, box_w);

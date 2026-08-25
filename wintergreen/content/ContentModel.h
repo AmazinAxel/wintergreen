@@ -80,8 +80,8 @@ struct Run {
 // ---------------------------------------------------------------------------
 
 struct ImageRef {
-  uint16_t key = 0;         // index into the EPUB's file entries / MRB image ref table
-  uint16_t attr_width = 0;  // from HTML attributes or MRB image table; 0 = unknown
+  uint16_t key = 0;         // index into the EPUB's file entries / WGB image ref table
+  uint16_t attr_width = 0;  // from HTML attributes or WGB image table; 0 = unknown
   uint16_t attr_height = 0;
 
   ImageRef() = default;
@@ -179,7 +179,7 @@ struct TocEntry {
   StringRef fragment{};  // empty => no fragment
   uint16_t file_idx = 0;
   uint8_t depth = 0;        // nesting depth in NCX (0 = top-level)
-  uint16_t para_index = 0;  // paragraph index within chapter (stored in MRB v6+)
+  uint16_t para_index = 0;  // paragraph index within chapter (stored in WGB v6+)
 };
 
 struct TableOfContents {

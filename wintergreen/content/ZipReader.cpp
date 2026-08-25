@@ -14,15 +14,9 @@
 
 #ifdef ESP_PLATFORM
 #include "esp_heap_caps.h"
-#include "esp_log.h"
-static constexpr char kZipTag[] = "zip";
 // Returns largest contiguous free block on ESP32; always passes on desktop.
 static bool heap_can_alloc(size_t bytes) {
-  size_t largest = heap_caps_get_largest_free_block(MALLOC_CAP_8BIT);
-  bool ok = largest >= bytes + 2048;  // 2 KB overhead margin
-  if (!ok)
-    ESP_LOGW(kZipTag, "heap preflight FAIL: need %u, largest=%u", (unsigned)bytes, (unsigned)largest);
-  return ok;
+  return heap_caps_get_largest_free_block(MALLOC_CAP_8BIT) >= bytes + 2048;  // 2 KB overhead margin
 }
 #else
 static inline bool heap_can_alloc(size_t) {

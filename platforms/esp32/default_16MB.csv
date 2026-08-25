@@ -1,7 +1,12 @@
-# Name,   Type, SubType, Offset,  Size, Flags
-nvs,      data, nvs,     0x9000,  0x5000,
-otadata,  data, ota,     0xe000,  0x2000,
-app0,     app,  ota_0,   0x10000, 0x640000,
+# Name,   Type, SubType, Offset,   Size,     Flags
+nvs,      data, nvs,     0x9000,   0x5000,
+otadata,  data, ota,     0xe000,   0x2000,
+app0,     app,  ota_0,   0x10000,  0x640000,
 app1,     app,  ota_1,   0x650000, 0x640000,
-spiffs,   data, spiffs,  0xc90000,0x360000,
-coredump, data, coredump,0xFF0000,0x10000,
+# Raw partitions, not filesystems. Both are written by esptool at flash time
+# (tools/generate_assets.py registers them as FLASH_EXTRA_IMAGES) and read at
+# runtime with esp_partition_mmap, so neither costs a byte of the app image and
+# neither is ever copied or decompressed on the device.
+font,     data, spiffs,  0xc90000, 0x080000,
+sleep,    data, spiffs,  0xd10000, 0x020000,
+coredump, data, coredump,0xFF0000, 0x10000,

@@ -4,14 +4,14 @@
 #include <string>
 #include <vector>
 
-#include "../content/mrb/MrbReader.h"
+#include "../content/wgb/WgbReader.h"
 #include "ListMenuScreen.h"
 
 namespace wintergreen {
 
 // ---------------------------------------------------------------------------
 // ReaderSettings — user-adjustable reader preferences
-// Stored in ReaderScreen; mutated inline by ReaderOptionsScreen.
+// Stored in ReaderScreen; mutated inline by QuickmenuScreen.
 // ---------------------------------------------------------------------------
 // Only two things about the page are adjustable. Margins, alignment, line
 // spacing and publisher font sizes are fixed: margins at what used to be the
@@ -19,8 +19,9 @@ namespace wintergreen {
 struct ReaderSettings {
   uint8_t font_size_idx = 1;  // base font size preset index (1 = Normal/24px)
 
-  static constexpr const char* kFontSizeNames[] = {"20", "24", "26", "28", "30", "32", "34", "36"};
-  static constexpr uint8_t kNumFontSizePresets = 8;
+  // Must match the sizes tools/make_font.py builds into the bundle, in order.
+  static constexpr const char* kFontSizeNames[] = {"20", "24", "28", "32", "36"};
+  static constexpr uint8_t kNumFontSizePresets = 5;
 
   static constexpr uint16_t h_padding() {
     return 12;
@@ -39,12 +40,12 @@ struct ReaderSettings {
 // reading context (TOC availability).
 //
 // Usage:
-//   app_->reader_options()->set_settings(&reader_settings_);
-//   app_->reader_options()->populate(mrb_.toc(), chapter_idx, page_pos_.paragraph);
-//   app_->push_screen(ScreenId::ReaderOptions);
-class ReaderOptionsScreen final : public ListMenuScreen {
+//   app_->quickmenu()->set_settings(&reader_settings_);
+//   app_->quickmenu()->populate(wgb_.toc(), chapter_idx, page_pos_.paragraph);
+//   app_->push_screen(ScreenId::Quickmenu);
+class QuickmenuScreen final : public ListMenuScreen {
  public:
-  ReaderOptionsScreen() = default;
+  QuickmenuScreen() = default;
 
   const char* name() const override {
     return "Options";
@@ -55,7 +56,7 @@ class ReaderOptionsScreen final : public ListMenuScreen {
     settings_ = s;
   }
 
-  // Populate before pushing. Pass toc (may be empty) and chapter_count from MRB.
+  // Populate before pushing. Pass toc (may be empty) and chapter_count from WGB.
   // The chapter list is appended below the settings when toc has entries OR
   // chapter_count > 1 (numbered fallback).
   void populate(const TableOfContents& toc, uint16_t current_chapter, uint16_t current_para,
@@ -72,7 +73,8 @@ class ReaderOptionsScreen final : public ListMenuScreen {
   static constexpr int kLM = 14, kRM = 14;
   static constexpr int kPctGap = 10;    // title text → its percentage
   static constexpr int kBlockGap = 10;  // between title, chapter and the rule
-  static constexpr int kSepH = 14;      // gap holding the settings/chapters hairline
+  // The settings/chapters hairline uses the shared ListMenuScreen geometry
+  // (kSeparatorH / draw_separator_) so it matches the book list exactly.
   // No battery on this screen — it is an overlay on the book, not a top-level
   // screen, and the reader it sits over shows nothing either.
   static constexpr int kHeaderTop = 16;
@@ -107,6 +109,18 @@ class ReaderOptionsScreen final : public ListMenuScreen {
 
   void update(const ButtonState& buttons, DrawBuffer& buf, IRuntime& runtime) override {
     buf_ = &buf;
+    runtime_ = &runtime;
+    // The clicker connects asynchronously — several seconds, on its own task —
+    // so the row that says "Connecting" has to be repainted when the outcome
+    // arrives. This is the only thing on any screen that changes without a
+    // button press, hence the explicit poll; everything else repaints on input.
+    if (idx_clicker_ >= 0) {
+      const ClickerState now = runtime.clicker_state();
+      if (now != clicker_shown_) {
+        refresh_items_(selected_index());
+        request_redraw();
+      }
+    }
     ListMenuScreen::update(buttons, buf, runtime);
   }
 
@@ -123,11 +137,36 @@ class ReaderOptionsScreen final : public ListMenuScreen {
   mutable std::string subtitle_buf_;
   ReaderSettings* settings_ = nullptr;
   DrawBuffer* buf_ = nullptr;
+  IRuntime* runtime_ = nullptr;
+
+  // What the Clicker row currently says, so update() can tell an asynchronous
+  // state change from a redraw it has already done.
+  ClickerState clicker_shown_ = ClickerState::Unavailable;
+
+  static const char* clicker_label_(ClickerState s) {
+    switch (s) {
+      case ClickerState::Connected:
+        return "Connected";
+      case ClickerState::Connecting:
+        return "Connecting";
+      case ClickerState::NotFound:
+        return "Not found";
+      case ClickerState::Failed:
+        return "Failed";
+      default:
+        return "Disconnected";
+    }
+  }
+
+  // Item 0 is the header block (book title + chapter + percentages), drawn by
+  // draw_all_ rather than by the list loop and worth 0 rows to every height
+  // calculation. Selecting it returns to the book.
+  static constexpr int kIdxBack = 0;
 
   // Item indices (-1 = not shown).
   int idx_font_size_ = -1;
-  int idx_rotate_display_ = -1;
   int idx_reader_rotate_display_ = -1;
+  int idx_clicker_ = -1;
   int first_chapter_ = -1;
 
   uint16_t pending_chapter_ = 0;

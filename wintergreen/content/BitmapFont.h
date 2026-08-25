@@ -1,13 +1,13 @@
 #pragma once
 
-// BitmapFont — proportional bitmap font loaded from MBF binary data.
+// BitmapFont — proportional bitmap font loaded from WGF binary data.
 //
 // Implements IFont for the TextLayout engine. Reads glyph metrics and
 // bitmap data directly from a `const uint8_t*` pointer (works for both
 // firmware-embedded constexpr data and memory-mapped flash partitions).
 // Zero heap allocations.
 //
-// Supports multi-style MBF files: Regular + optional Bold, Italic, BoldItalic.
+// Supports multi-style WGF files: Regular + optional Bold, Italic, BoldItalic.
 // Style-specific glyph_data() and char_width() select the right style table.
 // Missing styles fall back to Regular.
 
@@ -15,12 +15,12 @@
 #include <cstdint>
 #include <cstring>
 
-#include "BitmapFontFormat.h"
+#include "WgfFormat.h"
 #include "Font.h"
 
 namespace wintergreen {
 
-// Result of a glyph lookup — points into the MBF data buffer.
+// Result of a glyph lookup — points into the WGF data buffer.
 struct GlyphData {
   const uint8_t* bits;           // pointer to 1-bit BW packed bitmap (nullptr if no bitmap)
   const uint8_t* gray_lsb_bits;  // pointer to grayscale LSB plane (nullptr if absent)
@@ -50,17 +50,17 @@ class BitmapFont : public IFont {
     for (auto& s : styles_)
       s = {};
 
-    if (!data || size < sizeof(MbfHeader))
+    if (!data || size < sizeof(WgfHeader))
       return;
 
-    auto* hdr = reinterpret_cast<const MbfHeader*>(data);
-    if (hdr->magic != kMbfMagic || hdr->version != kMbfVersion)
+    auto* hdr = reinterpret_cast<const WgfHeader*>(data);
+    if (hdr->magic != kWgfMagic)
       return;
 
     // Validate Regular style data
-    const size_t ranges_start = sizeof(MbfHeader);
-    const size_t ranges_end = ranges_start + static_cast<size_t>(hdr->num_ranges) * sizeof(MbfRange);
-    const size_t glyphs_end = ranges_end + static_cast<size_t>(hdr->num_glyphs) * sizeof(MbfGlyph);
+    const size_t ranges_start = sizeof(WgfHeader);
+    const size_t ranges_end = ranges_start + static_cast<size_t>(hdr->num_ranges) * sizeof(WgfRange);
+    const size_t glyphs_end = ranges_end + static_cast<size_t>(hdr->num_glyphs) * sizeof(WgfGlyph);
     if (glyphs_end > size || hdr->bitmap_data_offset > size)
       return;
 
@@ -76,18 +76,18 @@ class BitmapFont : public IFont {
       gray_msb_bitmaps_ = data + hdr->gray_msb_offset;
 
     // Regular style (always present)
-    styles_[0].ranges = reinterpret_cast<const MbfRange*>(data + ranges_start);
-    styles_[0].glyphs = reinterpret_cast<const MbfGlyph*>(data + ranges_end);
+    styles_[0].ranges = reinterpret_cast<const WgfRange*>(data + ranges_start);
+    styles_[0].glyphs = reinterpret_cast<const WgfGlyph*>(data + ranges_end);
     styles_[0].num_ranges = hdr->num_ranges;
     styles_[0].num_glyphs = hdr->num_glyphs;
     styles_[0].kerning_length = hdr->kerning_length;
     styles_[0].fallback_glyph_idx = find_glyph_index_in(styles_[0], 0xFFFD);
 
-    if (hdr->kerning_offset && styles_[0].kerning_length >= sizeof(MbfClassKerning)) {
+    if (hdr->kerning_offset && styles_[0].kerning_length >= sizeof(WgfClassKerning)) {
       size_t kern_end = hdr->kerning_offset + styles_[0].kerning_length;
       if (kern_end <= size) {
-        styles_[0].kerning = reinterpret_cast<const MbfClassKerning*>(data + hdr->kerning_offset);
-        styles_[0].l_class_map = data + hdr->kerning_offset + sizeof(MbfClassKerning);
+        styles_[0].kerning = reinterpret_cast<const WgfClassKerning*>(data + hdr->kerning_offset);
+        styles_[0].l_class_map = data + hdr->kerning_offset + sizeof(WgfClassKerning);
         styles_[0].r_class_map = styles_[0].l_class_map + styles_[0].num_glyphs;
         styles_[0].kerning_matrix = reinterpret_cast<const int8_t*>(styles_[0].r_class_map + styles_[0].num_glyphs);
       }
@@ -198,7 +198,7 @@ class BitmapFont : public IFont {
     if (idx < 0)
       return {nullptr, nullptr, nullptr, 0, 0, header_ ? header_->default_advance : static_cast<uint8_t>(0), 0, 0};
 
-    const MbfGlyph& g = sd.glyphs[idx];
+    const WgfGlyph& g = sd.glyphs[idx];
     const uint8_t* bits = nullptr;
     const uint8_t* lsb = nullptr;
     const uint8_t* msb = nullptr;
@@ -244,9 +244,9 @@ class BitmapFont : public IFont {
 
  private:
   struct StyleData {
-    const MbfRange* ranges = nullptr;
-    const MbfGlyph* glyphs = nullptr;
-    const MbfClassKerning* kerning = nullptr;
+    const WgfRange* ranges = nullptr;
+    const WgfGlyph* glyphs = nullptr;
+    const WgfClassKerning* kerning = nullptr;
     const uint8_t* l_class_map = nullptr;
     const uint8_t* r_class_map = nullptr;
     const int8_t* kerning_matrix = nullptr;
@@ -258,7 +258,7 @@ class BitmapFont : public IFont {
 
   const uint8_t* data_ = nullptr;
   size_t size_ = 0;
-  const MbfHeader* header_ = nullptr;
+  const WgfHeader* header_ = nullptr;
   const uint8_t* bitmaps_ = nullptr;
   const uint8_t* gray_lsb_bitmaps_ = nullptr;
   const uint8_t* gray_msb_bitmaps_ = nullptr;
@@ -275,26 +275,26 @@ class BitmapFont : public IFont {
 
   // Load a style section from the given file offset.
   static void load_style_(const uint8_t* data, size_t size, uint32_t offset, StyleData& out) {
-    if (offset == 0 || offset + sizeof(MbfStyleSection) > size)
+    if (offset == 0 || offset + sizeof(WgfStyleSection) > size)
       return;
-    auto* sec = reinterpret_cast<const MbfStyleSection*>(data + offset);
-    size_t ranges_start = offset + sizeof(MbfStyleSection);
-    size_t ranges_end = ranges_start + static_cast<size_t>(sec->num_ranges) * sizeof(MbfRange);
-    size_t glyphs_end = ranges_end + static_cast<size_t>(sec->num_glyphs) * sizeof(MbfGlyph);
+    auto* sec = reinterpret_cast<const WgfStyleSection*>(data + offset);
+    size_t ranges_start = offset + sizeof(WgfStyleSection);
+    size_t ranges_end = ranges_start + static_cast<size_t>(sec->num_ranges) * sizeof(WgfRange);
+    size_t glyphs_end = ranges_end + static_cast<size_t>(sec->num_glyphs) * sizeof(WgfGlyph);
     if (glyphs_end > size)
       return;
-    out.ranges = reinterpret_cast<const MbfRange*>(data + ranges_start);
-    out.glyphs = reinterpret_cast<const MbfGlyph*>(data + ranges_end);
+    out.ranges = reinterpret_cast<const WgfRange*>(data + ranges_start);
+    out.glyphs = reinterpret_cast<const WgfGlyph*>(data + ranges_end);
     out.num_ranges = sec->num_ranges;
     out.num_glyphs = sec->num_glyphs;
     out.kerning_length = sec->kerning_length;
     out.fallback_glyph_idx = find_glyph_index_in(out, 0xFFFD);
 
-    if (out.kerning_length >= sizeof(MbfClassKerning)) {
+    if (out.kerning_length >= sizeof(WgfClassKerning)) {
       size_t kern_end = glyphs_end + out.kerning_length;
       if (kern_end <= size) {
-        out.kerning = reinterpret_cast<const MbfClassKerning*>(data + glyphs_end);
-        out.l_class_map = data + glyphs_end + sizeof(MbfClassKerning);
+        out.kerning = reinterpret_cast<const WgfClassKerning*>(data + glyphs_end);
+        out.l_class_map = data + glyphs_end + sizeof(WgfClassKerning);
         out.r_class_map = out.l_class_map + out.num_glyphs;
         out.kerning_matrix = reinterpret_cast<const int8_t*>(out.r_class_map + out.num_glyphs);
       }
@@ -309,7 +309,7 @@ class BitmapFont : public IFont {
     int hi = static_cast<int>(sd.num_ranges) - 1;
     while (lo <= hi) {
       int mid = lo + (hi - lo) / 2;
-      const MbfRange& r = sd.ranges[mid];
+      const WgfRange& r = sd.ranges[mid];
       uint32_t range_end = r.first_codepoint + r.count;
       if (cp < r.first_codepoint) {
         hi = mid - 1;

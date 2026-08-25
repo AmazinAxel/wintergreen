@@ -18,7 +18,6 @@
 #include <cstring>
 #include <memory>
 
-#include "../HeapLog.h"
 #ifdef ESP_PLATFORM
 #include "esp_heap_caps.h"
 #include "esp_timer.h"
@@ -1071,25 +1070,18 @@ ImageError decode_jpeg_from_entry(IZipFile& file, const ZipEntry& entry, uint16_
 
   const char* err = parse_jpeg_header(inp, *st);
   if (err) {
-    MR_LOGI("jpeg", "%s", err);
     return ImageError::InvalidData;
   }
   err = validate_tables(*st);
   if (err) {
-    MR_LOGI("jpeg", "%s", err);
     return ImageError::InvalidData;
   }
 
   BitReader r(inp);
 #ifdef ESP_PLATFORM
-  int64_t _t_jdec = esp_timer_get_time();
 #endif
   err = decode_baseline(*st, r, max_w, max_h, out, scale_to_fill, sink);
-#ifdef ESP_PLATFORM
-  MR_LOGI("jpgd", "decode=%ldms w=%d h=%d", (long)((esp_timer_get_time() - _t_jdec) / 1000), st->width, st->height);
-#endif
   if (err) {
-    MR_LOGI("jpeg", "%s", err);
     return ImageError::InvalidData;
   }
 

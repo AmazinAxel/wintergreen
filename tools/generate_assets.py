@@ -1,44 +1,92 @@
-Import("env")
-import hashlib
-import os
-import sys
+"""Pre-build hook: prepare the two raw asset partitions and hand them to esptool.
 
-_TOOLS_DIR = os.path.join(env.subst("$PROJECT_DIR"), "tools")
-if _TOOLS_DIR not in sys.path:
-    sys.path.insert(0, _TOOLS_DIR)
-import build_assets  # noqa: E402
+Neither asset is embedded in the app image any more. `font` and `sleep` are raw
+partitions (see platforms/esp32/default_16MB.csv) written at flash time and read
+at runtime with esp_partition_mmap, so:
 
-project_dir = env.subst("$PROJECT_DIR")
-esp32_dir = os.path.join(project_dir, "platforms", "esp32")
-bin_path = os.path.join(esp32_dir, "assets.bin")
-asm_path = os.path.join(esp32_dir, "assets_embedded.S")
+  - the app image carries neither, and every build/upload is ~218 KB smaller;
+  - the font is no longer stored twice (once in the image, once in the
+    partition) and is no longer decompressed into flash on first boot, which is
+    what the old "Installing fonts..." progress screen existed for;
+  - the sleep image is read straight out of memory-mapped flash.
 
-# WG_NO_EMBED_FONT drops the reader font (~290 KB) from the blob for iterative
-# dev uploads. The device keeps using whatever is already in the font partition,
-# so a board must have been flashed once with a full build first.
-skip_font = any("WG_NO_EMBED_FONT" in str(f) for f in env.get("CPPDEFINES", []) + env.get("BUILD_FLAGS", []))
-assets = [a for a in build_assets.DEFAULT_ASSETS if not (skip_font and a[0] == build_assets.FONT_ASSET)]
-if skip_font:
-    print(f"[generate_assets] WG_NO_EMBED_FONT: omitting {build_assets.FONT_ASSET} from the blob")
-
-build_assets.build(project_dir, bin_path, assets)
-print(f"[generate_assets] assets.bin written ({os.path.getsize(bin_path):,} bytes)")
-
-# Embed an MD5 of assets.bin as a comment so CMake detects content changes
-# and recompiles the .S file whenever assets.bin is updated.
-with open(bin_path, "rb") as bf:
-    blob_hash = hashlib.md5(bf.read()).hexdigest()
-
-bin_path_escaped = bin_path.replace("\\", "/")
-asm = f"""\
-    /* assets_md5: {blob_hash} */
-    .section .rodata
-    .global _binary_assets_bin_start
-    .global _binary_assets_bin_end
-_binary_assets_bin_start:
-    .incbin \"{bin_path_escaped}\"
-_binary_assets_bin_end:
+The reader font ships as `[uint32 uncompressed size][zlib stream]`; it is
+inflated **here**, on the build machine, so the device never runs an inflate.
 """
-with open(asm_path, "w") as f:
-    f.write(asm)
-print(f"[generate_assets] assets_embedded.S written (blob md5={blob_hash})")
+
+Import("env")
+
+import os
+import struct
+import subprocess
+import sys
+import zlib
+
+PROJECT_DIR = env.subst("$PROJECT_DIR")
+BUILD_DIR = env.subst("$BUILD_DIR")
+
+# Must match platforms/esp32/default_16MB.csv.
+PARTITIONS = {
+    "font": (0xC90000, 0x080000),
+    "sleep": (0xD10000, 0x020000),
+}
+
+
+def _fail(msg):
+    sys.stderr.write("[assets] ERROR: %s\n" % msg)
+    env.Exit(1)
+
+
+def _write_if_changed(path, data):
+    """Avoid rewriting an identical image so esptool's own change detection and
+    the build's timestamps stay stable."""
+    if os.path.exists(path) and os.path.getsize(path) == len(data):
+        with open(path, "rb") as f:
+            if f.read() == data:
+                return False
+    os.makedirs(os.path.dirname(path), exist_ok=True)
+    with open(path, "wb") as f:
+        f.write(data)
+    return True
+
+
+def _check_fits(name, data):
+    _, size = PARTITIONS[name]
+    if len(data) > size:
+        _fail("%s image is %d bytes, partition is %d" % (name, len(data), size))
+
+
+# --- font: inflate the WGFS bundle on the host ------------------------------
+src = os.path.join(PROJECT_DIR, "resources", "AtkinsonHyperlegible.bin")
+with open(src, "rb") as f:
+    blob = f.read()
+if len(blob) < 8:
+    _fail("%s is too small to be a font bundle" % src)
+(raw_size,) = struct.unpack("<I", blob[:4])
+font = zlib.decompress(blob[4:])
+if len(font) != raw_size:
+    _fail("font size prefix says %d, inflated %d" % (raw_size, len(font)))
+if font[:4] != b"WGFS":
+    _fail("inflated font does not start with WGFS")
+_check_fits("font", font)
+
+# --- sleep: raw MGR2, copied verbatim ---------------------------------------
+src = os.path.join(PROJECT_DIR, "resources", "sleep.mgr")
+with open(src, "rb") as f:
+    sleep = f.read()
+if sleep[:4] != b"MGR2":
+    _fail("%s does not start with MGR2" % src)
+_check_fits("sleep", sleep)
+
+images = []
+for name, data in (("font", font), ("sleep", sleep)):
+    path = os.path.join(BUILD_DIR, "%s_partition.bin" % name)
+    changed = _write_if_changed(path, data)
+    offset, size = PARTITIONS[name]
+    print(
+        "[assets] %-5s 0x%06X  %7d bytes / %d partition%s"
+        % (name, offset, len(data), size, "  (rewritten)" if changed else "")
+    )
+    images.append((hex(offset), path))
+
+env.Append(FLASH_EXTRA_IMAGES=images)

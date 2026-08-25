@@ -3,19 +3,13 @@
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
-#include <ctime>
 
-#include "HeapLog.h"
 #include "content/CoverPaths.h"
 #include "content/BookIndex.h"
-#include "content/ImageDecoder.h"
-#include "screens/ListMenuScreen.h"
 
 #ifdef ESP_PLATFORM
 #include <dirent.h>
 #include <sys/stat.h>
-
-#include "esp_random.h"
 #else
 #include <filesystem>
 #endif
@@ -27,54 +21,59 @@ namespace fs = std::filesystem;
 
 namespace wintergreen {
 
+// The sleep cover is composed by the converter at exactly the panel size and
+// blitted 1:1. Nothing at runtime can adapt if the two disagree — the size
+// check in show_book_cover_sleep_ simply fails and the wordmark shows instead —
+// so the mismatch is caught here rather than on the glass. It said 800 once
+// (the panel hides 14 rows; app space is 786) and no cover ever appeared.
+static_assert(kSleepCoverW == DrawBuffer::kWidth, "sleep cover must be panel width");
+static_assert(kSleepCoverH == DrawBuffer::kHeight, "sleep cover must be panel height");
+
 void Application::start(DrawBuffer& buf, IRuntime& runtime) {
   ticks_ = 0;
   uptime_ms_ = 0;
-  buttons_ = ButtonState{};
   started_ = true;
   running_ = true;
 
-#ifdef ESP_PLATFORM
-  std::srand(esp_random());
-#else
-  std::srand(static_cast<unsigned>(std::time(nullptr)));
-#endif
 
   if (reader_font_)
     reader_.set_fonts(reader_font_);
 
+  // All of the possible menus!! There's only four, pretty much the bare minimum!
   home_.set_app(this);
   menu_.set_app(this);
   reader_.set_app(this);
-  reader_options_.set_app(this);
+  quickmenu_.set_app(this);
 
-
-  // Set up settings file path if data_dir_ is set
-  if (data_dir_)
-    settings_path_ = std::string(data_dir_) + "/settings";
 
   load_settings_();
 
-  // Apply persisted menu font size to all list screens.
-  ListMenuScreen::set_font_size(kMenuFontSize);
+  // Compile-time constant; pushed once here rather than on every frame.
+  buf.set_sunlight_fading_fix(config::kSunlightFadingFix);
+  buf.set_rotation(Rotation::Deg90);
 
-  buf.set_rotation(rotation_from_setting(rotate_display())); // rotaton
+  // Pick the root screen. With no books at all the carousel has nothing to show
+  // and its only useful action is "Back for all books", so start on the list
+  // instead — which is also where Sync lives, the one thing that can fix an
+  // empty library. MainMenu::on_back() then does nothing, because there is no
+  // home screen underneath to return to.
+  //
+  // The index has to be loaded here to answer that; both screens load it only
+  // when it is empty, so this costs nothing extra.
+  if (data_dir_ && BookIndex::instance().entries().empty())
+    BookIndex::instance().load(index_path_);
+  const bool empty_library = BookIndex::instance().entries().empty();
+  screen_mgr_.push(empty_library ? static_cast<IScreen*>(&menu_) : static_cast<IScreen*>(&home_), buf, runtime);
 
-  screen_mgr_.push(&home_, buf, runtime);
-
-  // Don't auto-open books from the hidden folder — they're meant to stay private.
+  // Don't auto-open books from the hidden folder
   if (!pending_book_path_.empty() && pending_book_path_.find("/.hidden/") != std::string::npos)
     pending_book_path_.clear();
 
-  // Auto-open last book if one was active at shutdown — but only if the font
-  // is valid. cache_only=true tells the reader not to convert if the MRB is
-  // missing; it will pop back to the book list instead of blocking the UI.
+  // Auto-open last book if one was active at shutdown
   if (!pending_book_path_.empty()) {
-    MR_LOGI("app", "auto-open: '%s'", pending_book_path_.c_str());
     if (reader_font_ && reader_font_->valid()) {
       auto_open_book(pending_book_path_.c_str(), buf, runtime);
     } else {
-      MR_LOGI("app", "skipping auto-open (no valid font) — starting from book list");
     }
     pending_book_path_.clear();
   }
@@ -91,60 +90,39 @@ void Application::auto_open_book(const char* epub_path, DrawBuffer& buf, IRuntim
   screen_mgr_.push(&reader_, buf, runtime);
 }
 
-// Scale-to-fit the most recent book's cover onto the sleep screen (white letterbox).
-// Returns true and does a full refresh if successful.
-// Draw `book_path`'s cover as the sleep screen. Returns false when the book has
-// no full-res cover, in which case the caller falls back to the wordmark image.
+// Show `book_path`'s cover as the sleep screen. Returns false when the book has
+// no usable cover_sleep.bin, in which case the caller falls back to the wordmark.
+//
+// The file is composed by tools/epub2wgb at exactly panel size, with the
+// artwork already scaled, centred and its letterbox bars already toned, so
+// there is nothing left to do here but stream it onto the panel a row at a
+// time. Anything of another size is from an older conversion and is ignored
+// rather than guessed at.
 static bool show_book_cover_sleep_(DrawBuffer& buf, const char* data_dir, const std::string& book_path) {
   if (!data_dir || book_path.empty()) return false;
 
-  // Load the pre-extracted full-res 1-bit cover for the sleep screen.
   const std::string cpath = cover_sleep_bin_path(book_path.c_str(), data_dir);
   FILE* f = std::fopen(cpath.c_str(), "rb");
   if (!f) return false;
 
   uint16_t hdr[2] = {};
-  if (std::fread(hdr, 2, 2, f) != 2) { std::fclose(f); return false; }
-  const int cw = static_cast<int>(hdr[0]);
-  const int ch = static_cast<int>(hdr[1]);
-  const size_t stride  = (static_cast<size_t>(cw) + 7) / 8;
-  const size_t data_sz = stride * static_cast<size_t>(ch);
-  if (cw <= 0 || ch <= 0 || data_sz == 0 || data_sz > 65536) { std::fclose(f); return false; }
-
-  std::vector<uint8_t> data(data_sz);
-  const bool ok = (std::fread(data.data(), 1, data_sz, f) == data_sz);
-  std::fclose(f);
-  if (!ok) return false;
-
-  // Scale-to-fit within W×H, preserving aspect ratio, white letterbox.
-  const int W = buf.width();
-  const int H = buf.height();
-  buf.fill(true);  // white background
-
-  int dst_w = W;
-  int dst_h = W * ch / cw;
-  if (dst_h > H) {
-    dst_h = H;
-    dst_w = H * cw / ch;
+  const int W = buf.width(), H = buf.height();
+  if (std::fread(hdr, 2, 2, f) != 2 || hdr[0] != W || hdr[1] != H) {
+    std::fclose(f);
+    return false;
   }
-  const int ox = (W - dst_w) / 2;
-  const int oy = (H - dst_h) / 2;
 
-  // Nearest-neighbour blit row-by-row.
-  uint8_t row_buf[80];
-  if ((dst_w + 7) / 8 > static_cast<int>(sizeof(row_buf))) return false;
-  for (int dy = 0; dy < dst_h; ++dy) {
-    const int sy = dy * ch / dst_h;
-    const uint8_t* src_row = data.data() + static_cast<size_t>(sy) * stride;
-    std::memset(row_buf, 0xFF, sizeof(row_buf));  // 1 = white
-    for (int dx = 0; dx < dst_w; ++dx) {
-      const int sx  = dx * cw / dst_w;
-      const int bit = (src_row[sx >> 3] >> (7 - (sx & 7))) & 1;
-      if (bit == 0)  // 0 = black pixel
-        row_buf[dx >> 3] &= static_cast<uint8_t>(~(0x80u >> (dx & 7)));
+  const int stride = (W + 7) / 8;
+  uint8_t row[(kSleepCoverW + 7) / 8];
+  if (stride > static_cast<int>(sizeof(row))) { std::fclose(f); return false; }
+  for (int y = 0; y < H; ++y) {
+    if (std::fread(row, 1, stride, f) != static_cast<size_t>(stride)) {
+      std::fclose(f);
+      return false;  // truncated: whatever reached the buffer is discarded unrefreshed
     }
-    buf.blit_1bit_row(ox, oy + dy, row_buf, dst_w);
+    buf.blit_1bit_row(0, y, row, W);
   }
+  std::fclose(f);
 
   buf.full_refresh(RefreshMode::Full, /*turnOffScreen=*/true);
   buf.deep_sleep();
@@ -187,9 +165,8 @@ void Application::do_sleep_(DrawBuffer& buf, bool wordmark_image) {
   if (!cover_book.empty())
     shown = show_book_cover_sleep_(buf, data_dir_, cover_book);
   if (!shown)
-    shown = buf.show_sleep_image_embedded(show_sleep_text());
+    shown = buf.show_sleep_image_embedded();
 
-  MR_LOGI("sleep", "sleep screen shown: %d (wordmark=%d)", (int)shown, (int)wordmark_image);
   if (!shown)
     buf.deep_sleep();
 
@@ -204,34 +181,95 @@ void Application::update(const ButtonState& buttons, uint32_t dt_ms, DrawBuffer&
 
   ++ticks_;
   uptime_ms_ += dt_ms;
-  buttons_ = buttons;
-  buf.set_sunlight_fading_fix(sunlight_fading_fix());
+
+  // Dynamic frequency scaling: hold the CPU at 160 MHz while the UI is working,
+  // let it idle at 80 MHz otherwise. Page layout and drawing take no PM lock of
+  // their own — no driver is involved — so without this a page turn would run at
+  // the idle clock. The hold is raised on any button activity and dropped after
+  // kPerfHoldMs of quiet, which comfortably outlasts a page turn.
+  static constexpr uint32_t kPerfHoldMs = 750;
+  if (buttons.current != 0 || buttons.pressed_latch != 0 || has_pending_transition()) {
+    perf_idle_ms_ = 0;
+    runtime.set_performance_hold(true);
+  } else if (perf_idle_ms_ < kPerfHoldMs) {
+    perf_idle_ms_ += dt_ms;
+    if (perf_idle_ms_ >= kPerfHoldMs)
+      runtime.set_performance_hold(false);
+  }
+
+
+  // Low-battery cutoff. Deep-discharging a Li-ion cell below ~3.0 V costs it
+  // permanent capacity, so the device puts itself away before it gets there and
+  // main.cpp refuses to boot again until it has been charged.
+  //
+  // This is dangerous code: a false positive makes the device look bricked, and
+  // it shipped once with three faults that together did exactly that. Anything
+  // that changes it must preserve all five guards below.
+  //
+  //   1. A zero reading means "cannot measure" and is ignored.
+  //   2. So is anything below kImplausibleMv — a broken ADC reads near zero, and
+  //      a cell that far gone is past the protection IC anyway.
+  //   3. The low reading must persist for kLowBatteryHoldMs of *wall time*, not
+  //      a frame count. This originally required five frames — about 125 ms,
+  //      shorter than a single e-ink refresh, which is the largest current spike
+  //      the device has and drags the rail down with it.
+  //   4. It never samples while the panel is mid-refresh, for the same reason.
+  //   5. USB bypasses it, which is the recovery path. That check must be a real
+  //      one — see usb_attached() in main.cpp for how getting it wrong stranded
+  //      the device even while plugged in.
+  //   6. It samples once a second, not once a frame. The cell cannot move in
+  //      25 ms, and an ADC conversion plus its calibration curve is real work to
+  //      repeat 40 times a second for an answer that never changes.
+  if (kLowBatteryCutoffMv > 0 && !usb_powered_ && !buf.display().is_busy()) {
+    static constexpr int kImplausibleMv = 2500;
+    static constexpr uint32_t kBatteryPollMs = 1000;
+    battery_poll_ms_ += dt_ms;
+    if (battery_poll_ms_ >= kBatteryPollMs) {
+      const uint32_t elapsed = battery_poll_ms_;
+      battery_poll_ms_ = 0;
+      const int mv = runtime.battery_millivolts();
+      if (mv >= kImplausibleMv && mv < kLowBatteryCutoffMv) {
+        // Charge the *measured* interval, so the hold stays wall-clock even
+        // though the sampling is coarse.
+        low_battery_ms_ += elapsed;
+        if (low_battery_ms_ >= kLowBatteryHoldMs) {
+          do_sleep_(buf, /*wordmark_image=*/true);
+          return;
+        }
+      } else {
+        low_battery_ms_ = 0;
+      }
+    }
+  }
+  // Cleared every frame; main.cpp re-asserts it via keep_awake() while a host is
+  // attached, so unplugging re-arms both the cutoff and auto-sleep.
+  usb_powered_ = false;
 
   // Inactivity / auto-sleep tracking
-  if (buttons_.current != 0 || buttons_.pressed_latch != 0) {
+  if (buttons.current != 0 || buttons.pressed_latch != 0) {
     inactivity_ms_ = 0;
   } else {
     inactivity_ms_ += dt_ms;
-    if (sleep_timeout_min() > 0) {
-      const uint32_t timeout_ms = static_cast<uint32_t>(sleep_timeout_min()) * 60u * 1000u;
+    if (config::kAutoSleepMinutes > 0) {
+      const uint32_t timeout_ms = static_cast<uint32_t>(config::kAutoSleepMinutes) * 60u * 1000u;
       if (inactivity_ms_ >= timeout_ms) {
-        MR_LOGI("app", "auto-sleep after %u ms idle", inactivity_ms_);
         do_sleep_(buf);
         return;
       }
     }
   }
 
+
   // Power button: hold to sleep, tap to select. The tap resolves on release —
   // the only way to tell it apart from a hold — and is forwarded to the screen
   // as a synthetic Button1 (Confirm) press, so screens need no power handling.
-  ButtonState fwd = buttons_;
-  if (buttons_.is_pressed(Button::Power)) {
+  ButtonState fwd = buttons;
+  if (buttons.is_pressed(Button::Power)) {
     power_armed_ = true;
     power_hold_ms_ = 0;
-  } else if (power_armed_ && buttons_.is_down(Button::Power)) {
+  } else if (power_armed_ && buttons.is_down(Button::Power)) {
     power_hold_ms_ += dt_ms;
-    if (power_hold_ms_ >= power_hold_sleep_ms()) {
+    if (power_hold_ms_ >= config::kHoldDelayMs) {
       power_armed_ = false;
       do_sleep_(buf);
       return;
@@ -258,17 +296,11 @@ void Application::update(const ButtonState& buttons, uint32_t dt_ms, DrawBuffer&
   if (top) {
     top->update(fwd, buf, runtime);
 
-    if (!font_warning_shown_ && font_manager_ && font_manager_->any_corrupt()) {
-      font_warning_shown_ = true;
-      MR_LOGI("app", "font glyphs out of bounds — font file may be corrupt");
-    }
-
     // Process pending navigation (queued by screens via push_screen/replace_screen).
     if (pending_replace_ != ScreenId::None) {
       ScreenId id = pending_replace_;
       pending_replace_ = ScreenId::None;
-      screen_mgr_.pop(buf, runtime);
-      screen_mgr_.push(screen_for_(id), buf, runtime);
+      screen_mgr_.replace(screen_for_(id), buf, runtime);
       buf.refresh();
     } else if (pending_push_ != ScreenId::None) {
       ScreenId id = pending_push_;
@@ -278,31 +310,37 @@ void Application::update(const ButtonState& buttons, uint32_t dt_ms, DrawBuffer&
     } else if (pending_pop_count_ > 0) {
       int count = pending_pop_count_;
       pending_pop_count_ = 0;
-      if (top == &reader_ || top == &reader_options_) {
-        buf.wait_panel_idle();  // SD write; the panel may still be mid-refresh
-        save_settings_();
-      }
+      const bool was_reader_stack = (top == &reader_ || top == &quickmenu_);
+      if (was_reader_stack)
+        buf.wait_panel_idle();  // the pop writes the card; the panel may still be mid-refresh
       screen_mgr_.pop(count, buf, runtime);
+      // Settings are saved *after* the pop, not before. save_settings_() writes
+      // book_path only while the reader is still on the stack, so saving first
+      // persisted "resume this book" for a book the user had just closed — and
+      // then had to be rewritten without it at the next sleep. One write, and
+      // the right contents.
+      if (was_reader_stack)
+        save_settings_();
       buf.refresh();
     }
   }
-}  // namespace wintergreen
+}
 
-IScreen* wintergreen::Application::screen_for_(ScreenId id) {
+IScreen* Application::screen_for_(ScreenId id) {
   switch (id) {
     case ScreenId::MainMenu:
       return &menu_;
     case ScreenId::Reader:
       return &reader_;
-    case ScreenId::ReaderOptions:
-      return &reader_options_;
+    case ScreenId::Quickmenu:
+      return &quickmenu_;
     case ScreenId::HomeScreen:
       return &home_;
     default:
       return nullptr;
   }
 }
-void wintergreen::Application::save_settings_() {
+void Application::save_settings_() {
   if (settings_path_.empty())
     return;
 
@@ -348,44 +386,48 @@ void wintergreen::Application::save_settings_() {
 }
 
 
-void wintergreen::Application::record_book_opened(const std::string& path) {
-  BookIndex::instance().mark_opened(path);
-  if (data_dir_) {
-    std::string index_path = std::string(data_dir_) + "/book_index.dat";
-    BookIndex::instance().save(index_path);
-  }
-  save_settings_();
-}
-void wintergreen::Application::record_book_progress(const std::string& path, int pct) {
-  if (!data_dir_ || path.empty())
-    return;
-  const std::string index_path = std::string(data_dir_) + "/book_index.dat";
-  BookIndex& idx = BookIndex::instance();
-  // MainMenu::stop() clears the in-memory entries, so the reader usually closes
-  // with nothing loaded — reload first or the save would truncate the file.
-  bool reloaded = false;
-  if (idx.entries().empty()) {
-    if (!idx.load(index_path))
-      return;
-    reloaded = true;
-  }
-  idx.set_progress(path, pct);
-  idx.save(index_path);
-  if (reloaded)
-    idx.clear_entries();
+void Application::release_index_for_radio() {
+  // The reading position is already on disk (ReaderScreen writes .pos on close)
+  // and settings are saved on sleep, so nothing here is the only copy.
+  BookIndex::instance().release_memory();
 }
 
-void wintergreen::Application::load_settings_() {
+void Application::record_book_opened(const std::string& path) {
+  // In-memory only. Neither file is written here.
+  //
+  // The index goes out once a session, when the reader closes and
+  // record_book_progress() runs. Settings used to be written here too, purely so
+  // that a reboot resumed this book — but every ordinary way of putting the
+  // device down (power button, auto-sleep) routes through do_sleep_(), which
+  // saves settings anyway. The write here only mattered when power was lost
+  // without sleeping, and it bought that case an SD write on *every* book open.
+  // `.pos` is written at close for the same reason, so a hard power loss already
+  // resumes at the position you started from.
+  BookIndex::instance().mark_opened(path);
+}
+void Application::record_book_progress(const std::string& path, int pct) {
+  if (!data_dir_ || path.empty())
+    return;
+  BookIndex& idx = BookIndex::instance();
+  // The index stays resident for the whole session (see MainMenu::stop), so the
+  // reload-then-re-clear dance this used to do — to avoid save() truncating the
+  // file when nothing was loaded — is gone. An empty index here means no book
+  // was ever indexed, and saving that would be the truncation it guarded against.
+  if (idx.entries().empty())
+    return;
+  idx.set_progress(path, pct);
+  idx.save(index_path_);
+}
+
+void Application::load_settings_() {
   if (settings_path_.empty())
     return;
   FILE* f = std::fopen(settings_path_.c_str(), "r");
   if (!f) {
-    // Power was lost between the remove() and the rename() in save_settings_.
+    // Power was lost between the remove() and the rename() in save_settings_
     // The .tmp is a complete file, so prefer it to starting from defaults.
     const std::string tmp_path = settings_path_ + ".tmp";
     f = std::fopen(tmp_path.c_str(), "r");
-    if (f)
-      MR_LOGI("app", "settings: recovered from %s", tmp_path.c_str());
   }
   if (!f)
     return;
@@ -405,17 +447,14 @@ void wintergreen::Application::load_settings_() {
     if (std::sscanf(line, "book_path=%511[^\n]", sval) == 1)
       last_book_path = sval;
     else if (std::sscanf(line, "font_size=%u", &uval) == 1)
-      rs.font_size_idx = uval < kMaxFontSizes ? static_cast<uint8_t>(uval) : 1;
+      rs.font_size_idx = uval < ReaderSettings::kNumFontSizePresets ? static_cast<uint8_t>(uval) : 1;
     else if (std::sscanf(line, "rotate_reader=%u", &uval) == 1)
       rotate_reader_ = static_cast<uint8_t>(uval == 1 ? 1 : 0);
   }
   std::fclose(f);
 
-  MR_LOGI("app", "Loaded settings: font_size=%u", rs.font_size_idx);
 
-
-  // Store the book to auto-open; actual push happens in start() after buf is ready.
-  pending_book_path_ = last_book_path;
+  pending_book_path_ = last_book_path; // to open
 }
 
 bool Application::running() const {

@@ -40,7 +40,7 @@ class HomeScreen final : public ListMenuScreen {
     std::string title;
     std::string author;
     std::string bin_path;
-    std::string sleep_path;
+    std::string home_path;   // exact-fit, blitted 1:1 (see kHomeCoverW in CoverPaths.h)
   };
 
   BookSlot slots_[kMaxBooks];

@@ -7,7 +7,6 @@
 
 namespace wintergreen {
 
-void run_loop(Application& app, DrawBuffer& buf, IInputSource& input, IRuntime& runtime);
 void run_loop_iteration(Application& app, DrawBuffer& buf, IInputSource& input, IRuntime& runtime);
 
 }  // namespace wintergreen

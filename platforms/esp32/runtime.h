@@ -1,21 +1,22 @@
-﻿#pragma once
+#pragma once
 
-#include <algorithm>
-#include <cmath>
+#include <cstdint>
+#include <optional>
 
 #include "esp_adc/adc_cali.h"
 #include "esp_adc/adc_cali_scheme.h"
 #include "esp_adc/adc_oneshot.h"
+#include "esp_pm.h"
+#include "esp_system.h"
 #include "esp_timer.h"
 #include "freertos/FreeRTOS.h"
 #include "freertos/task.h"
 #include "hal/adc_types.h"
-#include "wintergreen/Input.h"
 #include "wintergreen/Runtime.h"
 
-// Assuming battery is connected to ADC1 channel for GPIO0
-// Usually GPIO0 maps to ADC1_CHANNEL_0 on ESP32-C3
-// But you may need to adjust the exact channel or unit if different
+#include "bluetooth_clicker.h"
+
+// Battery sense sits on GPIO0 = ADC1 channel 0, behind a 2:1 divider.
 #define BATTERY_ADC_CHANNEL ADC_CHANNEL_0
 
 class Esp32Runtime final : public wintergreen::IRuntime {
@@ -23,6 +24,7 @@ class Esp32Runtime final : public wintergreen::IRuntime {
   explicit Esp32Runtime(uint32_t frame_time_ms, adc_oneshot_unit_handle_t adc_handle)
       : target_frame_ms_(frame_time_ms), last_frame_ms_(frame_time_ms), frame_start_ms_(0), adc1_handle_(adc_handle) {
     init_battery_adc();
+    init_pm_();
   }
 
   ~Esp32Runtime() override {
@@ -31,9 +33,6 @@ class Esp32Runtime final : public wintergreen::IRuntime {
     }
   }
 
-  bool should_continue() const override {
-    return true;
-  }
 
   // Measured duration of the last frame, not the target — Application uses it as
   // dt for the auto-sleep countdown, which drifts if the nominal value is returned.
@@ -56,50 +55,118 @@ class Esp32Runtime final : public wintergreen::IRuntime {
     frame_start_ms_ = frame_end;
   }
 
-  std::optional<uint8_t> battery_percentage() const override {
+  // Battery terminal voltage in millivolts, or 0 if it cannot be read.
+  // Everything else derives from this: percentage for the header, and the
+  // low-battery cutoff.
+  int battery_millivolts() const override {
     if (!adc1_handle_)
-      return std::nullopt;
-
+      return 0;
     int adc_raw = 0;
-    if (adc_oneshot_read(adc1_handle_, BATTERY_ADC_CHANNEL, &adc_raw) != ESP_OK) {
-      return std::nullopt;
-    }
-
+    if (adc_oneshot_read(adc1_handle_, BATTERY_ADC_CHANNEL, &adc_raw) != ESP_OK)
+      return 0;
     int voltage_mv = 0;
-    if (adc_cali_handle_) {
+    if (adc_cali_handle_)
       adc_cali_raw_to_voltage(adc_cali_handle_, adc_raw, &voltage_mv);
-    } else {
-      // Fallback or handle differently if uncalibrated
-      voltage_mv = adc_raw;
-    }
+    else
+      return 0;  // uncalibrated: a wrong voltage here would strand the device
+    return voltage_mv * 2;  // voltage divider
+  }
 
-    float millivolts = voltage_mv * 2.0f;  // Voltage divider multiplier
+  std::optional<uint8_t> battery_percentage() const override {
+    const int mv_i = battery_millivolts();
+    if (mv_i == 0)
+      return std::nullopt;
+    const int64_t mv = mv_i;
 
-    double volts = millivolts / 1000.0;
-    // Polynomial derived from LiPo samples
-    double y = -144.9390 * volts * volts * volts + 1655.8629 * volts * volts - 6158.8520 * volts + 7501.3202;
-
-    // Clamp to [0,100] and round
-    y = std::max(y, 0.0);
-    y = std::min(y, 100.0);
-    y = std::round(y);
+    // Percent = -144.9390·v³ + 1655.8629·v² - 6158.8520·v + 7501.3202, v in volts,
+    // from LiPo discharge samples. Evaluated in int64 rather than double: the C3
+    // has no FPU, so the original expression pulled the soft-double library into
+    // flash and ran it on every redraw. Coefficients are scaled by 1e4 and v by
+    // 1e3, so the sum carries 1e13; the worst-case term is ~3e17, well inside
+    // int64. The result is bit-comparable to the float version at the one-percent
+    // resolution it is displayed at.
+    constexpr int64_t kScale = 10000000000000LL;  // 1e13
+    const int64_t n = -1449390LL * mv * mv * mv
+                    + 16558629000LL * mv * mv
+                    - 61588520000000LL * mv
+                    + 75013202000000000LL;
+    int pct = static_cast<int>((n + kScale / 2) / kScale);  // round to nearest
+    if (pct < 0)
+      pct = 0;
+    else if (pct > 100)
+      pct = 100;
 
     // Hysteresis: only update the displayed value when the new reading differs
-    // by more than kHysteresisPercent from the last displayed value.  This
-    // prevents voltage noise causing the indicator to flicker between adjacent
-    // percentages when switching screens.
-    const int new_pct = static_cast<int>(y);
-    if (!last_pct_.has_value() || std::abs(new_pct - static_cast<int>(last_pct_.value())) >= kHysteresisPercent) {
-      last_pct_ = static_cast<uint8_t>(new_pct);
-    }
+    // by at least kHysteresisPercent. Without it, voltage noise flickers the
+    // indicator between adjacent percentages every time a screen redraws.
+    const int shown = last_pct_.has_value() ? static_cast<int>(*last_pct_) : 0;
+    const int delta = pct > shown ? pct - shown : shown - pct;
+    if (!last_pct_.has_value() || delta >= kHysteresisPercent)
+      last_pct_ = static_cast<uint8_t>(pct);
     return last_pct_;
   }
 
-  void yield() override {
-    vTaskDelay(1);  // 1 tick (10ms at 100Hz); pdMS_TO_TICKS(1) rounds to 0
+
+  // Dynamic frequency scaling. The lock is held only while the UI is working;
+  // see IRuntime::set_performance_hold for why layout needs it explicitly.
+  void set_performance_hold(bool on) override {
+    if (!pm_lock_ || on == pm_held_)
+      return;
+    if (on)
+      esp_pm_lock_acquire(pm_lock_);
+    else
+      esp_pm_lock_release(pm_lock_);
+    pm_held_ = on;
+  }
+
+  // BLE page-turner clicker. Both are thin: the state machine and every BLE
+  // call live in bluetooth_clicker.h, and compile away completely when no MAC
+  // is configured.
+  wintergreen::ClickerState clicker_state() const override {
+    return wg_clicker::state();
+  }
+  void toggle_clicker() override {
+    wg_clicker::toggle();
+  }
+  int clicker_status_code() const override {
+    return wg_clicker::status_code();
+  }
+
+  // Only the abnormal causes. POWERON/SW/DEEPSLEEP/USB/JTAG are the ordinary
+  // ways this device restarts and would just be noise on screen.
+  //   4 PANIC   5 INT_WDT   6 TASK_WDT   7 WDT   9 BROWNOUT
+  int last_reset_reason() const override {
+    switch (esp_reset_reason()) {
+      case ESP_RST_PANIC:
+      case ESP_RST_INT_WDT:
+      case ESP_RST_TASK_WDT:
+      case ESP_RST_WDT:
+      case ESP_RST_BROWNOUT:
+        return static_cast<int>(esp_reset_reason());
+      default:
+        return 0;
+    }
   }
 
  private:
+  // Dynamic frequency scaling. Note this is the only thing in the tree whose
+  // behaviour differs between USB-attached and battery, because the
+  // USB Serial/JTAG driver holds a PM lock that pins the clock — so a DFS fault
+  // is invisible on USB and appears only on battery. Test on battery.
+  void init_pm_() {
+    esp_pm_config_t cfg{};
+    cfg.max_freq_mhz = 160;
+    // Never below 80: APB follows the CPU clock on the C3, and the SD-over-SPI
+    // timing has no margin left at 20 MHz as it is.
+    cfg.min_freq_mhz = 80;
+    // Automatic light sleep breaks the ADC-ladder buttons — see sdkconfig.defaults.
+    cfg.light_sleep_enable = false;
+    if (esp_pm_configure(&cfg) != ESP_OK)
+      return;
+    if (esp_pm_lock_create(ESP_PM_CPU_FREQ_MAX, 0, "ui", &pm_lock_) != ESP_OK)
+      pm_lock_ = nullptr;
+  }
+
   void init_battery_adc() {
     // Configuration for ESP32-C3 ADC1 Channel 0 (GPIO0)
     adc_oneshot_chan_cfg_t config = {
@@ -134,5 +201,7 @@ class Esp32Runtime final : public wintergreen::IRuntime {
   uint32_t frame_start_ms_;
   adc_oneshot_unit_handle_t adc1_handle_ = nullptr;
   adc_cali_handle_t adc_cali_handle_ = nullptr;
+  esp_pm_lock_handle_t pm_lock_ = nullptr;
+  bool pm_held_ = false;
   mutable std::optional<uint8_t> last_pct_;
 };

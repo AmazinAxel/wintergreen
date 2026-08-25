@@ -1,19 +1,17 @@
-﻿#include <cstdio>
+#include <cstdio>
 
-#include "asset_blob.h"
 #include "driver/gpio.h"
 #include "driver/usb_serial_jtag.h"
 #include "epd.h"
 #include "esp_heap_caps.h"
-#include "esp_log.h"
 #include "esp_ota_ops.h"
 #include "esp_sleep.h"
 #include "esp_system.h"
 #include "esp_timer.h"
 #include "font_manager.h"
 #include "input.h"
+#include "WintergreenConfig.h"
 #include "wintergreen/Application.h"
-#include "wintergreen/HeapLog.h"
 #include "wintergreen/Loop.h"
 #include "wintergreen/content/BookIndex.h"
 #include "wintergreen/display/DrawBuffer.h"
@@ -39,16 +37,29 @@ static void verify_ota() {
 static constexpr gpio_num_t kPowerPin = GPIO_NUM_3;
 static constexpr uint32_t kPowerWakeupMs = 250;
 
+// True when a USB host is attached.
+//
+// This asks the USB Serial/JTAG peripheral directly. It used to read GPIO20
+// (U0RXD) and call a high level "USB connected", which is only true behind an
+// external UART bridge — the X4 uses the C3's *native* USB, so GPIO20 never goes
+// high and the check always answered "no host". That was harmless while it only
+// decided whether to require a wake-hold, and became a device-bricking bug the
+// moment the battery cutoff used it to decide whether it was safe to sleep.
+//
+// Safe to call before usb_serial_jtag_driver_install(); it reads peripheral
+// state, not driver state.
+static bool usb_attached() {
+  return usb_serial_jtag_is_connected();
+}
+
 static void verify_wakeup_press() {
-  // If USB is connected (GPIO20/U0RXD reads HIGH), boot immediately.
-  gpio_set_direction(GPIO_NUM_20, GPIO_MODE_INPUT);
-  if (gpio_get_level(GPIO_NUM_20) == 1)
+  // If USB is connected, boot immediately.
+  if (usb_attached())
     return;
 
   // Only require a hold check on a clean power-on (battery, no USB).
-  // Crashes, panics, watchdog resets, SW resets â€” all boot immediately.
+  // Crashes, panics, watchdog resets, SW resets — all boot immediately.
   if (esp_reset_reason() != ESP_RST_POWERON) {
-    ESP_LOGI("pwr", "Non-poweron reset (%d) â€” booting immediately", (int)esp_reset_reason());
     return;
   }
 
@@ -60,7 +71,7 @@ static void verify_wakeup_press() {
   cfg.intr_type = GPIO_INTR_DISABLE;
   gpio_config(&cfg);
 
-  // Wait up to 2Ã— the threshold; if the button isn't held long enough, sleep.
+  // Wait up to 2× the threshold; if the button isn't held long enough, sleep.
   const uint32_t deadline_ms = kPowerWakeupMs * 2;
   uint32_t held_ms = 0;
   for (uint32_t elapsed = 0; elapsed < deadline_ms; elapsed += 10) {
@@ -68,14 +79,50 @@ static void verify_wakeup_press() {
     if (gpio_get_level(kPowerPin) == 0) {
       held_ms += 10;
       if (held_ms >= kPowerWakeupMs)
-        return;  // confirmed long press â€” boot normally
+        return;  // confirmed long press — boot normally
     } else {
       held_ms = 0;  // button released, reset counter
     }
   }
 
-  // Short press â€” go back to sleep; wake again on power button press.
-  ESP_LOGI("pwr", "Short press on wakeup (held %lu ms) â€” returning to sleep", (unsigned long)held_ms);
+  // Short press — go back to sleep; wake again on power button press.
+  esp_sleep_enable_gpio_wakeup_on_hp_periph_powerdown(1ULL << kPowerPin, ESP_GPIO_WAKEUP_GPIO_LOW);
+  esp_deep_sleep_start();
+}
+
+
+
+// Refuse to come up on a flat cell.
+//
+// Application::update puts the device to sleep once the battery has been below
+// kLowBatteryCutoffMv for a few seconds, and this is what stops the next power
+// button press bringing it straight back — booting far enough to power the panel
+// and mount the card would take the cell lower still.
+//
+// Charging is the way out. The charger IC works whether or not the SoC is
+// running, so a cut-off device left on USB recovers on its own; and this check
+// is skipped outright while a host is attached, so plugging in always gives a
+// bootable device to flash. It runs before epd.begin(), so a refused boot never
+// lights the panel.
+//
+// A reading of zero (cannot measure) or an implausibly low one is treated as
+// "fine": stranding a device because it cannot read its own battery would be
+// worse than the discharge it is trying to prevent.
+static void verify_battery(const Esp32Runtime& runtime) {
+  if (wintergreen::kLowBatteryCutoffMv == 0 || usb_attached())
+    return;
+  static constexpr int kImplausibleMv = 2500;
+  int worst = 0;
+  for (int i = 0; i < 8; ++i) {
+    const int mv = runtime.battery_millivolts();
+    if (mv < kImplausibleMv)
+      return;
+    if (worst == 0 || mv < worst)
+      worst = mv;
+    vTaskDelay(pdMS_TO_TICKS(25));
+  }
+  if (worst >= wintergreen::kLowBatteryCutoffMv)
+    return;
   esp_sleep_enable_gpio_wakeup_on_hp_periph_powerdown(1ULL << kPowerPin, ESP_GPIO_WAKEUP_GPIO_LOW);
   esp_deep_sleep_start();
 }
@@ -84,10 +131,6 @@ extern "C" void app_main(void) {
   verify_ota();
   verify_wakeup_press();
 
-  // Initialise the appended asset blob (fonts, sleep images, ...).
-  // Must happen before FontManager::init() and any sleep-image rendering.
-  asset_blob::g_assets.init();
-
   static Esp32InputSource input;
   static EInkDisplay epd;
   // 25 ms UI frame (40 Hz) — see CLAUDE.md "Idle power" for the timing rationale.
@@ -95,62 +138,38 @@ extern "C" void app_main(void) {
   static wintergreen::Application app;
   static wintergreen::DrawBuffer buf(epd);
 
-  // After a software reset (post-flash) wait briefly for the serial monitor.
-  if (esp_reset_reason() == ESP_RST_SW) {
-    vTaskDelay(pdMS_TO_TICKS(3000));
-  }
+  // Before anything touches the panel or the card.
+  verify_battery(runtime);
 
-  // --- Memory audit: log heap at every stage ---
-  ESP_LOGI("mem", "after static init (DrawBuffer+App etc): free=%lu largest=%lu",
-           (unsigned long)esp_get_free_heap_size(), (unsigned long)heap_caps_get_largest_free_block(MALLOC_CAP_8BIT));
-
-  MR_LOGI("app", "Booting up...");
+  // The sleep image is a raw partition written by esptool, so this is an mmap
+  // and nothing else — no copy, no inflate, no SD access on the sleep path.
+  static RawPartition sleep_part;
+  if (sleep_part.map("sleep"))
+    buf.set_sleep_image(sleep_part.data, sleep_part.size);
 
   epd.begin();
 
-  ESP_LOGI("mem", "after epd.begin: free=%lu largest=%lu", (unsigned long)esp_get_free_heap_size(),
-           (unsigned long)heap_caps_get_largest_free_block(MALLOC_CAP_8BIT));
-
-  // Mount SD card (shares SPI bus with display).
+  // Mount the SD card (shares SPI2 with the display).
   if (sd_init()) {
-    MR_LOGI("app", "SD card ready");
-
-    ESP_LOGI("mem", "after sd_init: free=%lu largest=%lu", (unsigned long)esp_get_free_heap_size(),
-             (unsigned long)heap_caps_get_largest_free_block(MALLOC_CAP_8BIT));
-
-    // Data directory for converted books, settings, reading state.
-    mkdir("/sdcard/.wintergreen", 0775);
-
-    // Register the books directory for the selection screen.
+    // State lives in two dotfiles at the card root — see set_state_root.
     app.set_books_dir("/sdcard");
-    app.set_data_dir("/sdcard/.wintergreen");
-  } else {
-    MR_LOGI("app", "SD card not available");
+    app.set_state_root("/sdcard");
   }
-
-  serial_start();
-
-  ESP_LOGI("mem", "after serial_start: free=%lu largest=%lu", (unsigned long)esp_get_free_heap_size(),
-           (unsigned long)heap_caps_get_largest_free_block(MALLOC_CAP_8BIT));
 
   static FontManager font_mgr(app);
   font_mgr.init();
   app.set_font_manager(&font_mgr);
 
-  ESP_LOGI("mem", "after font init: free=%lu largest=%lu", (unsigned long)esp_get_free_heap_size(),
-           (unsigned long)heap_caps_get_largest_free_block(MALLOC_CAP_8BIT));
-
   app.start(buf, runtime);
-
-  ESP_LOGI("mem", "after app.start: free=%lu largest=%lu", (unsigned long)esp_get_free_heap_size(),
-           (unsigned long)heap_caps_get_largest_free_block(MALLOC_CAP_8BIT));
 
   // Discard the power-button press that woke us from deep sleep.
   input.clear_button(wintergreen::Button::Power);
 
-  while (runtime.should_continue() && app.running()) {
-    // Suppress auto-sleep while a PC is connected over USB.
+  while (app.running()) {
+    // A host is attached: bring the serial receiver up (once) and hold off
+    // auto-sleep for as long as it stays attached.
     if (usb_serial_jtag_is_connected()) {
+      serial_start_if_connected();
       app.keep_awake();
     }
 
@@ -159,7 +178,7 @@ extern "C" void app_main(void) {
     // is the producer, this loop is the consumer.
     //
     // Deferral rules:
-    //   (A) Add/Rename ops use scratch buffers (Book::open) â€” defer when
+    //   (A) Add/Rename ops use scratch buffers (Book::open) — defer when
     //       Reader is the top screen (it owns those buffers for rendering).
     //   (C) ALL ops do SD card I/O (fopen/fprintf in save/load) which shares
     //       SPI2_HOST with the display. Defer when the EPD hardware is
@@ -172,14 +191,11 @@ extern "C" void app_main(void) {
       const bool epd_busy = epd.is_busy();
       const bool defer = (needs_scratch && reader_active) || epd_busy;
 
-      ESP_LOGI("main", "index_op: op=%u needs_scratch=%d reader_active=%d epd_busy=%d defer=%d",
-               (unsigned)op, (int)needs_scratch, (int)reader_active, (int)epd_busy, (int)defer);
-
       if (defer) {
         // Leave the slot occupied; retry next iteration. The main loop
         // continues to run (UI updates, serial commands) between retries.
       } else {
-        // Copy paths to locals BEFORE clearing the slot â€” minimizes the window
+        // Copy paths to locals BEFORE clearing the slot — minimizes the window
         // in which a new op would be dropped.
         char path_a[256];
         char path_b[256];
@@ -189,24 +205,19 @@ extern "C" void app_main(void) {
         path_b[sizeof(path_b) - 1] = '\0';
         g_index_op = SerialIndexOp::None;  // free slot before processing
 
-        constexpr const char* kDataDir = "/sdcard/.wintergreen";
-        const std::string index_path = std::string(kDataDir) + "/book_index.dat";
+        const std::string& index_path = app.index_path();
         switch (op) {
           case SerialIndexOp::Add:
-            if (!wintergreen::BookIndex::instance().index_file(path_a, index_path, buf))
-              ESP_LOGW("main", "index_file failed for %s", path_a);
-            buf.reset_after_scratch();
+            (void)wintergreen::BookIndex::instance().index_file(path_a, index_path);
             break;
           case SerialIndexOp::Remove:
             wintergreen::BookIndex::instance().remove_path(path_a, index_path);
             break;
           case SerialIndexOp::Rename:
             // Fast path: in-place rename preserves metadata + last_open_order.
-            // Fallback: src wasn't indexed â†’ index dst fresh (extracts metadata).
+            // Fallback: src wasn't indexed → index dst fresh (extracts metadata).
             if (!wintergreen::BookIndex::instance().rename_in_place(path_a, path_b, index_path)) {
-              if (wintergreen::BookIndex::instance().index_file(path_b, index_path, buf))
-                ESP_LOGI("main", "rename_in_place missed %s, indexed %s instead", path_a, path_b);
-              buf.reset_after_scratch();
+              (void)wintergreen::BookIndex::instance().index_file(path_b, index_path);
             }
             break;
           default:
@@ -215,49 +226,16 @@ extern "C" void app_main(void) {
       }
     }
 
-    // Check if a new grayscale LUT was uploaded via serial.
-    uint8_t lut_buf[112];
-    uint8_t lut_type = 0;
-    if (serial_lut_take(lut_buf, &lut_type)) {
-      switch (lut_type) {
-        case 0:
-          epd.set_grayscale_lut(lut_buf);
-          ESP_LOGI("epd", "Custom grayscale LUT set via serial (type=0)");
-          break;
-        case 1:
-          epd.set_grayscale_revert_lut(lut_buf);
-          ESP_LOGI("epd", "Custom grayscale REVERT LUT set via serial (type=1)");
-          break;
-        default:
-          ESP_LOGI("epd", "Received LUT with unknown type %u", lut_type);
-          break;
-      }
-    }
-
-    // Dispatch serial path commands (open book, benchmarks).
+    // Dispatch serial path commands.
     {
       const char* cmd_path = nullptr;
-      switch (serial_cmd_take(&cmd_path)) {
-        case SerialCmdType::Open:
-          app.auto_open_book(cmd_path, buf, runtime);
-          // auto_open_book pushes the Reader and renders the page into the
-          // inactive buffer, but does not commit it. We must refresh here to
-          // show the book page on the display (the Application::start() path
-          // has its own buf.full_refresh() after auto_open_book returns).
-          buf.refresh();
-          break;
-        case SerialCmdType::FlashBench: {
-          // Use scratch_buf1 (48 KB) as the write pattern buffer.
-          FontPartition::bench_flash(buf.scratch_buf1(), wintergreen::DrawBuffer::kBufSize);
-          buf.reset_after_scratch();
-          break;
-        }
-        case SerialCmdType::RenderBench: {
-          app.reader()->bench_render(buf);
-          break;
-        }
-        default:
-          break;
+      if (serial_cmd_take(&cmd_path) == SerialCmdType::Open) {
+        app.auto_open_book(cmd_path, buf, runtime);
+        // auto_open_book pushes the Reader and renders the page into the
+        // inactive buffer, but does not commit it. We must refresh here to
+        // show the book page on the display (the Application::start() path
+        // has its own buf.full_refresh() after auto_open_book returns).
+        buf.refresh();
       }
     }
 
@@ -268,13 +246,13 @@ extern "C" void app_main(void) {
       continue;
     }
 
-    strncpy(g_top_screen_name, app.top_screen_name(), sizeof(g_top_screen_name) - 1);
-    g_top_screen_name[sizeof(g_top_screen_name) - 1] = '\0';
+    // Carry out a BLE teardown the HID callback asked for. Compiles to nothing
+    // unless a clicker MAC is configured; see bluetooth_clicker.h for why the
+    // callback cannot tear its own stack down.
+    wg_clicker::poll();
 
     wintergreen::run_loop_iteration(app, buf, input, runtime);
   }
-
-  MR_LOGI("app", "Shutting down, entering deep sleep...");
 
   // Hold-to-sleep leaves the power button still down, and the wake source is
   // level-triggered on LOW — sleeping now would wake instantly. Wait for the

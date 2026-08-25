@@ -67,6 +67,8 @@ class MainMenu final : public ListMenuScreen {
   std::string_view get_item_right(int index) const override;
   std::string wintergreen_header_left() const override;
   bool is_separator(int index) const override;
+  // The Sync action never has an author line under it.
+  bool is_single_line_row(int index) const override { return is_action_row_(index); }
   int count() const override;
 
   void start(DrawBuffer& buf, IRuntime& runtime) override {
@@ -101,7 +103,7 @@ class MainMenu final : public ListMenuScreen {
     uint32_t last_open_order = 0;
     uint8_t progress_pct = 0;
     // Books under .hidden/ are not in BookIndex — there is no pool to reference,
-    // so they carry their own metadata and are read straight from the MRB.
+    // so they carry their own metadata and are read straight from the WGB.
     bool hidden = false;
     std::string title_own;
     std::string author_own;
@@ -123,23 +125,38 @@ class MainMenu final : public ListMenuScreen {
     return cnt;
   }
 
+  // Row 0 is the Sync action, row 1 the hairline under it; books start at 2.
+  // Both are visual-only, so every entries_ index shifts by one on top of the
+  // separator shift.
+  static constexpr int kSyncRow = 0;
+  static bool is_action_row_(int visual) {
+    return visual == kSyncRow;
+  }
+
   int entries_index_for(int visual) const {
-    return visual - seps_before_(visual);
+    if (is_action_row_(visual)) return -1;
+    return visual - seps_before_(visual) - 1;
   }
 
   int visual_for_entries(int real) const {
-    int r = 0, v = 0;
-    while (v < count()) {
-      while (v < count() && is_separator(v)) v++;
-      if (v >= count()) break;
+    int r = 0;
+    for (int v = 0; v < count(); ++v) {
+      if (is_separator(v) || is_action_row_(v)) continue;
       if (r == real) return v;
-      r++; v++;
+      ++r;
     }
     return count() - 1;
   }
 
   void scan_directory_(DrawBuffer& buf);
   void populate_list_();
+  // Land on the first book rather than on Sync when the screen opens. Called
+  // after populate_list_() from the two paths that build the list on entry, so
+  // an in-place refresh (serial upload) does not move the cursor.
+  void select_first_book_();
+  // NAS sync, the one thing kWifiSsid/kWifiPassword are reserved for. No Wi-Fi
+  // subsystem exists yet, so this is the single hook that will start it.
+  void run_sync_();
   // Reads <books_dir>/.hidden/ into hidden_. Only called when the gesture asks
   // for it, so the card is not walked on every visit to this screen.
   void scan_hidden_();

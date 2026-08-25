@@ -1,4 +1,4 @@
-#include "ReaderOptionsScreen.h"
+#include "QuickmenuScreen.h"
 
 #include <climits>
 #include <cstdio>
@@ -13,7 +13,7 @@ constexpr const char* ReaderSettings::kFontSizeNames[];
 
 // ---------------------------------------------------------------------------
 
-void ReaderOptionsScreen::populate(const TableOfContents& toc, uint16_t current_chapter, uint16_t current_para,
+void QuickmenuScreen::populate(const TableOfContents& toc, uint16_t current_chapter, uint16_t current_para,
                                    const std::string& fallback_title, int book_progress_pct, int chapter_progress_pct,
                                    uint16_t chapter_count) {
   toc_ = &toc;
@@ -36,7 +36,7 @@ void ReaderOptionsScreen::populate(const TableOfContents& toc, uint16_t current_
   has_pending_ = false;
 }
 
-std::vector<std::string> ReaderOptionsScreen::wrap_(const BitmapFont& f, const std::string& text, int first_w,
+std::vector<std::string> QuickmenuScreen::wrap_(const BitmapFont& f, const std::string& text, int first_w,
                                                     int rest_w, int max_lines) {
   std::vector<std::string> out;
   if (text.empty() || !f.valid() || max_lines <= 0)
@@ -86,14 +86,17 @@ std::vector<std::string> ReaderOptionsScreen::wrap_(const BitmapFont& f, const s
   return out;
 }
 
-int ReaderOptionsScreen::header_h_() const {
+int QuickmenuScreen::header_h_() const {
   int h = header_top_();
   h += static_cast<int>(title_lines_.size()) * title_font_().y_advance();
   if (!chapter_lines_.empty())
     h += kBlockGap + static_cast<int>(chapter_lines_.size()) * chapter_font_().y_advance();
-  // gap + rule + the same breathing room below it that the settings/chapters
-  // hairline gets, so the first row is not flush against the line.
-  return h + kBlockGap + 1 + kSepH / 2;
+  // The rule under the header is drawn with the shared draw_separator_(), so it
+  // occupies exactly kSeparatorH like every other hairline in the tree — half
+  // above the line, half below. It used to carry kBlockGap above and only
+  // kSeparatorH/2 below, which made this one divider sit differently from the
+  // settings/chapters one a few rows further down. Must match draw_all_.
+  return h + kSeparatorH;
 }
 
 // Build a "Label: Value" string into a fixed buffer.
@@ -102,7 +105,7 @@ static const char* fmt_setting(char* buf, size_t bufsz, const char* label, const
   return buf;
 }
 
-std::string_view ReaderOptionsScreen::get_item_subtitle(int index) const {
+std::string_view QuickmenuScreen::get_item_subtitle(int index) const {
   std::string_view label = ListMenuScreen::get_item_label(index);
   const auto pos = label.find(": ");
   if (pos == std::string_view::npos) return {};
@@ -110,23 +113,23 @@ std::string_view ReaderOptionsScreen::get_item_subtitle(int index) const {
   return subtitle_buf_;
 }
 
-std::string ReaderOptionsScreen::wintergreen_header_left() const {
+std::string QuickmenuScreen::wintergreen_header_left() const {
   return "reading";
 }
 
-void ReaderOptionsScreen::start(DrawBuffer& buf, IRuntime& runtime) {
+void QuickmenuScreen::start(DrawBuffer& buf, IRuntime& runtime) {
   buf_ = &buf;
+  runtime_ = &runtime;
   // Capture current selection before the base class calls on_start(), which
   // rebuilds the list.
   prev_selected_ = selected_index();
   ListMenuScreen::start(buf, runtime);
 }
 
-void ReaderOptionsScreen::on_start() {
+void QuickmenuScreen::on_start() {
   // Use the list/menu rotation rather than inheriting whatever rotation the
   // reader view was using.
-  if (app_)
-    set_buf_rotation_(rotation_from_setting(app_->rotate_display()));
+  set_buf_rotation_(Rotation::Deg90);
 
   // The header is drawn entirely by this screen's own draw_all_; the base
   // class's card header (title_/subtitle_) is not used. The author was dropped —
@@ -158,10 +161,18 @@ void ReaderOptionsScreen::on_start() {
   }
 
   clear_items();
-  idx_font_size_ = idx_rotate_display_ = idx_reader_rotate_display_ = -1;
+  idx_font_size_ = idx_reader_rotate_display_ = -1;
   first_chapter_ = -1;
 
   char tmp[40];
+
+  // Item 0 *is* the header block — the book title, the chapter and their two
+  // percentages. It carries no label of its own and is never drawn by the list
+  // loop below; draw_all_ paints it at the top of the panel and inverts the
+  // whole block when it is selected. Selecting it returns to the book, so the
+  // thing you are reading is both the first thing the menu shows and the
+  // default action. Its row height is 0 everywhere the list measures itself.
+  add_item("");
 
   // Flat list, no section headers: the two settings, then Chapters.
   if (settings_) {
@@ -188,7 +199,36 @@ void ReaderOptionsScreen::on_start() {
     }
 
     idx_reader_rotate_display_ = count();
-    add_item(fmt_setting(tmp, sizeof(tmp), "Reader", rotation_label(app_ ? app_->rotate_reader() : 0)));
+    add_item(fmt_setting(tmp, sizeof(tmp), "Orientation", rotation_label(app_ ? app_->rotate_reader() : 0)));
+  }
+
+  // The clicker row exists only when a MAC is configured — on every other build
+  // clicker_state() is Unavailable and there is no row to select, rather than a
+  // control that can never do anything.
+  idx_clicker_ = -1;
+  clicker_shown_ = runtime_ ? runtime_->clicker_state() : ClickerState::Unavailable;
+  if (clicker_shown_ != ClickerState::Unavailable) {
+    idx_clicker_ = count();
+    // A failure carries its GAP reason code, because there is no log to put it
+    // in and "Failed" on its own is exactly as useless as the silence it
+    // replaced. See bluetooth_clicker.h for how to read the number.
+    char val[24];
+    const int code = runtime_ ? runtime_->clicker_status_code() : 0;
+    const int rst = runtime_ ? runtime_->last_reset_reason() : 0;
+    if (clicker_shown_ == ClickerState::Failed && code != 0)
+      snprintf(val, sizeof(val), "Failed %d", code);
+    else if (clicker_shown_ == ClickerState::Connected && code < 0)
+      // Free internal RAM while the radio is up — the number that decides
+      // whether the reader can still lay out a page. See status_code().
+      snprintf(val, sizeof(val), "Connected %dk", -code);
+    else if (rst != 0)
+      // The device restarted abnormally. Say so here: a reset wipes any state
+      // that could have recorded why, and esp_reset_reason() is the only thing
+      // that survives it. Clears on the next clean boot.
+      snprintf(val, sizeof(val), "%s rst%d", clicker_label_(clicker_shown_), rst);
+    else
+      snprintf(val, sizeof(val), "%s", clicker_label_(clicker_shown_));
+    add_item(fmt_setting(tmp, sizeof(tmp), "Page Turner", val));
   }
 
   // Chapters, inline below the settings. Nested TOC entries keep their depth as
@@ -198,7 +238,7 @@ void ReaderOptionsScreen::on_start() {
     first_chapter_ = count();
     for (const auto& entry : toc_->entries)
       add_item_view(entry.label.view(toc_->pool), entry.depth);
-  } else if (chapter_count_ > 1) {
+  } else if (chapter_count_ > 1) { // chapter generation
     first_chapter_ = count();
     char cbuf[20];
     for (uint16_t i = 0; i < chapter_count_; ++i) {
@@ -220,27 +260,31 @@ void ReaderOptionsScreen::on_start() {
   set_selected(sel);
 }
 
-void ReaderOptionsScreen::refresh_items_(int restore_selection) {
+void QuickmenuScreen::refresh_items_(int restore_selection) {
   prev_selected_ = restore_selection;
   on_start();  // on_start() calls set_selected().
 }
 
-int ReaderOptionsScreen::get_visible_count_(int H, int scroll_off) const {
+int QuickmenuScreen::get_visible_count_(int H, int scroll_off) const {
   int available_h = H - header_h_();
   // The settings/chapters hairline takes a row-sized bite out of the list.
   if (first_chapter_ > 0)
-    available_h -= kSepH;
+    available_h -= kSeparatorH;
   int h = 0, cnt = 0;
   const int n = count();
   for (int i = scroll_off; i < n; ++i) {
-    if (h + row_h_() > available_h) break;
-    h += row_h_();
+    // The header item occupies the header, not a list row, so it costs no
+    // height here — otherwise the list would think it had one row fewer than
+    // it draws and the last chapter would be unreachable.
+    const int rh = (i == kIdxBack) ? 0 : row_h_();
+    if (h + rh > available_h) break;
+    h += rh;
     cnt++;
   }
   return cnt;
 }
 
-void ReaderOptionsScreen::draw_all_(DrawBuffer& buf, std::optional<uint8_t> battery_pct) const {
+void QuickmenuScreen::draw_all_(DrawBuffer& buf, std::optional<uint8_t> battery_pct) const {
   const int W = buf.width();
   const int H = buf.height();
   buf.fill(true);
@@ -252,14 +296,25 @@ void ReaderOptionsScreen::draw_all_(DrawBuffer& buf, std::optional<uint8_t> batt
   const BitmapFont& cfont = chapter_font_();
   int y = header_top_();
 
+  // The header block is item kIdxBack. When it is selected the whole block —
+  // title, chapter and both percentages — is inverted, exactly as a list row is,
+  // and Confirm returns to the book. The fill runs from the top of the panel to
+  // the rule, so the block reads as one target rather than as text that happens
+  // to be highlighted.
+  const bool head_sel = (selected() == kIdxBack);
+  if (head_sel)
+    // Up to the rule, which draw_separator_ places at the midpoint of the
+    // kSeparatorH gap the header block ends with.
+    buf.fill_rect(0, 0, W, header_h_() - kSeparatorH / 2, false);
+
   // ── Book title, with the book percentage at the right of its first line ──
   for (size_t i = 0; i < title_lines_.size(); ++i) {
     const std::string& line = title_lines_[i];
-    buf.draw_text_proportional(kLM, y + tfont.baseline(), line.c_str(), line.size(), tfont, false);
+    buf.draw_text_proportional(kLM, y + tfont.baseline(), line.c_str(), line.size(), tfont, head_sel);
     if (i == 0) {
       const int pw = tfont.word_width(book_pct_buf_.c_str(), book_pct_buf_.size(), FontStyle::Regular);
       buf.draw_text_proportional(W - kRM - pw, y + tfont.baseline(), book_pct_buf_.c_str(), book_pct_buf_.size(), tfont,
-                                 false);
+                                 head_sel);
     }
     y += tfont.y_advance();
   }
@@ -269,27 +324,28 @@ void ReaderOptionsScreen::draw_all_(DrawBuffer& buf, std::optional<uint8_t> batt
     y += kBlockGap;
     for (size_t i = 0; i < chapter_lines_.size(); ++i) {
       const std::string& line = chapter_lines_[i];
-      buf.draw_text_proportional(kLM, y + cfont.baseline(), line.c_str(), line.size(), cfont, false);
+      buf.draw_text_proportional(kLM, y + cfont.baseline(), line.c_str(), line.size(), cfont, head_sel);
       if (i == 0) {
         const int pw = cfont.word_width(chapter_pct_buf_.c_str(), chapter_pct_buf_.size(), FontStyle::Regular);
         buf.draw_text_proportional(W - kRM - pw, y + cfont.baseline(), chapter_pct_buf_.c_str(),
-                                   chapter_pct_buf_.size(), cfont, false);
+                                   chapter_pct_buf_.size(), cfont, head_sel);
       }
       y += cfont.y_advance();
     }
   }
 
-  y += kBlockGap;
-  buf.fill_rect(0, y, W, 1, false);
-  y += 1 + kSepH / 2;  // must match header_h_()
+  // Same helper, same geometry as every other hairline — see header_h_().
+  draw_separator_(buf, W, y);
+  y += kSeparatorH;  // must match header_h_()
 
   // ── Item list ────────────────────────────────────────────────────────────
   const int n = count();
-  // Compute total content height to decide whether scrolling is needed.
-  const int total_h = n * row_h_();
+  // Compute total content height to decide whether scrolling is needed. The
+  // header item is not one of these rows.
+  const int total_h = (n - 1) * row_h_();
   const int so = (total_h <= H - y) ? 0 : scroll_offset();
 
-  for (int i = so; i < n && y < H; ++i) {
+  for (int i = (so > kIdxBack ? so : kIdxBack + 1); i < n && y < H; ++i) {
     const bool sel = (i == selected());
 
     const std::string_view label = get_item_label(i);
@@ -298,8 +354,8 @@ void ReaderOptionsScreen::draw_all_(DrawBuffer& buf, std::optional<uint8_t> batt
     // Hairline between the settings and the chapters. It sits in its own gap
     // rather than inside a row, so a selected first chapter cannot paint over it.
     if (i == first_chapter_ && i > so) {
-      buf.fill_rect(0, y + kSepH / 2, W, 1, false);
-      y += kSepH;
+      draw_separator_(buf, W, y);
+      y += kSeparatorH;
     }
 
     // Only a settings row is "Label: Value". Chapter titles legitimately contain
@@ -330,7 +386,13 @@ void ReaderOptionsScreen::draw_all_(DrawBuffer& buf, std::optional<uint8_t> batt
   }
 }
 
-void ReaderOptionsScreen::on_select(int index) {
+void QuickmenuScreen::on_select(int index) {
+  // The header block: back to the book, with no chapter jump pending.
+  if (index == kIdxBack) {
+    app_->pop_screen();
+    return;
+  }
+
   if (first_chapter_ >= 0 && index >= first_chapter_) {
     const int ch = index - first_chapter_;
     if (toc_ && !toc_->entries.empty()) {
@@ -363,6 +425,22 @@ void ReaderOptionsScreen::on_select(int index) {
     if (app_) {
       uint8_t v = static_cast<uint8_t>(app_->rotate_reader() == 1 ? 0 : 1);
       app_->set_rotate_reader(v);
+      refresh_items_(index);
+    }
+    return;
+  }
+  if (index == idx_clicker_) {
+    if (runtime_) {
+      // Free the resident book index first, synchronously. The BLE stack starts
+      // allocating the moment toggle_clicker() spawns its worker, and on this
+      // device the two do not fit at once — a connect used to fail with the
+      // host task unable to start (11 KB free), or succeed and then abort the
+      // reader on its next page layout.
+      if (runtime_->clicker_state() != ClickerState::Connected && app_)
+        app_->release_index_for_radio();
+      // Returns immediately: connecting takes seconds. The row redraws as
+      // "Connecting", and update() below repaints it when the outcome lands.
+      runtime_->toggle_clicker();
       refresh_items_(index);
     }
     return;

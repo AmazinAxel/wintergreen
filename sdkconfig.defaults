@@ -57,7 +57,13 @@ CONFIG_LOG_DEFAULT_LEVEL=0
 # assert/abort path. Neither is reachable in a shipped build.
 CONFIG_ESP_ERR_TO_NAME_LOOKUP=n
 CONFIG_ESP_DEBUG_OCDAWARE=n
-CONFIG_FREERTOS_DEBUG_OCDAWARE=n
+
+# World-readable device with no untrusted code: the PMS permission programming
+# and esp_mprot_set_prot (~2 KB) protect against nothing here.
+CONFIG_ESP_SYSTEM_MEMPROT_FEATURE=n
+
+# Nothing in the tree calls select(); the VFS select shim is pure overhead.
+CONFIG_VFS_SUPPORT_SELECT=n
 
 # RAM optimizations
 # Optimize for performance (-O2) — faster CPU-bound inflate/XML parsing
@@ -68,23 +74,27 @@ CONFIG_COMPILER_OPTIMIZATION_DEBUG=n
 # flash. HAL follows the system level, so setting HAL alone had no effect.
 CONFIG_COMPILER_OPTIMIZATION_ASSERTIONS_SILENT=y
 
-# Use newlib nano printf
-CONFIG_NEWLIB_NANO_FORMAT=y
-
-# Move FreeRTOS functions to flash (slightly slower, saves IRAM)
-CONFIG_FREERTOS_PLACE_FUNCTIONS_INTO_FLASH=y
+# NOTE — removed, do not re-add without checking the option still exists.
+# espressif32 @ ^7.0.1 ships an IDF that moved libc to picolibc and dropped
+# several symbols. An unknown key in this file is *silently ignored*, so these
+# four looked like they were doing something for as long as they sat here:
+#   CONFIG_NEWLIB_NANO_FORMAT=y             gone; CONFIG_LIBC_PICOLIBC is in
+#                                           force and always links the
+#                                           double-capable __d_vfprintf/__d_vfscanf
+#   CONFIG_FREERTOS_PLACE_FUNCTIONS_INTO_FLASH=y  gone; CONFIG_FREERTOS_IN_IRAM
+#                                           already defaults off, same outcome
+#   CONFIG_FREERTOS_DEBUG_OCDAWARE=n        gone
+#   CONFIG_SPI_MASTER_ISR_IN_IRAM=n         gone
+# CONFIG_FREERTOS_ISR_STACKSIZE=1024 is also removed: the generated config
+# clamped it straight back to the 1536 minimum, so it never took effect.
 
 # Use SPI flash ROM implementation (saves IRAM by using ROM code)
 CONFIG_SPI_FLASH_ROM_IMPL=y
 
-# Reduce ISR stack (default 1536, we have no heavy ISRs)
-CONFIG_FREERTOS_ISR_STACKSIZE=1024
-
 # Move heap allocator (tlsf) from IRAM to flash — saves ~3.5KB IRAM
 CONFIG_HEAP_PLACE_FUNCTION_INTO_FLASH=y
 
-# SPI master/slave ISR in flash — we don't do SPI during flash writes
-CONFIG_SPI_MASTER_ISR_IN_IRAM=n
+# SPI slave ISR in flash — we don't do SPI during flash writes
 CONFIG_SPI_SLAVE_ISR_IN_IRAM=n
 
 # No need to post events from IRAM ISR context
@@ -100,3 +110,110 @@ CONFIG_LIBC_LOCKS_PLACE_IN_IRAM=n
 # We don't use esp_timer callbacks or event loops heavily
 CONFIG_ESP_TIMER_TASK_STACK_SIZE=2048
 CONFIG_ESP_SYSTEM_EVENT_TASK_STACK_SIZE=2048
+
+# --- Dynamic frequency scaling ---
+# CPU drops to 80 MHz whenever nothing holds the max-frequency lock, which in a
+# reading session is almost all of the time: the UI loop wakes every 25 ms, finds
+# nothing to do and goes back to WFI. ~22 mA at 160 MHz vs ~15 mA at 80 MHz, and
+# awake current is essentially the whole battery budget (see CLAUDE.md "Idle
+# power").
+#
+# light_sleep_enable stays FALSE — automatic light sleep force-selects
+# PM_SLP_DISABLE_GPIO via the C3 GPIO-reset errata workaround, which destroys the
+# SAR ADC state the resistor-ladder buttons depend on. That is a *tickless idle*
+# problem, not a PM_ENABLE problem; this config does not trip it.
+#
+# min_freq_mhz is 80, not 40: APB must never drop below 80 MHz or the already
+# marginal SD-over-SPI timing goes with it.
+CONFIG_PM_ENABLE=y
+# Do NOT add CONFIG_FREERTOS_USE_TICKLESS_IDLE — see above and CLAUDE.md.
+
+# --- Console ---
+# Left on the UART default *deliberately*, even though this board exposes no
+# UART: the alternative bricks it on battery.
+#
+# Routing the console to the native USB Serial/JTAG makes a write block when the
+# peripheral's FIFO fills and no host is draining it. With a host attached that
+# never happens; on battery the first console write blocks forever and the device
+# hangs before it ever reaches epd.begin() — no panel activity at all. Nothing
+# prints in a normal build (logging is compiled out), so this costs nothing, and
+# a panic is only readable with a host attached anyway.
+#
+# To diagnose, set these three and keep USB plugged in:
+#   CONFIG_ESP_CONSOLE_USB_SERIAL_JTAG=y
+#   CONFIG_ESP_CONSOLE_UART_DEFAULT=n
+#   CONFIG_ESP_CONSOLE_SECONDARY_NONE=y
+
+# --- Bluetooth LE: page-turner clicker (HID-over-GATT host) ---
+#
+# Everything here is inert unless WG_BLUETOOTH_PAGE_TURNER is defined in
+# WintergreenConfig.h: with no MAC configured, platforms/esp32/bluetooth_clicker.h
+# preprocesses away, nothing references the stack and the linker drops all of it.
+# The residual cost of these keys in a clicker-less build is ~3.8 KB of flash and
+# ~400 bytes of RAM, measured — see CLAUDE.md "Bluetooth page-turner".
+#
+# NimBLE rather than Bluedroid: central-only, one connection, a fraction of the
+# footprint.
+CONFIG_BT_ENABLED=y
+CONFIG_BT_NIMBLE_ENABLED=y
+CONFIG_BT_NIMBLE_ROLE_CENTRAL=y
+CONFIG_BT_NIMBLE_ROLE_OBSERVER=y
+CONFIG_BT_NIMBLE_MAX_CONNECTIONS=1
+CONFIG_BT_NIMBLE_LOG_LEVEL_NONE=y
+# Bond keys survive a reboot; some clickers refuse to re-pair silently.
+CONFIG_BT_NIMBLE_NVS_PERSIST=y
+#
+# These three look wrong for a central-only device and are not. IDF guards
+# nimble_hidh.c — the HID **host** — with CONFIG_BT_NIMBLE_HID_SERVICE, which is
+# the HID *device* service option, and that option sits inside a Kconfig menu
+# gated on GATT_SERVER, which in turn depends on ROLE_PERIPHERAL. So the host
+# implementation cannot be compiled without nominally enabling the peripheral
+# role. Nothing ever advertises; this costs image size and no runtime behaviour.
+# Drop any of them and the link fails with "undefined reference to
+# esp_ble_hidh_init".
+CONFIG_BT_NIMBLE_ROLE_PERIPHERAL=y
+CONFIG_BT_NIMBLE_GATT_SERVER=y
+CONFIG_BT_NIMBLE_HID_SERVICE=y
+# Required, and its absence is silent. esp_hidh's NimBLE path never calls
+# ble_gap_security_initiate, and the HID characteristics need an encrypted link
+# — so without this the clicker connects and then reads nothing. This is the
+# switch that makes ble_gattc retry a read through pairing when the peer answers
+# INSUFFICIENT_ENC/AUTHEN (ble_gattc.c's BLE_GATTC_AUTO_PAIR block). The
+# matching ble_hs_cfg.sm_* fields are set in bluetooth_clicker.h; both halves are
+# needed, since NimBLE defaults sm_bonding and both key-dist masks to 0.
+CONFIG_BT_NIMBLE_GATTC_AUTO_PAIR=y
+
+# The host task runs GATT discovery, the security manager, and — because
+# ble_store_config persists bonds — NVS writes, which are stack-hungry. Bonding
+# completes a second or two after a HID connect, which is exactly when a device
+# that resets shortly after connecting would do it. 4096 is the IDF default and
+# has no margin for that path.
+CONFIG_BT_NIMBLE_HOST_TASK_STACK_SIZE=6144
+
+# NimBLE buffer pools, cut well below IDF defaults. A page-turner sends 8-byte
+# keyboard reports a few times a minute over one connection — the default pools
+# are sized for a throughput case this device does not have, and they come out
+# of internal RAM (MEM_ALLOC_MODE_INTERNAL) on a build that already holds 160 KB
+# statically. Frees ~12 KB of the heap the reader competes for.
+CONFIG_BT_NIMBLE_TRANSPORT_ACL_FROM_LL_COUNT=8
+CONFIG_BT_NIMBLE_MSYS_2_BLOCK_COUNT=8
+CONFIG_BT_NIMBLE_TRANSPORT_EVT_COUNT=12
+CONFIG_BT_NIMBLE_TRANSPORT_EVT_DISCARD_COUNT=4
+CONFIG_BT_NIMBLE_MAX_BONDS=2
+
+# Controller-side sizing. BLE_MAX_ACT is the big one: each "activity" is a
+# connection/scan/adv slot with its own controller buffers, and 6 is sized for a
+# multi-peripheral hub. This device needs exactly two — one scan, one
+# connection. The scan duplicate-filter cache is 100 entries for the same
+# reason and is only ever used for a few seconds at connect time.
+CONFIG_BT_CTRL_BLE_MAX_ACT=2
+CONFIG_BT_CTRL_SCAN_DUPL_CACHE_SIZE=10
+CONFIG_BT_NIMBLE_MSYS_1_BLOCK_COUNT=6
+
+# MTU 256 sizes every ATT buffer for a payload this device never sends. A HID
+# report map is a few hundred bytes read once at connect; the reports themselves
+# are 8. 128 still reads any sane report map in one or two round trips.
+CONFIG_BT_NIMBLE_ATT_PREFERRED_MTU=128
+# 4 concurrent GATT procedures is for a client juggling several services. This
+# one walks the HID service at connect and then only receives notifications.
+CONFIG_BT_NIMBLE_GATT_MAX_PROCS=2

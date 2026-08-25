@@ -4,13 +4,11 @@
 
 #include <cstdio>
 
-#include "esp_log.h"
 #include "esp_vfs_fat.h"
 
 #define SD_MOUNT "/sdcard"
 #define SD_MAX_FILES 4
 
-static const char* kSdTag = "sd";
 
 #include "driver/gpio.h"
 #include "driver/sdspi_host.h"
@@ -31,7 +29,6 @@ inline bool sd_init() {
   sdspi_dev_handle_t handle{};
   esp_err_t err = sdspi_host_init_device(&dev_cfg, &handle);
   if (err != ESP_OK) {
-    ESP_LOGE(kSdTag, "sdspi_host_init_device: %s", esp_err_to_name(err));
     return false;
   }
 
@@ -47,12 +44,9 @@ inline bool sd_init() {
 
   err = esp_vfs_fat_sdspi_mount(SD_MOUNT, &host, &dev_cfg, &mnt, &sd_card_);
   if (err != ESP_OK) {
-    ESP_LOGE(kSdTag, "mount failed: %s", esp_err_to_name(err));
     return false;
   }
 
-  float mb = (float)sd_card_->csd.capacity * sd_card_->csd.sector_size / (1024.0f * 1024.0f);
-  ESP_LOGI(kSdTag, "SD mounted at %s (%.0f MB, %d kHz)", SD_MOUNT, mb, sd_card_->max_freq_khz);
   return true;
 }
 

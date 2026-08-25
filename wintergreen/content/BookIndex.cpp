@@ -4,30 +4,32 @@
 #include <cctype>
 #include <cstdio>
 #include <cstring>
-#include <functional>
 #include <queue>
 #include <string>
 #include <vector>
 
-#include "../HeapLog.h"
 #include "../display/DrawBuffer.h"
-#include "mrb/MrbReader.h"
+#include "wgb/WgbReader.h"
 
 #ifdef ESP_PLATFORM
 #include <dirent.h>
-#include "esp_log.h"
-#define MR_LOGI(tag, fmt, ...) ESP_LOGI(tag, fmt, ##__VA_ARGS__)
-#define MR_LOGW(tag, fmt, ...) ESP_LOGW(tag, fmt, ##__VA_ARGS__)
-#define MR_LOGE(tag, fmt, ...) ESP_LOGE(tag, fmt, ##__VA_ARGS__)
 #else
 #include <filesystem>
 namespace fs = std::filesystem;
-#define MR_LOGI(tag, fmt, ...) (void)0
-#define MR_LOGW(tag, fmt, ...) (void)0
-#define MR_LOGE(tag, fmt, ...) (void)0
 #endif
 
 namespace wintergreen {
+
+bool ci_less(std::string_view a, std::string_view b) {
+  size_t min_len = std::min(a.size(), b.size());
+#ifdef _WIN32
+  int cmp = _strnicmp(a.data(), b.data(), min_len);
+#else
+  int cmp = strncasecmp(a.data(), b.data(), min_len);
+#endif
+  if (cmp != 0) return cmp < 0;
+  return a.size() < b.size();
+}
 
 BookIndex& BookIndex::instance() {
   static BookIndex instance;
@@ -45,11 +47,11 @@ static bool ends_with_ci(const char* name, size_t name_len, const char* ext, siz
   return true;
 }
 
-// A book is a .mrb produced by tools/epub2mrb. EPUBs are not recognised: the
+// A book is a .wgb produced by tools/epub2wgb. EPUBs are not recognised: the
 // device has no converter, so listing one would only offer a book that cannot
 // be opened.
 static bool has_book_extension(const char* name, size_t name_len) {
-  return ends_with_ci(name, name_len, ".mrb", 4);
+  return ends_with_ci(name, name_len, ".wgb", 4);
 }
 
 // Name of the directory containing `path`, used as a title fallback.
@@ -61,20 +63,12 @@ static std::string folder_name_of(const std::string& path) {
   return path.substr(prev == std::string::npos ? 0 : prev + 1, last - (prev == std::string::npos ? 0 : prev + 1));
 }
 
-bool BookIndex::is_mrb_path(const char* path) {
+bool BookIndex::is_wgb_path(const char* path) {
   if (!path)
     return false;
   const char* slash = std::strrchr(path, '/');
   const char* name = slash ? slash + 1 : path;
-  return ends_with_ci(name, std::strlen(name), ".mrb", 4);
-}
-
-bool BookIndex::is_book_path(const char* path) {
-  if (!path) return false;
-  const char* slash = std::strrchr(path, '/');
-  const char* name = slash ? slash + 1 : path;
-  const size_t name_len = std::strlen(name);
-  return has_book_extension(name, name_len);
+  return has_book_extension(name, std::strlen(name));
 }
 
 bool BookIndex::add_entry(std::string_view path, std::string_view title, std::string_view author,
@@ -87,6 +81,7 @@ bool BookIndex::add_entry(std::string_view path, std::string_view title, std::st
   entry.author = pool_.add(author);
   entry.last_open_order = last_open_order;
   entries_.push_back(entry);
+  dirty_ = true;
   return true;
 }
 
@@ -97,6 +92,7 @@ bool BookIndex::load(const std::string& index_file) {
 
   entries_.clear();
   pool_.reset();
+  dirty_ = false;  // freshly parsed from disk; nothing to write back
 
   char line[1024];
   bool first_line = true;
@@ -161,6 +157,13 @@ bool BookIndex::load(const std::string& index_file) {
 }
 
 bool BookIndex::save(const std::string& index_file) const {
+  // Rewriting an unchanged index is pure SD wear: the file is rewritten whole,
+  // and a flash erase block is far larger than it. Every mutator sets dirty_ only
+  // when a stored value actually moves, so re-opening a book you were already on
+  // and closing it again writes nothing.
+  if (!dirty_)
+    return true;
+
   const std::string tmp_path = index_file + ".tmp";
   FILE* f = std::fopen(tmp_path.c_str(), "wb");
   if (!f)
@@ -190,15 +193,11 @@ bool BookIndex::save(const std::string& index_file) const {
   // See Application::save_settings_: FatFs rename does not replace an existing
   // destination, so it must be removed first.
   std::remove(index_file.c_str());
-  std::rename(tmp_path.c_str(), index_file.c_str());
+  if (std::rename(tmp_path.c_str(), index_file.c_str()) == 0)
+    dirty_ = false;
   return true;
 }
 
-void BookIndex::clear_entries() {
-  { std::vector<BookIndexEntry> tmp; entries_.swap(tmp); }
-  pool_.reset();
-  generation_ = 0;
-}
 
 void BookIndex::ensure_loaded_(const std::string& index_path) {
   if (!entries_.empty()) return;
@@ -209,13 +208,11 @@ void BookIndex::ensure_loaded_(const std::string& index_path) {
   load(index_path);
 }
 
-bool BookIndex::index_file(const std::string& path, const std::string& index_path, DrawBuffer& buf) {
-  (void)buf;  // metadata comes from the MRB itself — no scratch buffers needed
+bool BookIndex::index_file(const std::string& path, const std::string& index_path) {
   std::string title, author;
   {
-    MrbReader r;
+    WgbReader r;
     if (!r.open(path.c_str())) {
-      MR_LOGW("index", "index_file: MrbReader::open failed for '%s'", path.c_str());
       return false;
     }
     title = r.metadata().title;
@@ -230,7 +227,6 @@ bool BookIndex::index_file(const std::string& path, const std::string& index_pat
   ensure_loaded_(index_path);
   remove_entry(path);
   add_entry(path, title, author);
-  MR_LOGI("index", "index_file: added '%s' (entries=%zu)", path.c_str(), entries_.size());
   ++generation_;
   return save(index_path);
 }
@@ -239,16 +235,12 @@ bool BookIndex::remove_path(const std::string& path, const std::string& index_pa
   ensure_loaded_(index_path);
   auto it = std::find_if(entries_.begin(), entries_.end(),
                          [&](const BookIndexEntry& e) { return e.path.view(pool_) == path; });
-  if (it == entries_.end()) {
-    MR_LOGW("index", "remove_path: '%s' not in index (entries=%zu)", path.c_str(), entries_.size());
+  if (it == entries_.end())
     return true;  // not indexed — nothing to do, no save needed
-  }
-  MR_LOGI("index", "remove_path: removing '%s'", path.c_str());
   entries_.erase(it);
+  dirty_ = true;
   ++generation_;
-  bool ok = save(index_path);
-  if (!ok) MR_LOGE("index", "remove_path: save FAILED for '%s'", path.c_str());
-  return ok;
+  return save(index_path);
 }
 
 bool BookIndex::rename_in_place(const std::string& src, const std::string& dst, const std::string& index_path) {
@@ -258,6 +250,7 @@ bool BookIndex::rename_in_place(const std::string& src, const std::string& dst, 
   if (it == entries_.end())
     return false;  // src not indexed — caller may fall back to index_file(dst)
   it->path = pool_.add(dst);
+  dirty_ = true;
   ++generation_;
   return save(index_path);
 }
@@ -265,8 +258,10 @@ bool BookIndex::rename_in_place(const std::string& src, const std::string& dst, 
 void BookIndex::remove_entry(std::string_view path) {
   auto it = std::find_if(entries_.begin(), entries_.end(),
                          [&](const BookIndexEntry& e) { return e.path.view(pool_) == path; });
-  if (it != entries_.end())
+  if (it != entries_.end()) {
     entries_.erase(it);
+    dirty_ = true;
+  }
 }
 
 void BookIndex::mark_opened(std::string_view path) {
@@ -276,24 +271,30 @@ void BookIndex::mark_opened(std::string_view path) {
   ++next;
   for (auto& entry : entries_) {
     if (entry.path.view(pool_) == path) {
-      entry.last_open_order = next;
+      if (entry.last_open_order != next) {
+        entry.last_open_order = next;
+        dirty_ = true;
+      }
       return;
     }
   }
 }
-
 void BookIndex::set_progress(std::string_view path, int pct) {
   if (pct < 0) pct = 0;
   if (pct > 100) pct = 100;
   for (auto& entry : entries_) {
     if (entry.path.view(pool_) == path) {
-      entry.progress_pct = static_cast<uint8_t>(pct);
+      if (entry.progress_pct != static_cast<uint8_t>(pct)) {
+        entry.progress_pct = static_cast<uint8_t>(pct);
+        dirty_ = true;
+      }
       return;
     }
   }
 }
 
-void BookIndex::build_index(const std::string& root_dir, DrawBuffer& buf) {
+void BookIndex::build_index(const std::string& root_dir) {
+  dirty_ = true;
   // Preserve open order across a rescan so the most-recently-read sort survives.
   struct OldStats {
     std::string key;
@@ -308,10 +309,8 @@ void BookIndex::build_index(const std::string& root_dir, DrawBuffer& buf) {
 
   entries_.clear();
   pool_.reset();
-  (void)buf;
   // Process books as we find them to avoid storing all paths in memory.
   int done = 0;
-  int total = 0;
 
   auto process_path = [&](const std::string& path) {
     if (static_cast<int>(entries_.size()) >= MAX_BOOKS)
@@ -320,7 +319,7 @@ void BookIndex::build_index(const std::string& root_dir, DrawBuffer& buf) {
     std::string title, author;
     bool ok = false;
     {
-      MrbReader r;
+      WgbReader r;
       if (r.open(path.c_str())) {
         title = r.metadata().title;
         author = r.metadata().author.value_or("");
@@ -346,7 +345,10 @@ void BookIndex::build_index(const std::string& root_dir, DrawBuffer& buf) {
   };
 
   // Single iterator helper: calls `cb(path)` for each book found
-  auto iterate_books = [&](const std::function<void(const std::string&)>& cb) {
+  // Templated on the callback rather than taking std::function: type erasure here
+  // cost a heap allocation and an indirect call per book, and emitted the lambda
+  // body as a separate 1.7 KB symbol.
+  auto iterate_books = [&](auto&& cb) {
     std::queue<std::string> q;
     q.push(root_dir);
     while (!q.empty()) {
@@ -383,10 +385,11 @@ void BookIndex::build_index(const std::string& root_dir, DrawBuffer& buf) {
     }
   };
 
-  iterate_books([&](const std::string& p) { total++; });
-  MR_LOGI("index", "Found %d epub(s), indexing...", total);
+  // One pass, not two. The old code walked the whole card first purely to count
+  // books into `total` for a log line that is compiled out at
+  // LOG_DEFAULT_LEVEL_NONE — a full recursive SD scan, over a bus shared with
+  // the panel, for nothing.
   iterate_books(process_path);
-  MR_LOGI("index", "Indexed %d book(s)", done);
 
   // build_index is a structural mutation — bump so observers (MainMenu) refresh
   // even if the call doesn't go through index_file/remove_path/rename_in_place.

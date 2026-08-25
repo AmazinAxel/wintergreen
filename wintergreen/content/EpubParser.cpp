@@ -4,7 +4,6 @@
 #include <cctype>
 #include <memory>
 
-#include "../HeapLog.h"
 #include "HtmlEntities.h"
 #include "ImageDecoder.h"
 #include "XmlReader.h"
@@ -432,6 +431,13 @@ EpubError Epub::parse_opf(IZipFile& file, const std::string& opf_path, uint8_t* 
   };
   std::vector<ManifestRef> manifest;
   manifest.reserve(zip_.entry_count());
+  // Cover fallbacks, in descending confidence. Only consulted when the OPF has
+  // no <meta name="cover">, which is common enough that a whole library can come
+  // up with no covers at all: EPUB 3 declares it with properties="cover-image",
+  // and plenty of EPUB 2 files just call the manifest item id="cover".
+  int cover_prop_idx = -1;   // properties contains cover-image
+  int cover_id_idx = -1;     // manifest id is literally "cover"
+  int cover_name_idx = -1;   // href basename starts with "cover"
   int ncx_file_idx = -1;
   std::string toc_id_ref;
   uint32_t ncx_id_hash = 0;
@@ -516,6 +522,23 @@ EpubError Epub::parse_opf(IZipFile& file, const std::string& opf_path, uint8_t* 
                 std::string(id.data, id.length) == *metadata_.cover_id) {
               cover_idx_ = idx;
             }
+            // Fallback candidates, recorded whether or not a meta cover exists —
+            // resolving them costs nothing and the meta one always wins below.
+            if (idx >= 0 && mt == MediaType::Image) {
+              auto props = ev.attrs.get("properties");
+              if (cover_prop_idx < 0 && props.length &&
+                  std::string_view(props.data, props.length).find("cover-image") != std::string_view::npos)
+                cover_prop_idx = idx;
+              if (cover_id_idx < 0 && id.length == 5 && sv_eq(id, "cover"))
+                cover_id_idx = idx;
+              if (cover_name_idx < 0) {
+                std::string_view h(href.data, href.length);
+                const auto slash = h.rfind('/');
+                const std::string_view base = (slash == std::string_view::npos) ? h : h.substr(slash + 1);
+                if (base.size() >= 5 && (base.compare(0, 5, "cover") == 0 || base.compare(0, 5, "Cover") == 0))
+                  cover_name_idx = idx;
+              }
+            }
           }
         }
       } else if (section == Section::Spine) {
@@ -537,6 +560,10 @@ EpubError Epub::parse_opf(IZipFile& file, const std::string& opf_path, uint8_t* 
       }
     }
   }
+
+  // Pick a cover when the OPF never declared one.
+  if (cover_idx_ < 0)
+    cover_idx_ = cover_prop_idx >= 0 ? cover_prop_idx : (cover_id_idx >= 0 ? cover_id_idx : cover_name_idx);
 
   if (!toc_id_ref.empty() && ncx_file_idx >= 0) {
     if (fnv1a(toc_id_ref.data(), toc_id_ref.size()) != ncx_id_hash)

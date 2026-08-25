@@ -4,56 +4,9 @@
 #include <cstdio>
 #include <optional>
 
-// Set to 1 to print per-paragraph budget trace for layout_backward().
-
 #include "hyphenation/Hyphenation.h"
 
-#ifdef ESP_PLATFORM
-#include "esp_timer.h"
-int64_t g_layout_hyph_us = 0;
-int64_t g_layout_metrics_us = 0;
-int64_t g_layout_para_us = 0;   // total time inside layout_para_lines() calls
-int g_layout_cache_misses = 0;  // paragraphs that required fresh layout_para_lines()
-#endif
-
-// Set to 1 to print a step-by-step trace of forward + backward page collection.
-// Output goes to stdout; safe to enable in desktop builds while debugging.
-#ifndef MR_LAYOUT_TRACE
-#define MR_LAYOUT_TRACE 0
-#endif
-
-#if MR_LAYOUT_TRACE
-#define MR_TRACE(...)         \
-  do {                        \
-    std::printf("[layout] "); \
-    std::printf(__VA_ARGS__); \
-    std::printf("\n");        \
-  } while (0)
-#else
-#define MR_TRACE(...) ((void)0)
-#endif
-
 namespace wintergreen {
-
-#if MR_LAYOUT_TRACE
-static const char* trace_kind(int k) {
-  switch (k) {
-    case TextLayout::PageItem::TextLine:
-      return "Text";
-    case TextLayout::PageItem::Image:
-      return "Image";
-    case TextLayout::PageItem::Hr:
-      return "Hr";
-    case TextLayout::PageItem::PageBreak:
-      return "PgBrk";
-    case TextLayout::PageItem::Empty:
-      return "Empty";
-    case TextLayout::PageItem::Spacer:
-      return "Spacer";
-  }
-  return "?";
-}
-#endif
 
 // ---------------------------------------------------------------------------
 // PageContent typed accessors
@@ -319,13 +272,7 @@ static std::vector<LayoutLine> layout_para_lines(const IFont& font, const Layout
       // Loop handles multi-line hyphenation: each iteration places a chunk or
       // emits a hyphenated prefix and continues with the remaining suffix.
       while (true) {
-#ifdef ESP_PLATFORM
-        int64_t _tm = esp_timer_get_time();
-        uint16_t word_w = font.word_width(word_ptr, word_len, run.style, eff_size_pct);
-        g_layout_metrics_us += esp_timer_get_time() - _tm;
-#else
-        uint16_t word_w = font.word_width(word_ptr, word_len, run.style, eff_size_pct);
-#endif
+        const uint16_t word_w = font.word_width(word_ptr, word_len, run.style, eff_size_pct);
         uint16_t needed = word_w + (needs_space ? space_width : 0);
 
         if (current.words.empty()) {
@@ -345,27 +292,12 @@ static std::vector<LayoutLine> layout_para_lines(const IFont& font, const Layout
         uint16_t avail =
             line_width > x + (needs_space ? space_width : 0) ? line_width - x - (needs_space ? space_width : 0) : 0;
         bool prefix_has_hyphen = false;
-#ifdef ESP_PLATFORM
-        {
-          int64_t _th = esp_timer_get_time();
-          size_t split_tmp =
-              find_hyphen_break(font, word_ptr, word_len, run.style, eff_size_pct, hyph_lang, avail, prefix_has_hyphen);
-          g_layout_hyph_us += esp_timer_get_time() - _th;
-          const size_t split = split_tmp;
-#else
         {
           const size_t split =
               find_hyphen_break(font, word_ptr, word_len, run.style, eff_size_pct, hyph_lang, avail, prefix_has_hyphen);
-#endif
           if (split > 0) {
             // Emit prefix + hyphen, flush, then loop with the suffix.
-#ifdef ESP_PLATFORM
-            int64_t _tm2 = esp_timer_get_time();
             const uint16_t prefix_w = font.word_width(word_ptr, static_cast<uint16_t>(split), run.style, eff_size_pct);
-            g_layout_metrics_us += esp_timer_get_time() - _tm2;
-#else
-            const uint16_t prefix_w = font.word_width(word_ptr, static_cast<uint16_t>(split), run.style, eff_size_pct);
-#endif
             // Don't add a synthetic hyphen if the prefix already ends with one.
             const uint16_t hyphen_w = prefix_has_hyphen ? 0 : font.char_width('-', run.style, eff_size_pct);
             if (needs_space)
@@ -448,19 +380,23 @@ static std::vector<LayoutLine> layout_para_lines(const IFont& font, const Layout
 // Page layout types and shared helpers
 // ---------------------------------------------------------------------------
 
+// Position an image inside the page, scaling **down** only.
+//
+// Images are rasterised to 1-bit by the converter, already fitted to the portrait
+// page box (see kImageBoxW/H in WgbFormat.h), so in portrait this is a no-op and
+// the device blits 1:1. Enlarging a 1-bit dithered bitmap has no detail to
+// recover and only turns grain into blocks, so a landscape page — whose content
+// area is wider — centres the image at its stored size instead of stretching it.
+// The scale-down branches remain for images that are somehow still oversized.
 static void scale_image(const PageOptions& opts, uint16_t content_width, uint16_t& img_w, uint16_t& img_h,
                         uint16_t& x_off) {
   const uint16_t fw = opts.width;
-  if (img_w >= fw / 2) {
-    if (img_w != fw) {
-      img_h = static_cast<uint16_t>(static_cast<uint32_t>(img_h) * fw / img_w);
-      img_w = fw;
-    }
-  } else {
-    if (img_w > content_width) {
-      img_h = static_cast<uint16_t>(static_cast<uint32_t>(img_h) * content_width / img_w);
-      img_w = content_width;
-    }
+  if (img_w > fw) {
+    img_h = static_cast<uint16_t>(static_cast<uint32_t>(img_h) * fw / img_w);
+    img_w = fw;
+  } else if (img_w > content_width && img_w < fw / 2) {
+    img_h = static_cast<uint16_t>(static_cast<uint32_t>(img_h) * content_width / img_w);
+    img_w = content_width;
   }
   if (img_w == 0)
     img_w = 1;
@@ -511,11 +447,13 @@ TextLayout::InlineImageInfo TextLayout::resolve_inline_image(const TextParagraph
   const auto& img = *text_para.inline_image;
   info.has_image = true;
   info.key = img.key;
-  if (img.attr_width > 0 && img.attr_height > 0) {
+  // The image table wins over the EPUB's declared width/height: it holds the
+  // dimensions of the bitmap the converter actually produced, which is what will
+  // be drawn. Markup dimensions are only a fallback for an image with no raster.
+  if (!sp || !sp(img.key, info.width, info.height)) {
     info.width = img.attr_width;
     info.height = img.attr_height;
-  } else if (sp)
-    sp(img.key, info.width, info.height);
+  }
   if (info.width > 0 && info.height > 0)
     info.promoted = (info.width > content_width / 3 || info.height > 120);
   return info;
@@ -563,16 +501,7 @@ const TextLayout::LaidOutParagraph& TextLayout::get_laid_out_(size_t pi) const {
       lo.width = cw;
       if (img.has_image && img.width > 0 && img.height > 0 && !img.promoted)
         lo.first_line_extra_indent = img.width + 4;
-#ifdef ESP_PLATFORM
-      {
-        int64_t _tp = esp_timer_get_time();
-        slot.lines = layout_para_lines(font, lo, para.text, hyphenation_lang_);
-        g_layout_para_us += esp_timer_get_time() - _tp;
-      }
-      ++g_layout_cache_misses;
-#else
       slot.lines = layout_para_lines(font, lo, para.text, hyphenation_lang_);
-#endif
       slot.line_heights.resize(slot.lines.size());
       slot.line_baselines.resize(slot.lines.size());
       for (size_t i = 0; i < slot.lines.size(); ++i) {
@@ -1170,8 +1099,6 @@ std::optional<Collected> TextLayout::LaidOutParagraph::collect_backward(size_t e
 static size_t collect_para_items(const LaidOut& lp, size_t start_idx, uint16_t spc, uint16_t ph, uint16_t& used,
                                  uint16_t& pending_desc, bool& has_content, bool& page_full, bool& pending_page_break,
                                  PagePosition& boundary, std::vector<PageItem>& items) {
-  MR_TRACE("  fwd para %u: start_idx=%zu spc=%u used=%u ph=%u pd=%u", (unsigned)lp.para_idx, start_idx, (unsigned)spc,
-           (unsigned)used, (unsigned)ph, (unsigned)pending_desc);
   size_t break_idx = start_idx;
   for (size_t idx = start_idx; !page_full; ++idx) {
     break_idx = idx;
@@ -1189,7 +1116,6 @@ static size_t collect_para_items(const LaidOut& lp, size_t start_idx, uint16_t s
           uint32_t to = (lp.type == ParagraphType::Text && idx < lp.lines.size()) ? lp.lines[idx].text_offset : 0;
           boundary = {lp.para_idx, static_cast<uint16_t>(idx), to};
           page_full = true;
-          MR_TRACE("    fwd avail=0 -> page_full at {p=%u,off=%zu}", (unsigned)lp.para_idx, idx);
         }
       }
       break;
@@ -1197,14 +1123,12 @@ static size_t collect_para_items(const LaidOut& lp, size_t start_idx, uint16_t s
 
     auto r = lp.collect(idx, avail);
     if (!r) {
-      MR_TRACE("    fwd idx=%zu avail=%u -> NO FIT (exhausted or too tall)", idx, (unsigned)avail);
       break;
     }
 
     if (r->item.kind == PageItem::PageBreak) {
       boundary = {static_cast<uint16_t>(lp.para_idx + 1), 0};
       pending_page_break = has_content;
-      MR_TRACE("    fwd PageBreak -> boundary={p=%u,0}", (unsigned)(lp.para_idx + 1));
       break;
     }
 
@@ -1212,10 +1136,6 @@ static size_t collect_para_items(const LaidOut& lp, size_t start_idx, uint16_t s
     uint16_t new_pd =
         (r->item.kind == PageItem::TextLine) ? static_cast<uint16_t>(r->item.height - r->item.baseline) : 0;
 
-    MR_TRACE("    fwd idx=%zu kind=%s h=%u bl=%u avail=%u gap=%u pd=%u->%u -> used %u->%u", idx,
-             trace_kind(r->item.kind), (unsigned)r->item.height, (unsigned)r->item.baseline, (unsigned)avail,
-             (unsigned)gap, (unsigned)pending_desc, (unsigned)new_pd, (unsigned)used,
-             (unsigned)(used + pending_desc + gap + item_cost));
 
     used += pending_desc + gap + item_cost;
     pending_desc = new_pd;
@@ -1283,17 +1203,7 @@ std::vector<LayoutLine> TextLayout::layout_paragraph(const LayoutOptions& opts, 
 }
 
 PageContent TextLayout::layout() const {
-#ifdef ESP_PLATFORM
-  g_layout_hyph_us = 0;
-  g_layout_metrics_us = 0;
-  g_layout_para_us = 0;
-  g_layout_cache_misses = 0;
-#endif
-  MR_TRACE("=== layout() FORWARD from {p=%u,off=%u,to=%u} ===", (unsigned)position_.paragraph,
-           (unsigned)position_.offset, (unsigned)position_.text_offset);
   auto c = collect_page_items(position_);
-  MR_TRACE("=== forward done: items=%zu boundary={p=%u,off=%u} at_end=%d ===", c.items.size(),
-           (unsigned)c.boundary.paragraph, (unsigned)c.boundary.offset, (int)c.at_chapter_end);
   return assemble_page(c.items, position_, c.boundary, c.at_chapter_end);
 }
 
@@ -1333,8 +1243,6 @@ static size_t paragraph_end_idx(const LaidOut& lp) {
 // Returns the remaining start offset within the paragraph (0 = fully consumed).
 static size_t collect_para_items_bwd(const LaidOut& lp, size_t end_idx, uint16_t spc, uint16_t ph, uint16_t& used,
                                      uint16_t& pending_desc, bool& page_full, std::vector<PageItem>& rev_items) {
-  MR_TRACE("  bwd para %u: end_idx=%zu spc=%u used=%u ph=%u pd=%u", (unsigned)lp.para_idx, end_idx, (unsigned)spc,
-           (unsigned)used, (unsigned)ph, (unsigned)pending_desc);
   size_t idx = end_idx;
   bool first_item = true;
   while (idx > 0 && !page_full) {
@@ -1345,7 +1253,6 @@ static size_t collect_para_items_bwd(const LaidOut& lp, size_t end_idx, uint16_t
       auto probe = lp.collect_backward(idx, ph);
       if (probe) {
         page_full = true;
-        MR_TRACE("    bwd idx=%zu avail=0 -> page_full", idx);
       }
       break;
     }
@@ -1357,9 +1264,7 @@ static size_t collect_para_items_bwd(const LaidOut& lp, size_t end_idx, uint16_t
       auto probe = lp.collect_backward(idx, ph, !is_bottommost);
       if (probe) {
         page_full = true;
-        MR_TRACE("    bwd idx=%zu avail=%u -> item too tall, page_full", idx, (unsigned)avail);
       } else {
-        MR_TRACE("    bwd idx=%zu -> exhausted", idx);
       }
       break;
     }
@@ -1369,10 +1274,6 @@ static size_t collect_para_items_bwd(const LaidOut& lp, size_t end_idx, uint16_t
     uint16_t item_cost = (is_bottommost && r->item.kind == PageItem::TextLine) ? r->item.baseline : r->item.height;
     uint16_t new_pd = 0;
 
-    MR_TRACE("    bwd idx=%zu kind=%s h=%u bl=%u avail=%u gap=%u pd=%u->%u -> used %u->%u next_idx=%zu", idx,
-             trace_kind(r->item.kind), (unsigned)r->item.height, (unsigned)r->item.baseline, (unsigned)avail,
-             (unsigned)gap, (unsigned)pending_desc, (unsigned)new_pd, (unsigned)used,
-             (unsigned)(used + pending_desc + gap + item_cost), r->next_idx);
 
     used += pending_desc + gap + item_cost;
     pending_desc = new_pd;
@@ -1478,11 +1379,7 @@ TextLayout::CollectResult TextLayout::collect_page_items_backward(PagePosition e
 }
 
 PageContent TextLayout::layout_backward() const {
-  MR_TRACE("=== layout_backward() from {p=%u,off=%u,to=%u} ===", (unsigned)position_.paragraph,
-           (unsigned)position_.offset, (unsigned)position_.text_offset);
   auto c = collect_page_items_backward(position_);
-  MR_TRACE("=== backward done: items=%zu start={p=%u,off=%u} at_end=%d ===", c.items.size(),
-           (unsigned)c.boundary.paragraph, (unsigned)c.boundary.offset, (int)c.at_chapter_end);
   return assemble_page(c.items, c.boundary, position_, c.at_chapter_end);
 }
 

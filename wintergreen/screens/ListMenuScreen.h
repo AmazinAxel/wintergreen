@@ -33,18 +33,6 @@ class ListMenuScreen : public IScreen {
     initial_selection_ = index;
   }
 
-  // Global font size — affects all ListMenuScreen instances (static).
-  // 0 = small (14px), 1 = medium (18px), 2 = large (24px)
-  static void set_font_size(int size) {
-    font_size_idx_ = size;
-  }
-  static int font_size() {
-    return font_size_idx_;
-  }
-  // Initialise `out` with the MBF4 data for the current menu font size.
-  // Declared here; implemented in ListMenuScreen.cpp (which owns the font headers).
-  static void apply_ui_font(BitmapFont& out);
-
  protected:
   const char* title_ = nullptr;
   const char* title2_ = nullptr;
@@ -61,14 +49,6 @@ class ListMenuScreen : public IScreen {
   // screens (chapter select, links) that appear on top of the reader.
   bool plain_list_ = false;
 
-
-  // 0 = center (default), 1 = left, 2 = right
-  void set_list_align(uint8_t align) {
-    list_align_ = align;
-  }
-  uint8_t list_align() const {
-    return list_align_;
-  }
 
   void add_item(const std::string& label, int indent = 0) {
     owned_strings_.push_back(label);
@@ -116,6 +96,17 @@ class ListMenuScreen : public IScreen {
   // Returns true if the cursor may land on this item. Default: not a separator.
   // Override to additionally exclude theme-irrelevant items.
   virtual bool is_item_focusable(int index) const { return !is_separator(index); }
+  // A row that never has a subtitle (MainMenu's Sync action) and is therefore
+  // one line tall instead of two. Two-line rows are the default.
+  virtual bool is_single_line_row(int) const { return false; }
+
+  // Separator geometry, shared by every list in the tree — the book list, the
+  // book-details list and QuickmenuScreen's own draw pass — so a hairline
+  // sits in the same gap wherever it appears. Do not re-declare a local kSepH.
+  static constexpr int kSeparatorH = 14;
+  static void draw_separator_(DrawBuffer& buf, int W, int y) {
+    buf.fill_rect(0, y + kSeparatorH / 2, W, 1, false);
+  }
   virtual int count() const {
     return static_cast<int>(labels_.size());
   }
@@ -162,7 +153,6 @@ class ListMenuScreen : public IScreen {
   BitmapFont header_font_;
   BitmapFont subtitle_font_;   // always small; used for item subtitles and tight labels
   BitmapFont section_font_;    // one step below ui_font_; use for APPEARANCE/NAVIGATE etc.
-  static int font_size_idx_;  // 0=Normal, 1=Large, 2=XLarge
 
   // The battery percentage, top right. Every screen calls this — the position is
   // fixed here rather than per-screen so the header does not shift by a pixel
@@ -212,7 +202,6 @@ class ListMenuScreen : public IScreen {
   int hold_reps_up_ = 0;    // repeats fired so far this hold; drives the step size
   int hold_reps_down_ = 0;
 
-  uint8_t list_align_ = 0;  // 0=center, 1=left, 2=right
   bool on_start_set_selection_ = false;
   bool force_redraw_ = false;
 
@@ -228,7 +217,9 @@ class ListMenuScreen : public IScreen {
   int draw_header_(DrawBuffer& buf, int W, int H, std::optional<uint8_t> battery_pct = {}) const;
 
   // height of one list item slot (title + subtitle + padding + divider).
-  int wintergreen_slot_h_() const;
+  // Height of one item slot. Pass a row index for a per-row height (single-line
+  // rows are shorter); -1 gives the two-line default.
+  int wintergreen_slot_h_(int index = -1) const;
 
   // how many items are visible starting at scroll_off given available_h pixels.
   // Accounts for separator items being shorter than regular slots.

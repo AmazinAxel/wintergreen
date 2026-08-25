@@ -5,7 +5,7 @@
 #include <vector>
 
 #include "../ContentModel.h"
-#include "MrbFormat.h"
+#include "WgbFormat.h"
 
 namespace wintergreen {
 
@@ -40,24 +40,24 @@ class BufferedFileWriter {
   uint8_t buf_[kBufSize];
 };
 
-// Writes an MRB file sequentially.  Usage:
+// Writes an WGB file sequentially.  Usage:
 //
-//   MrbWriter w;
-//   w.open("book.mrb");
+//   WgbWriter w;
+//   w.open("book.wgb");
 //   w.begin_chapter();
 //   w.write_paragraph(para);
 //   w.end_chapter();
 //   w.finish(metadata, toc);
 //
-class MrbWriter {
+class WgbWriter {
  public:
-  MrbWriter() = default;
-  ~MrbWriter() {
+  WgbWriter() = default;
+  ~WgbWriter() {
     close();
   }
 
-  MrbWriter(const MrbWriter&) = delete;
-  MrbWriter& operator=(const MrbWriter&) = delete;
+  WgbWriter(const WgbWriter&) = delete;
+  WgbWriter& operator=(const WgbWriter&) = delete;
 
   bool open(const char* path);
   void close();
@@ -87,7 +87,7 @@ class MrbWriter {
     return idx < image_data_.size() && !image_data_[idx].empty();
   }
 
-  // Update the size of an existing image ref (used by MRB converter after
+  // Update the size of an existing image ref (used by WGB converter after
   // lazy resolution).  No-op if idx is out of range.
   void update_image_size(uint16_t idx, uint16_t width, uint16_t height);
 
@@ -96,19 +96,14 @@ class MrbWriter {
     return idx < images_.size() && (images_[idx].width != 0 || images_[idx].height != 0);
   }
 
-  // Add an anchor (id → paragraph) for runtime link fragment navigation.
-  // Call after all chapters are written, before finish().
-  void add_anchor(uint16_t chapter_idx, uint16_t para_index, const char* id, size_t id_len);
-
-  // Finalize: write index tables, metadata, TOC, spine file table, and fix up header.
-  // spine_files: base filenames of each spine item (index = chapter index).
-  bool finish(const EpubMetadata& meta, const TableOfContents& toc, const std::vector<std::string>& spine_files = {});
+  // Finalize: write index tables, metadata, TOC and fix up header.
+  bool finish(const EpubMetadata& meta, const TableOfContents& toc);
 
  private:
   BufferedFileWriter bw_;
   uint32_t paragraph_count_ = 0;
-  std::vector<MrbChapterEntry> chapters_;
-  std::vector<MrbImageRef> images_;
+  std::vector<WgbChapterEntry> chapters_;
+  std::vector<WgbImageRef> images_;
   std::vector<std::vector<uint8_t>> image_data_;  // parallel to images_
   bool in_chapter_ = false;
 
@@ -119,16 +114,13 @@ class MrbWriter {
   // Descriptor table: streamed to a single temp file for the whole book.
   // Each 8-byte entry {file_offset(u32), char_offset(u32)} is appended as paragraphs
   // are written. end_chapter() seeks back to chapter_desc_start_ and copies exactly
-  // chapter_para_count_*8 bytes into the MRB. Zero heap allocation, one FD, unbounded.
+  // chapter_para_count_*8 bytes into the WGB. Zero heap allocation, one FD, unbounded.
   FILE* desc_tmp_ = nullptr;
   char desc_tmp_path_[260] = {};
   uint32_t chapter_desc_start_ = 0;  // byte offset in desc_tmp_ where current chapter begins
 
   // Anchor table: streamed directly to a temp file during conversion to avoid
-  // large contiguous RAM allocation. Copied into the MRB at finish().
-  FILE* anchor_tmp_ = nullptr;
-  char anchor_tmp_path_[260] = {};
-  uint32_t anchor_count_ = 0;
+  // large contiguous RAM allocation. Copied into the WGB at finish().
 
   // Write raw bytes.
   bool write_bytes(const void* data, size_t size);

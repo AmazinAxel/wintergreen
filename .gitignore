@@ -1,13 +1,11 @@
 # cache
 .pio
+.build/
 __pycache__
-assets_embedded.S
 
-# build stuff
+# build output
 firmware.bin
-assets.bin
 sdkconfig.esp32c3
 
 # DO NOT COMMIT YOUR WIFI PASSWORD!!
 WintergreenConfig.h
-.build/

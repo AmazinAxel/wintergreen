@@ -44,27 +44,19 @@ struct ButtonState {
   mutable uint8_t press_history_pos_ = 0;
 };
 
-// Auto-repeat for a held button. Timings come from config::kHoldDelayMs and
-// config::kHoldRepeatMs in WintergreenConfig.h.
-//
-// Repeats are driven by elapsed time, never by frame count. Frame duration varies
-// with how much rendering a screen did and whether the panel was refreshing, so
-// counting frames ties repeat speed to render speed: when refreshes stopped
-// blocking, frames got ~10x shorter and a plain tap started registering as two
-// presses. Feed this runtime.frame_time_ms() (the measured last frame).
-struct HoldRepeat {
+struct HoldRepeat { // button holding
   static constexpr uint32_t kMaxPerTick = 4;
 
   uint32_t held_ms = 0;
-  uint32_t fired = 0;  // repeats already emitted during this hold
+  uint32_t fired = 0; // how many repeats this hold
 
-  // True when the button is not currently held.
+  // True when the button is not currently held
   bool idle() const {
     return held_ms == 0;
   }
 
-  // Advance one frame. Returns how many repeats to apply now (0 on a tap).
-  // May return >1 after a long frame, so a slow render cannot throttle the rate.
+  // Advance one frame and return how many repeats to apply now (0 on a tap)
+  // May return >1 after a long frame, so a slow render cannot throttle the rate
   int tick(bool down, uint32_t dt_ms) {
     if (!down) {
       held_ms = 0;
