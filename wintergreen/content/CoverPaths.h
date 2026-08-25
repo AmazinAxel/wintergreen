@@ -32,9 +32,9 @@ std::string book_pos_path(const char* book_path, const char* data_dir);
 // pass at a near-1:1 ratio is what made the home cover look coarse.
 //
 // Derived from HomeScreen::draw_all_'s layout. Note the panel's app-space
-// height is **786**, not 800: DisplayFrame::kPhysicalWidth excludes the hidden
-// rows at the top and bottom of the glass. Getting that wrong is what made
-// these 14 px too tall, which quietly put every home cover through the
+// height is **793**, not 800: DisplayFrame::kPhysicalWidth excludes the 7
+// hidden columns at the leading edge of the glass. Getting that wrong is what
+// made these too tall, which quietly put every home cover through the
 // downscale path it exists to avoid.
 //
 //   battery_row_h_ = kBatteryPadY(10) + ui_large.y_advance(31)          =  41

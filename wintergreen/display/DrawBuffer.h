@@ -513,7 +513,7 @@ class DrawBuffer {
 
   // Lend the spare as a plain scratch buffer, for a caller that needs kBufSize
   // bytes and is not drawing. Only used by the sleep path, which reads the whole
-  // cover file in one fread instead of one per row: 786 rows is 786 FATFS + SPI
+  // cover file in one fread instead of one per row: 793 rows is 793 FATFS + SPI
   // round trips on a 20 MHz card, and the spare is idle at sleep time.
   //
   // Whatever the spare held is destroyed, hence the invalidate — the snapshot and

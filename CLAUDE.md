@@ -1830,9 +1830,22 @@ What the converter does, and why each step is there:
 
 Nothing is cropped off the artwork; it is stretched, not filled by cropping.
 
-**The panel's app-space height is 786, not 800.** `DisplayFrame::kPhysicalWidth` is
-786 — the glass has hidden rows top and bottom — so in portrait `DrawBuffer::height()`
-is 786 and `width()` is 480. Both cover constants are derived from that, and both were
+**The panel's app-space height is 793, not 800.** `DisplayFrame::kPhysicalWidth` is
+793 and `kPanelOffsetX` is 7 — the glass hides 7 columns at the *leading edge only*,
+not split across both — so in portrait `DrawBuffer::height()` is 793 and `width()` is
+480. 7 + 793 = 800 exactly, so every panel column is reachable by drawing code.
+
+This was 10 + 786 for a long time, which left **4 columns nothing could write**. They
+kept the framebuffers' `0xFF` init and showed as a white bar along the top in
+portrait — invisible on light content, obvious against a dark book cover, and visibly
+filling in during a full refresh. Determined on hardware by dropping the offset to 7
+alone: the bar moved *wholesale* to the trailing edge rather than splitting in two,
+which is what proves the hidden columns are all at one end.
+
+The 480 axis (portrait width) is `kPhysicalHeight` and has no offset and no hidden
+pixels — it was never involved and has no slack to reclaim.
+
+Both cover constants are derived from the height, and both were
 once written against 800: `kSleepCoverH` by 14 px, which made *every* sleep cover fail
 the exact-size check and fall back to the wordmark, and `kHomeCoverH` by the same 14,
 which silently put every home cover through the box-filter-and-re-dither path it

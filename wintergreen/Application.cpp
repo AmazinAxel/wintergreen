@@ -25,7 +25,8 @@ namespace wintergreen {
 // blitted 1:1. Nothing at runtime can adapt if the two disagree — the size
 // check in show_book_cover_sleep_ simply fails and the wordmark shows instead —
 // so the mismatch is caught here rather than on the glass. It said 800 once
-// (the panel hides 14 rows; app space is 786) and no cover ever appeared.
+// (the panel hides 7 columns at the leading edge; app space is 793) and no
+// cover ever appeared.
 static_assert(kSleepCoverW == DrawBuffer::kWidth, "sleep cover must be panel width");
 static_assert(kSleepCoverH == DrawBuffer::kHeight, "sleep cover must be panel height");
 
@@ -121,7 +122,7 @@ static bool show_book_cover_sleep_(DrawBuffer& buf, const char* data_dir, const 
   const int stride = (W + 7) / 8;
   const size_t body = static_cast<size_t>(stride) * H;
 
-  // One fread for the whole image where possible. Row-at-a-time is 786 FATFS +
+  // One fread for the whole image where possible. Row-at-a-time is 793 FATFS +
   // SPI round trips on a 20 MHz card and dominated the time to show a sleep
   // cover. The spare framebuffer is idle at sleep time and is big enough, so
   // this needs no allocation; when it has been released (Wi-Fi sync) fall back
