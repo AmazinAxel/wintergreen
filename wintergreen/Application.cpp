@@ -62,8 +62,14 @@ void Application::start(DrawBuffer& buf, IRuntime& runtime) {
   // when it is empty, so this costs nothing extra.
   if (data_dir_ && BookIndex::instance().entries().empty())
     BookIndex::instance().load(index_path_);
-  const bool empty_library = BookIndex::instance().entries().empty();
-  screen_mgr_.push(empty_library ? static_cast<IScreen*>(&menu_) : static_cast<IScreen*>(&home_), buf, runtime);
+
+  // The carousel shows the most recently *opened* books, so it needs reading
+  // history, not merely a non-empty library. With none it would fall back to
+  // showing arbitrary books under a "recents" framing, so start on the list.
+  bool any_opened = false;
+  for (const auto& e : BookIndex::instance().entries())
+    if (e.last_open_order != 0) { any_opened = true; break; }
+  screen_mgr_.push(any_opened ? static_cast<IScreen*>(&home_) : static_cast<IScreen*>(&menu_), buf, runtime);
 
   // Don't auto-open books from the hidden folder
   if (!pending_book_path_.empty() && pending_book_path_.find("/.hidden/") != std::string::npos)
@@ -113,18 +119,43 @@ static bool show_book_cover_sleep_(DrawBuffer& buf, const char* data_dir, const 
   }
 
   const int stride = (W + 7) / 8;
-  uint8_t row[(kSleepCoverW + 7) / 8];
-  if (stride > static_cast<int>(sizeof(row))) { std::fclose(f); return false; }
-  for (int y = 0; y < H; ++y) {
-    if (std::fread(row, 1, stride, f) != static_cast<size_t>(stride)) {
-      std::fclose(f);
-      return false;  // truncated: whatever reached the buffer is discarded unrefreshed
-    }
-    buf.blit_1bit_row(0, y, row, W);
-  }
-  std::fclose(f);
+  const size_t body = static_cast<size_t>(stride) * H;
 
-  buf.full_refresh(RefreshMode::Full, /*turnOffScreen=*/true);
+  // One fread for the whole image where possible. Row-at-a-time is 786 FATFS +
+  // SPI round trips on a 20 MHz card and dominated the time to show a sleep
+  // cover. The spare framebuffer is idle at sleep time and is big enough, so
+  // this needs no allocation; when it has been released (Wi-Fi sync) fall back
+  // to the row loop rather than growing the heap on the way to sleep.
+  uint8_t* scratch = (body <= DrawBuffer::kBufSize) ? buf.borrow_spare_scratch() : nullptr;
+  if (scratch) {
+    if (std::fread(scratch, 1, body, f) != body) {
+      std::fclose(f);
+      return false;  // truncated: nothing has been drawn yet, so the caller's fallback is clean
+    }
+    std::fclose(f);
+    for (int y = 0; y < H; ++y)
+      buf.blit_1bit_row(0, y, scratch + static_cast<size_t>(y) * stride, W);
+  } else {
+    uint8_t row[(kSleepCoverW + 7) / 8];
+    if (stride > static_cast<int>(sizeof(row))) { std::fclose(f); return false; }
+    for (int y = 0; y < H; ++y) {
+      if (std::fread(row, 1, stride, f) != static_cast<size_t>(stride)) {
+        std::fclose(f);
+        return false;  // truncated: whatever reached the buffer is discarded unrefreshed
+      }
+      buf.blit_1bit_row(0, y, row, W);
+    }
+    std::fclose(f);
+  }
+
+  // Half, not Full: Full is differential and takes active_() as the waveform's
+  // starting state, but active_() is only correct when the last panel write went
+  // through refresh()/full_refresh(). commit_offscreen() and restore_snapshot()
+  // both write inactive_() without flipping active_idx_, so after a pre-drawn
+  // page turn or a quick-menu dismiss the "previous" frame is wrong and the
+  // waveform under-drives — leaving the book text on the glass instead of the
+  // cover. Half ignores prev and paints from `pixels` alone.
+  buf.full_refresh(RefreshMode::Half, /*turnOffScreen=*/true);
   buf.deep_sleep();
   return true;
 }

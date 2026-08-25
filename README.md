@@ -33,7 +33,10 @@ Paste and fill the following settings into the `WintergreenConfig.h` file in you
 namespace wintergreen::config {
   inline constexpr const char* kWifiName = "";
   inline constexpr const char* kWifiPassword = "";
-  inline constexpr const char* syncServer = "alechomelab.local";
+  // **A `.local` name will not work here** — that is mDNS, and the firmware has
+  // no mDNS resolver. Use a literal IP (no lookup at all), or a plain hostname
+  // if your router resolves its own DHCP leases.
+  inline constexpr const char* syncServer = "10.0.0.194";
 
   inline constexpr bool kSunlightFadingFix = false;
   inline constexpr uint8_t kAutoSleepMinutes = 2;

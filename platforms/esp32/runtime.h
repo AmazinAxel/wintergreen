@@ -141,6 +141,13 @@ class Esp32Runtime final : public wintergreen::IRuntime {
   void start_sync() override {
     wg_sync::start();
   }
+  // TEMPORARY — remove with wg_sync::FailStage.
+  uint8_t sync_fail_stage() const override {
+    return wg_sync::fail_stage();
+  }
+  uint32_t sync_fail_heap_kb() const override {
+    return wg_sync::fail_heap_kb();
+  }
 
  private:
   // Dynamic frequency scaling. Note this is the only thing in the tree whose

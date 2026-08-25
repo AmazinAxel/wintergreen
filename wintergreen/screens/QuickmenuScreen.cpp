@@ -91,16 +91,15 @@ int QuickmenuScreen::header_h_() const {
   h += static_cast<int>(title_lines_.size()) * title_font_().y_advance();
   if (!chapter_lines_.empty())
     h += kBlockGap + static_cast<int>(chapter_lines_.size()) * chapter_font_().y_advance();
+  // kHeaderTop again below the last line, so the highlight box has the same
+  // padding at the bottom as at the top; it is inside the box, not around it.
+  h += kHeaderTop;
   // The rule under the header is drawn with the shared draw_separator_(), so it
   // occupies exactly kSeparatorH like every other hairline in the tree — half
-  // above the line, half below.
-  //
-  // kBlockGap on top of that, because kSeparatorH/2 is the whole gap between the
-  // rule and the last line of the header, whereas the settings/chapters hairline
-  // has a row's kRowPad on each side of it. Without this the header text sits
-  // hard against its rule while every other divider in the tree breathes. Must
-  // match draw_all_.
-  return h + kBlockGap + kSeparatorH;
+  // above the line, half below — and content butts against both ends of that
+  // gap. Don't pad it further here or this divider reads twice as loose as the
+  // rest. Must match draw_all_.
+  return h + kSeparatorH;
 }
 
 // Build a "Label: Value" string into a fixed buffer.
@@ -306,13 +305,14 @@ void QuickmenuScreen::draw_all_(DrawBuffer& buf, std::optional<uint8_t> battery_
   // The header block is item kIdxBack. When it is selected the whole block —
   // title, chapter and both percentages — is inverted, exactly as a list row is,
   // and Confirm returns to the book. The fill runs from the top of the panel to
-  // the rule, so the block reads as one target rather than as text that happens
-  // to be highlighted.
+  // the *start* of the separator gap, so the block reads as one target rather
+  // than as text that happens to be highlighted.
   const bool head_sel = (selected() == kIdxBack);
   if (head_sel)
-    // Up to the rule, which draw_separator_ places at the midpoint of the
-    // kSeparatorH gap the header block ends with.
-    buf.fill_rect(0, 0, W, header_h_() - kSeparatorH / 2, false);
+    // Stops where the kSeparatorH gap begins. Running it to the rule instead
+    // (header_h_() - kSeparatorH / 2) swallows the gap above the hairline, and
+    // the separator loses its clearance on one side.
+    buf.fill_rect(0, 0, W, header_h_() - kSeparatorH, false);
 
   // ── Book title, with the book percentage at the right of its first line ──
   for (size_t i = 0; i < title_lines_.size(); ++i) {
@@ -341,8 +341,10 @@ void QuickmenuScreen::draw_all_(DrawBuffer& buf, std::optional<uint8_t> battery_
     }
   }
 
+  // Bottom padding inside the highlight box, matching header_top_().
+  y += kHeaderTop;
+
   // Same helper, same geometry as every other hairline — see header_h_().
-  y += kBlockGap;
   draw_separator_(buf, W, y);
   y += kSeparatorH;  // must match header_h_()
 

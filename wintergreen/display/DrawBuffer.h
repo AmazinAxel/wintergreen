@@ -24,8 +24,14 @@ enum class GrayPlane { BW, LSB, MSB };
 
 // Physical screen constants and bit-packed pixel helpers (used internally by DrawBuffer).
 struct DisplayFrame {
-  static constexpr int kPhysicalWidth = 786;  // visible app-space width (panel has hidden area at the top and bottom)
-  static constexpr int kPanelOffsetX = 10;    // hidden columns at the left edge of the 800px panel
+  // 7 + 793 = 800: the panel's hidden columns are all at the leading edge, not
+  // split across both. This said 10 + 786 once, leaving 4 columns that no
+  // drawing code could reach — they kept the buffers' 0xFF init and showed as a
+  // white bar along the top in portrait, most visible against a dark cover.
+  // Determined on hardware: dropping the offset to 7 moved the bar wholesale to
+  // the trailing edge rather than splitting it, so nothing is hidden there.
+  static constexpr int kPhysicalWidth = 793;  // visible app-space width
+  static constexpr int kPanelOffsetX = 7;     // hidden columns at the leading edge of the 800px panel
   static constexpr int kPanelWidth = 800;
   static constexpr int kPhysicalHeight = 480;
   static constexpr int kStride = kPanelWidth / 8;  // 100 bytes/row (800 divisible by 8)
@@ -476,6 +482,49 @@ class DrawBuffer {
   // clobber this.
   enum class Spare : uint8_t { None, Snapshot, Offscreen };
 
+  // Hand the spare framebuffer back to the heap, and take it again afterwards.
+  //
+  // This exists for one caller: the Wi-Fi sync. Two static framebuffers are
+  // 96 KB of BSS and the spare is another 48 KB of heap, which on a 320 KB part
+  // left ~20 KB free — and esp_wifi_init() needs roughly 50 KB, so it failed
+  // outright with no clue why (see "NAS book sync" in CLAUDE.md).
+  //
+  // Safe because the spare is **purely an optimisation**: without it a quick
+  // menu dismiss re-renders and a page turn re-draws, which is what happened
+  // before it existed. Both claim paths already null-check it.
+  //
+  // spare_use_ must be reset here: has_snapshot()/has_offscreen() test only that
+  // enum, so leaving it set would let restore_snapshot() memcpy from a freed
+  // pointer.
+  void release_spare() {
+    std::free(spare_);
+    spare_ = nullptr;
+    spare_use_ = Spare::None;
+    // draw_() resolves through draw_target_; if an offscreen draw was in
+    // progress the target must go back to a real buffer.
+    draw_target_ = nullptr;
+  }
+
+  // Best-effort: staying without it costs latency, not correctness.
+  void reacquire_spare() {
+    if (!spare_)
+      spare_ = static_cast<uint8_t*>(std::malloc(kBufSize));
+  }
+
+  // Lend the spare as a plain scratch buffer, for a caller that needs kBufSize
+  // bytes and is not drawing. Only used by the sleep path, which reads the whole
+  // cover file in one fread instead of one per row: 786 rows is 786 FATFS + SPI
+  // round trips on a 20 MHz card, and the spare is idle at sleep time.
+  //
+  // Whatever the spare held is destroyed, hence the invalidate — the snapshot and
+  // the pre-drawn page are both meaningless once the device is going to sleep.
+  // Returns null when the spare has been released (Wi-Fi sync); the caller must
+  // then fall back to reading row by row.
+  uint8_t* borrow_spare_scratch() {
+    spare_use_ = Spare::None;
+    return spare_;
+  }
+
   void save_snapshot() {
     if (!spare_)
       return;
@@ -827,24 +876,79 @@ class DrawBuffer {
     }
   };
 
+  // Decode MGR2 into both RAM planes in one pass over the source.
+  //
+  // Both planes are bits of the same 2-bit value, so the previous two passes
+  // read (and bit-twiddled) every pixel twice — ~377k iterations each, with a
+  // divide and a variable shift per pixel — to produce data already in hand.
+  // One pass builds both bytes together, 8 pixels at a time: 4 pixels per source
+  // byte means one output byte is exactly two source bytes, so the inner loop is
+  // a fixed unroll with no per-pixel indexing.
+  //
+  // BW goes to the inactive buffer as before; RED needs its own kBufSize, which
+  // is what the spare is for. Without the spare (Wi-Fi sync released it) fall
+  // back to decoding RED in a second pass.
   void show_mgr2_sleep_(Mgr2Source_& src) {
-    auto decode_pass = [&](bool red_bit) {
-      fill(false);
-      for (uint16_t y = 0; y < src.h && y < DisplayFrame::kPhysicalHeight; ++y) {
-        const uint8_t* src_row = src.get_row(y);
-        uint8_t* dst = inactive_() + static_cast<size_t>(y) * DisplayFrame::kStride;
-        for (int x = 0; x < static_cast<int>(src.w); x++) {
-          int state = (src_row[x / 4] >> (6 - (x % 4) * 2)) & 0x3;
-          if (red_bit ? (state >> 1) : (state & 1))
-            dst[x / 8] |= static_cast<uint8_t>(0x80 >> (x % 8));
+    const int rows = std::min<int>(src.h, DisplayFrame::kPhysicalHeight);
+    const int full_bytes = std::min<int>(src.w / 8, DisplayFrame::kStride);
+
+    auto decode_row = [&](const uint8_t* sr, uint8_t* bw, uint8_t* red) {
+      for (int b = 0; b < full_bytes; ++b) {
+        const uint8_t s0 = sr[b * 2], s1 = sr[b * 2 + 1];
+        uint8_t bw_byte = 0, red_byte = 0;
+        // s0 holds pixels 0-3, s1 pixels 4-7, each 2 bits, MSB-first.
+        for (int i = 0; i < 4; ++i) {
+          const uint8_t v = (s0 >> (6 - i * 2)) & 0x3;
+          bw_byte |= static_cast<uint8_t>((v & 1) << (7 - i));
+          red_byte |= static_cast<uint8_t>((v >> 1) << (7 - i));
         }
+        for (int i = 0; i < 4; ++i) {
+          const uint8_t v = (s1 >> (6 - i * 2)) & 0x3;
+          bw_byte |= static_cast<uint8_t>((v & 1) << (3 - i));
+          red_byte |= static_cast<uint8_t>((v >> 1) << (3 - i));
+        }
+        bw[b] = bw_byte;
+        red[b] = red_byte;
+      }
+      // Tail pixels beyond the last whole byte, if the image is not 8-aligned.
+      for (int x = full_bytes * 8; x < static_cast<int>(src.w) && x < DisplayFrame::kPanelWidth; ++x) {
+        const uint8_t v = (sr[x / 4] >> (6 - (x % 4) * 2)) & 0x3;
+        const uint8_t mask = static_cast<uint8_t>(0x80 >> (x % 8));
+        if (v & 1) bw[x / 8] |= mask;
+        if (v >> 1) red[x / 8] |= mask;
       }
     };
 
-    decode_pass(false);
-    display_.write_ram_bw(inactive_());
-    decode_pass(true);
-    display_.write_ram_red(inactive_());
+    uint8_t* red_buf = spare_;
+    if (red_buf) {
+      memset(inactive_(), 0x00, kBufSize);
+      memset(red_buf, 0x00, kBufSize);
+      spare_use_ = Spare::None;  // contents destroyed; nothing survives sleep anyway
+      for (int y = 0; y < rows; ++y)
+        decode_row(src.get_row(static_cast<uint16_t>(y)),
+                   inactive_() + static_cast<size_t>(y) * DisplayFrame::kStride,
+                   red_buf + static_cast<size_t>(y) * DisplayFrame::kStride);
+      display_.write_ram_bw(inactive_());
+      display_.write_ram_red(red_buf);
+    } else {
+      auto decode_pass = [&](bool red_bit) {
+        fill(false);
+        for (int y = 0; y < rows; ++y) {
+          const uint8_t* src_row = src.get_row(static_cast<uint16_t>(y));
+          uint8_t* dst = inactive_() + static_cast<size_t>(y) * DisplayFrame::kStride;
+          for (int x = 0; x < static_cast<int>(src.w); x++) {
+            int state = (src_row[x / 4] >> (6 - (x % 4) * 2)) & 0x3;
+            if (red_bit ? (state >> 1) : (state & 1))
+              dst[x / 8] |= static_cast<uint8_t>(0x80 >> (x % 8));
+          }
+        }
+      };
+      decode_pass(false);
+      display_.write_ram_bw(inactive_());
+      decode_pass(true);
+      display_.write_ram_red(inactive_());
+    }
+
     display_.grayscale_refresh_1pass(/*turnOffScreen=*/true);
     display_.deep_sleep();
   }

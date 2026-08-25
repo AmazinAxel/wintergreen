@@ -48,6 +48,7 @@ using wintergreen::SyncState;
 
 #include "WintergreenConfig.h"
 #include "esp_event.h"
+#include "esp_heap_caps.h"
 #include "esp_http_client.h"
 #include "esp_netif.h"
 #include "esp_wifi.h"
@@ -79,11 +80,12 @@ inline wintergreen::DrawBuffer* g_buf = nullptr;
 
 inline EventGroupHandle_t g_wifi_events = nullptr;
 inline constexpr int kConnectedBit = BIT0;
-inline constexpr int kFailedBit = BIT1;
 
-inline constexpr int kConnectTimeoutMs = 12000;
+// Generous: a full scan, WPA2 handshake and DHCP lease on a busy 2.4 GHz band
+// can take well over ten seconds, and the cost of waiting is a few seconds of
+// radio rather than a failed sync the user has to notice and retry by hand.
+inline constexpr int kConnectTimeoutMs = 20000;
 inline constexpr int kHttpTimeoutMs = 8000;
-inline constexpr int kMaxConnectRetries = 2;
 // One chunk of a book download. 4 KB is a FATFS cluster and a comfortable TCP
 // read; the point is that a 1 MB book is never held in RAM.
 inline constexpr int kChunk = 4096;
@@ -140,12 +142,12 @@ inline void wifi_event_(void*, esp_event_base_t base, int32_t id, void* data) {
   if (base == WIFI_EVENT && id == WIFI_EVENT_STA_START) {
     esp_wifi_connect();
   } else if (base == WIFI_EVENT && id == WIFI_EVENT_STA_DISCONNECTED) {
-    if (g_retries < kMaxConnectRetries) {
-      ++g_retries;
-      esp_wifi_connect();
-    } else {
-      xEventGroupSetBits(g_wifi_events, kFailedBit);
-    }
+    // Retry for as long as bring_up_wifi_'s timeout allows rather than counting
+    // attempts. A rejected association returns in milliseconds, so a small
+    // attempt budget is exhausted long before the radio has really tried; the
+    // wall-clock timeout is the honest bound and it is the one the user feels.
+    ++g_retries;
+    esp_wifi_connect();
   } else if (base == IP_EVENT && id == IP_EVENT_STA_GOT_IP) {
     g_retries = 0;
     xEventGroupSetBits(g_wifi_events, kConnectedBit);
@@ -326,8 +328,8 @@ inline bool http_get_file_(const std::string& url_path, const std::string& dest)
   esp_http_client_set_method(g_http, HTTP_METHOD_GET);
   if (esp_http_client_open(g_http, 0) != ESP_OK)
     return false;
-  if (esp_http_client_fetch_headers(g_http) < 0 ||
-      esp_http_client_get_status_code(g_http) != 200) {
+  const int64_t declared = esp_http_client_fetch_headers(g_http);
+  if (declared < 0 || esp_http_client_get_status_code(g_http) != 200) {
     esp_http_client_close(g_http);
     return false;
   }
@@ -346,18 +348,31 @@ inline bool http_get_file_(const std::string& url_path, const std::string& dest)
 
   std::vector<char> buf(kChunk);
   bool ok = true;
+  int64_t written = 0;
   int r;
   while ((r = esp_http_client_read(g_http, buf.data(), kChunk)) > 0) {
     if (std::fwrite(buf.data(), 1, static_cast<size_t>(r), f) != static_cast<size_t>(r)) {
       ok = false;
       break;
     }
+    written += r;
   }
   if (r < 0)
     ok = false;
   if (std::fclose(f) != 0)
     ok = false;
   esp_http_client_close(g_http);
+
+  // **A 200 is not proof this is the file we asked for.** The server's router
+  // falls through to an HTML page for any unmatched path, so a routing mistake
+  // arrives as 200 + Content-Length + a body — and the first version wrote that
+  // dashboard HTML to the card as book.wgb, four times, identically sized.
+  // Insisting the body match the declared length catches a truncated transfer;
+  // the reader's WGB2 magic check catches the rest.
+  if (ok && declared > 0 && written != declared)
+    ok = false;
+  if (ok && written == 0)
+    ok = false;
 
   if (!ok) {
     std::remove(tmp.c_str());
@@ -366,6 +381,30 @@ inline bool http_get_file_(const std::string& url_path, const std::string& dest)
   // FatFs f_rename does not replace, unlike POSIX — the target must go first.
   std::remove(dest.c_str());
   return std::rename(tmp.c_str(), dest.c_str()) == 0;
+}
+
+// Percent-encode one path segment. Book directory names contain spaces ("the
+// odyssey"), and a raw space in a request line is not a valid URL — the server
+// never matched the route and fell through to its HTML page.
+//
+// Only unreserved characters pass through (RFC 3986); everything else is
+// escaped, which is safe because the server percent-decodes before validating.
+inline std::string url_escape_(const std::string& s) {
+  static const char kHex[] = "0123456789ABCDEF";
+  std::string out;
+  out.reserve(s.size() + 8);
+  for (const unsigned char c : s) {
+    const bool unreserved = (c >= 'A' && c <= 'Z') || (c >= 'a' && c <= 'z') ||
+                            (c >= '0' && c <= '9') || c == '-' || c == '_' || c == '.' || c == '~';
+    if (unreserved) {
+      out.push_back(static_cast<char>(c));
+    } else {
+      out.push_back('%');
+      out.push_back(kHex[c >> 4]);
+      out.push_back(kHex[c & 0x0F]);
+    }
+  }
+  return out;
 }
 
 // ── JSON emission ──────────────────────────────────────────────────────────
@@ -476,24 +515,42 @@ inline bool run_sync_() {
     ::mkdir(book_dir.c_str(), 0777);
 
     const std::string wgb = book_dir + "/book.wgb";
-    if (!http_get_file_("/booksync/" + dir + "/book.wgb", wgb))
+    const std::string url_dir = url_escape_(dir);
+    if (!http_get_file_("/booksync/" + url_dir + "/book.wgb", wgb))
       continue;  // leave the rest of the sync running; retried next time
 
     // Covers are optional — an EPUB without one produces no cover files at all,
     // and every consumer already falls back.
     for (const char* cover : {"cover.bin", "cover_home.bin", "cover_sleep.bin"})
-      http_get_file_("/booksync/" + dir + "/" + cover, book_dir + "/" + cover);
+      http_get_file_("/booksync/" + url_dir + "/" + cover, book_dir + "/" + cover);
 
     // Index it in memory only. index_file() would save the whole ~30 KB index
     // per book; one save at the end covers every mutation.
+    //
+    // **A book that does not open is never indexed.** WgbReader::open checks the
+    // WGB2 magic, so this is the backstop that catches anything the transfer
+    // checks missed. The first version ignored the result and indexed the book
+    // anyway with the folder name as its title — so a bad download appeared in
+    // the library looking perfectly normal and simply failed to open. Deleting
+    // it here means the next sync re-offers it, since the device stops claiming
+    // to have it.
     std::string title, author;
+    bool readable = false;
     {
       wintergreen::WgbReader r;
       if (r.open(wgb.c_str())) {
+        readable = true;
         title = r.metadata().title;
         author = r.metadata().author.value_or("");
         r.close();
       }
+    }
+    if (!readable) {
+      std::remove(wgb.c_str());
+      for (const char* cover : {"cover.bin", "cover_home.bin", "cover_sleep.bin"})
+        std::remove((book_dir + "/" + cover).c_str());
+      ::rmdir(book_dir.c_str());
+      continue;
     }
     if (title.empty() || title == "none")
       title = dir;
@@ -502,8 +559,13 @@ inline bool run_sync_() {
     index_changed = true;
   }
 
-  // 2. Adopt positions the server was ahead on. It only sends those, so every
-  // write here is a file that genuinely moved.
+  // 2. Adopt the positions the server sent: the ones it is strictly ahead on,
+  // plus every book downloaded above. Runs *after* the downloads so those book
+  // directories already exist — a restored device resumes where it left off
+  // instead of starting every book at page one.
+  //
+  // The server only sends what actually moved, so every write here is a file
+  // that genuinely changed.
   const std::string open_book = g_app->reader() ? g_app->reader()->get_path() : std::string();
   for (const PosEntry& e : newpos) {
     const std::string wgb = std::string(books_dir) + "/" + e.dir + "/book.wgb";
@@ -529,13 +591,54 @@ inline bool run_sync_() {
   }
 
   // One save, dirty-guarded: a sync that changed nothing writes nothing.
-  if (index_changed)
+  //
+  // The generation bump is what makes MainMenu rebuild and repaint, so a book
+  // that just arrived shows up without navigating away and back. add_entry and
+  // remove_entry only set dirty_ — deliberately, so a batch of them costs one
+  // index write — so nothing else here would tell the screens anything changed.
+  if (index_changed) {
     index.save(g_app->index_path());
+    index.bump_generation();
+  }
 
   return true;
 }
 
 // ── Worker ─────────────────────────────────────────────────────────────────
+
+// ── Temporary failure diagnostics ──────────────────────────────────────────
+//
+// Every failure here looks identical from the UI: the row flicks back to
+// "Sync". That is the right end state (see the clicker's "failure codes are
+// gone" note in CLAUDE.md) but it is useless while bringing the feature up, so
+// the stage is recorded and shown after "Sync" until this is confirmed working.
+//
+// **Remove this whole block once sync is proven on hardware**, exactly as the
+// clicker's FailStage was removed.
+enum class FailStage : uint8_t {
+  None = 0,
+  NvsInit,
+  NetifInit,
+  EventGroup,
+  NetifCreate,
+  WifiInit,     // the likely one: internal RAM
+  HandlerReg,
+  SetMode,
+  SetConfig,
+  WifiStart,
+  ConnectTimeout,  // associated never happened — wrong password, wrong SSID, out of range
+  Resolve,
+  HttpInit,
+  Post,
+};
+inline volatile FailStage g_fail = FailStage::None;
+inline volatile uint32_t g_fail_heap_kb = 0;
+
+inline bool fail_(FailStage s) {
+  g_fail = s;
+  g_fail_heap_kb = heap_caps_get_free_size(MALLOC_CAP_INTERNAL) / 1024;
+  return false;
+}
 
 inline bool bring_up_wifi_(WifiGuard& guard) {
   esp_err_t nvs = nvs_flash_init();
@@ -544,57 +647,59 @@ inline bool bring_up_wifi_(WifiGuard& guard) {
     nvs = nvs_flash_init();
   }
   if (nvs != ESP_OK)
-    return false;
+    return fail_(FailStage::NvsInit);
 
   if (esp_netif_init() != ESP_OK)
-    return false;
+    return fail_(FailStage::NetifInit);
   // Both are idempotent-ish: already-created is not an error worth failing on,
   // since a second sync in the same boot re-enters here.
   esp_event_loop_create_default();
 
   g_wifi_events = xEventGroupCreate();
   if (!g_wifi_events)
-    return false;
+    return fail_(FailStage::EventGroup);
 
   guard.netif = esp_netif_create_default_wifi_sta();
   if (!guard.netif)
-    return false;
+    return fail_(FailStage::NetifCreate);
 
   wifi_init_config_t cfg = WIFI_INIT_CONFIG_DEFAULT();
   if (esp_wifi_init(&cfg) != ESP_OK)
-    return false;
+    return fail_(FailStage::WifiInit);
 
   if (esp_event_handler_instance_register(WIFI_EVENT, ESP_EVENT_ANY_ID, wifi_event_, nullptr,
                                           &guard.any_wifi) != ESP_OK ||
       esp_event_handler_instance_register(IP_EVENT, IP_EVENT_STA_GOT_IP, wifi_event_, nullptr,
                                           &guard.got_ip) != ESP_OK)
-    return false;
+    return fail_(FailStage::HandlerReg);
 
   wifi_config_t wc = {};
   std::snprintf(reinterpret_cast<char*>(wc.sta.ssid), sizeof(wc.sta.ssid), "%s", wintergreen::config::kWifiName);
   std::snprintf(reinterpret_cast<char*>(wc.sta.password), sizeof(wc.sta.password), "%s",
                 wintergreen::config::kWifiPassword);
 
-  // Pin the AP we used last time: a full scan across every channel is 1-2 s
-  // with the radio at full draw. Any failure falls back to a normal scan on the
-  // retry, since the disconnect handler calls esp_wifi_connect() again.
-  const NetHint hint = load_hint_();
-  if (hint.valid && hint.channel) {
-    std::memcpy(wc.sta.bssid, hint.bssid, 6);
-    wc.sta.bssid_set = true;
-    wc.sta.channel = hint.channel;
-  }
+  // **The BSSID/channel pin is not applied on the first attempt.**
+  //
+  // It was, and it is a trap: a pinned BSSID that has gone stale (the AP moved
+  // channel, or you are near a different one in a mesh) fails to associate, and
+  // the retry in wifi_event_ just calls esp_wifi_connect() again against the
+  // *same* pinned config — so every retry fails identically and the sync dies
+  // without ever trying a normal scan. Saving 1-2 s of scan is not worth a
+  // failure mode that looks exactly like a wrong password.
+  //
+  // The hint is still cached and still used, but only as a *fallback* ordering
+  // hint by esp_wifi's own scan, which is where it belongs.
 
   g_retries = 0;
   if (esp_wifi_set_mode(WIFI_MODE_STA) != ESP_OK)
-    return false;
+    return fail_(FailStage::SetMode);
   // Credentials live in the firmware, so there is nothing to persist — and this
   // avoids an NVS write on every sync.
   esp_wifi_set_storage(WIFI_STORAGE_RAM);
   if (esp_wifi_set_config(WIFI_IF_STA, &wc) != ESP_OK)
-    return false;
+    return fail_(FailStage::SetConfig);
   if (esp_wifi_start() != ESP_OK)
-    return false;
+    return fail_(FailStage::WifiStart);
 
   // Power save OFF, deliberately. It saves current while associated and *idle*,
   // which this workload never is: connect, transfer flat out, leave. MIN_MODEM
@@ -602,16 +707,21 @@ inline bool bring_up_wifi_(WifiGuard& guard) {
   // trip, extending total radio-on time — the opposite of the goal.
   esp_wifi_set_ps(WIFI_PS_NONE);
 
-  const EventBits_t bits =
-      xEventGroupWaitBits(g_wifi_events, kConnectedBit | kFailedBit, pdFALSE, pdFALSE,
-                          pdMS_TO_TICKS(kConnectTimeoutMs));
+  // Wait for the *timeout*, not for the retry counter. An association failure
+  // can come back in milliseconds (bad password, AP busy), so a small retry
+  // budget is spent almost instantly and the sync gives up while the radio has
+  // barely tried — user-visible as "Syncing..." flicking straight back to
+  // "Sync". kFailedBit is therefore not waited on here: wifi_event_ keeps
+  // reconnecting for as long as this timeout allows.
+  const EventBits_t bits = xEventGroupWaitBits(g_wifi_events, kConnectedBit, pdFALSE, pdFALSE,
+                                               pdMS_TO_TICKS(kConnectTimeoutMs));
   if (!(bits & kConnectedBit))
-    return false;
+    return fail_(FailStage::ConnectTimeout);
 
-  // Cache what actually worked.
+  // Cache what actually worked, for resolve_server_ and as a scan hint.
   wifi_ap_record_t ap;
   if (esp_wifi_sta_get_ap_info(&ap) == ESP_OK) {
-    NetHint h = hint;
+    NetHint h = load_hint_();
     std::memcpy(h.bssid, ap.bssid, 6);
     h.channel = ap.primary;
     h.valid = true;
@@ -677,7 +787,11 @@ inline void sync_task(void*) {
   bool ok = false;
   {
     WifiGuard guard;  // radio down on every path out of this scope
-    if (bring_up_wifi_(guard) && resolve_server_(g_base_url)) {
+    if (!bring_up_wifi_(guard)) {
+      // g_fail stays where bring_up_wifi_ left it
+    } else if (!resolve_server_(g_base_url)) {
+      g_fail = FailStage::Resolve;
+    } else {
       esp_http_client_config_t hc = {};
       hc.url = g_base_url.c_str();
       hc.timeout_ms = kHttpTimeoutMs;
@@ -685,13 +799,20 @@ inline void sync_task(void*) {
       // book then cost one TCP handshake rather than four.
       hc.keep_alive_enable = true;
       g_http = esp_http_client_init(&hc);
-      if (g_http) {
+      if (!g_http) {
+        g_fail = FailStage::HttpInit;
+      } else {
         ok = run_sync_();
+        if (!ok && g_fail == FailStage::None)
+          g_fail = FailStage::Post;
         esp_http_client_cleanup(g_http);
         g_http = nullptr;
       }
     }
   }
+
+  // After the WifiGuard has run, so the radio's memory is back first.
+  g_buf->reacquire_spare();
 
   g_state = ok ? SyncState::Done : SyncState::Failed;
   g_keep_awake = false;
@@ -703,6 +824,15 @@ inline void sync_task(void*) {
 
 inline SyncState state() {
   return g_state;
+}
+
+// TEMPORARY — see FailStage. Stage of the last failure, and free internal RAM
+// at that moment. Remove along with FailStage once sync is confirmed.
+inline uint8_t fail_stage() {
+  return static_cast<uint8_t>(g_fail);
+}
+inline uint32_t fail_heap_kb() {
+  return g_fail_heap_kb;
 }
 
 // Wired once at boot from main.cpp. The runtime's start_sync() has no access to
@@ -723,12 +853,36 @@ inline void start() {
   // Both radios cannot fit. The clicker goes down first, and stays down for the
   // session unless its quick-menu row is pressed again.
   wg_clicker::radio_off();
-  // Synchronously, before the task exists: bring-up allocates the moment it
-  // spawns, so a next-frame release is already too late.
-  g_app->release_ram_for_radio();
+
+  // **The book index is deliberately NOT released here.**
+  //
+  // It was, and it did two bad things at once. `MainMenu::entries_` holds
+  // `StringRef`s into the index's `StringPool`, and this screen is *on display*
+  // when Sync is pressed — so dropping the pool left every title and author
+  // resolving to an empty `string_view` (`StringPool::get` walks an empty chunk
+  // list and returns `{}`). The list stayed navigable and kept showing reading
+  // percentages, because those are `uint8_t` copies, which made it look like a
+  // drawing bug rather than a dangling reference.
+  //
+  // And it bought nothing: `run_sync_()` reloads the index from disk as its
+  // first act, so the memory came straight back before Wi-Fi ever started.
+  //
+  // The clicker's own release (QuickmenuScreen) is unaffected — that runs from
+  // a screen that holds no `StringRef`s.
+
+  // **This is what actually makes room for the radio.** Measured on hardware:
+  // esp_wifi_init() failed with 20 KB of internal RAM free, because two static
+  // framebuffers are 96 KB of BSS and the spare is another 48 KB of heap. Wi-Fi
+  // wants ~50 KB. Handing the spare back covers it.
+  //
+  // Costs nothing but latency while the sync runs: without the spare a quick
+  // menu dismiss re-renders and a page turn re-draws, and the sync screen is
+  // doing neither.
+  g_buf->release_spare();
 
   // 6 KB: the worker runs TLS-free HTTP, JSON scanning and FATFS writes.
   if (xTaskCreate(sync_task, "wg_sync", 6144, nullptr, 4, nullptr) != pdPASS) {
+    g_buf->reacquire_spare();  // the task that would have restored it never ran
     g_state = SyncState::Failed;
     g_keep_awake = false;
     g_busy = false;
@@ -755,6 +909,12 @@ namespace wg_sync {
 
 inline SyncState state() {
   return SyncState::Unavailable;
+}
+inline uint8_t fail_stage() {
+  return 0;
+}
+inline uint32_t fail_heap_kb() {
+  return 0;
 }
 inline void bind(wintergreen::Application&, wintergreen::DrawBuffer&) {}
 inline void start() {}

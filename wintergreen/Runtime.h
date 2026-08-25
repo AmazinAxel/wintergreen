@@ -90,5 +90,16 @@ class IRuntime {
   // Returns immediately; a sync takes seconds and runs on its own task. The
   // caller watches sync_state() for the outcome.
   virtual void start_sync() {}
+
+  // TEMPORARY bring-up diagnostics: stage of the last sync failure and the free
+  // internal RAM at that moment, shown on the Sync row. Remove both once the
+  // sync is confirmed working on hardware — the row is a switch, not a status
+  // console, exactly as with the clicker.
+  virtual uint8_t sync_fail_stage() const {
+    return 0;
+  }
+  virtual uint32_t sync_fail_heap_kb() const {
+    return 0;
+  }
 };
 }  // namespace wintergreen

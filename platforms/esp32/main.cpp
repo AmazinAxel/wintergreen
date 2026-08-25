@@ -149,12 +149,21 @@ extern "C" void app_main(void) {
 
   epd.begin();
 
-  // Mount the SD card (shares SPI2 with the display).
-  if (sd_init()) {
-    // State lives in two dotfiles at the card root — see set_state_root.
-    app.set_books_dir("/sdcard");
-    app.set_state_root("/sdcard");
+  // Mount the SD card (shares SPI2 with the display). Without it there is no
+  // library, no settings and no index — every screen would be an empty shell —
+  // so refuse to boot the same way a flat battery does: wordmark, then sleep.
+  if (!sd_init()) {
+    buf.show_sleep_image_embedded();
+    // Wake is level-triggered on LOW; sleeping with the button still down would
+    // wake us straight back up.
+    for (uint32_t waited = 0; waited < 5000 && gpio_get_level(kPowerPin) == 0; waited += 10)
+      vTaskDelay(pdMS_TO_TICKS(10));
+    esp_sleep_enable_gpio_wakeup_on_hp_periph_powerdown(1ULL << kPowerPin, ESP_GPIO_WAKEUP_GPIO_LOW);
+    esp_deep_sleep_start();
   }
+  // State lives in two dotfiles at the card root — see set_state_root.
+  app.set_books_dir("/sdcard");
+  app.set_state_root("/sdcard");
 
   static FontManager font_mgr(app);
   font_mgr.init();

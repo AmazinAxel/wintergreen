@@ -66,6 +66,13 @@ class BookIndex {
   // bump.
   uint64_t generation() const { return generation_; }
 
+  // For callers that batch several in-memory add_entry/remove_entry calls and
+  // then save once — the sync does this to avoid rewriting the whole index per
+  // book. Those mutators only set dirty_, so without this the screens never
+  // notice and a freshly synced book does not appear until you navigate away
+  // and back.
+  void bump_generation() { ++generation_; }
+
   // Returns false (no-op) if MAX_BOOKS has been reached.
   bool add_entry(std::string_view path, std::string_view title, std::string_view author,
                  uint32_t last_open_order = 0);

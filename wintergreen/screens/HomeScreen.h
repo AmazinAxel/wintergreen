@@ -48,6 +48,13 @@ class HomeScreen final : public ListMenuScreen {
 
   // Cover of the selected book only — loaded on demand from draw_all_(), so it
   // is ready in the same frame the selection changes.
+  //
+  // There is exactly ONE of these, deliberately. A second cache for the
+  // neighbouring book was tried and is why: at 424x479 a cover is ~25 KB, and
+  // std::vector::assign reallocates when the size differs, holding the old and
+  // new blocks at once. Three live covers is ~74 KB transiently against ~165 KB
+  // of free heap — the device ran out of memory and restarted while cycling the
+  // carousel. See "Investigated and rejected" in CLAUDE.md.
   mutable std::vector<uint8_t> cover_data_;
   mutable uint16_t cover_w_ = 0, cover_h_ = 0;
   mutable int cover_slot_ = -1;  // slot cover_data_ belongs to; -1 = nothing loaded

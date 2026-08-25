@@ -75,10 +75,8 @@ static std::vector<uint16_t> iota_indices_(size_t n) {
 void MainMenu::on_start() {
   title_ = "wintergreen";
 
-  if (!app_->data_dir_) {
-    needs_scan_ = false;
+  if (!app_->data_dir_)
     return;
-  }
 
   const std::string& index_path = app_->index_path();
 
@@ -88,13 +86,15 @@ void MainMenu::on_start() {
 
   if (BookIndex::instance().entries().empty())
     BookIndex::instance().load(index_path);
-  if (!BookIndex::instance().entries().empty()) {
-    populate_list_();
-    select_first_book_();
-    needs_scan_ = false;
-  } else {
-    needs_scan_ = true;
-  }
+
+  // Scan here, not from update(). Deferring it meant the first paint happened
+  // with an unpopulated list — a lone, vertically centred Sync row — and the
+  // real list only replaced it a frame later.
+  if (BookIndex::instance().entries().empty())
+    scan_directory_();
+
+  populate_list_();
+  select_first_book_();
   cached_generation_ = BookIndex::instance().generation();
 }
 
@@ -110,17 +110,6 @@ void MainMenu::update(const ButtonState& buttons, DrawBuffer& buf, IRuntime& run
     buf.full_refresh();
   }
 
-  if (needs_scan_) {
-    needs_scan_ = false;
-    scan_directory_(buf);
-    populate_list_();
-    select_first_book_();
-
-    draw_all_(buf, runtime.battery_percentage());
-    buf.full_refresh();
-    cached_generation_ = BookIndex::instance().generation();
-  }
-
   sync_runtime_ = &runtime;
 
   // Repaint when the Sync row's text changes. The index generation above covers
@@ -129,6 +118,9 @@ void MainMenu::update(const ButtonState& buttons, DrawBuffer& buf, IRuntime& run
   const SyncState sync_now = runtime.sync_state();
   if (sync_now != sync_shown_) {
     sync_shown_ = sync_now;
+    // TEMPORARY, with the failure label in get_item_label.
+    sync_fail_stage_ = runtime.sync_fail_stage();
+    sync_fail_heap_kb_ = runtime.sync_fail_heap_kb();
     draw_all_(buf, runtime.battery_percentage());
     buf.refresh();
   }
@@ -208,14 +200,12 @@ void MainMenu::on_back() {
   app_->pop_screen();
 }
 
-void MainMenu::scan_directory_(DrawBuffer& buf) {
+void MainMenu::scan_directory_() {
   if (!books_dir_ || !app_->data_dir_)
     return;
 
   std::string root_dir = books_dir_;
   const std::string& index_path = app_->index_path();
-
-  buf.sync_bw_ram();
 
   BookIndex::instance().build_index(root_dir);
   BookIndex::instance().save(index_path);
@@ -317,9 +307,19 @@ std::string_view MainMenu::get_item_label(int index) const {
     // read "Sync" — a failure and a fresh start call for the same action, so
     // distinguishing them would only be noise.
     switch (sync_shown_) {
-      case SyncState::Working: return "Syncing...";
+      case SyncState::Working: return "Syncing";
       case SyncState::Done:    return "Synced";
-      default:                 return "Sync";
+      // TEMPORARY: show why it failed while the feature is being brought up.
+      // Remove this case (and sync_fail_*) once sync is confirmed on hardware.
+      case SyncState::Failed:
+        if (sync_fail_stage_ != 0) {
+          std::snprintf(sync_label_buf_, sizeof(sync_label_buf_), "Sync (fail %u, %uk)",
+                        static_cast<unsigned>(sync_fail_stage_),
+                        static_cast<unsigned>(sync_fail_heap_kb_));
+          return sync_label_buf_;
+        }
+        return "Sync";
+      default: return "Sync";
     }
   }
   if (is_separator(index)) {

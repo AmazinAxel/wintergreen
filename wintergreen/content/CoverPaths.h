@@ -42,12 +42,12 @@ std::string book_pos_path(const char* book_path, const char* data_dir);
 //   below_h        = 26 + 2*ui_header.y_advance(41) + 6 + 31 + 26 + 19 + 28
 //                                                                       = 218
 //   width  = 480 - 2*kPad(16) - 2*(kFrameGap(10) + kFrameW(2))          = 424
-//   height = 786 - box_y - below_h - 2*(kFrameGap + kFrameW)            = 479
+//   height = 793 - box_y - below_h - 2*(kFrameGap + kFrameW)            = 486
 //
 // If the layout moves these drift, the fallback path takes over and quality
 // quietly regresses until the library is re-converted. Nothing breaks.
 inline constexpr int kHomeCoverW = 424;
-inline constexpr int kHomeCoverH = 479;
+inline constexpr int kHomeCoverH = 486;
 
 // The sleep screen, in panel pixels (portrait) — the whole visible panel.
 // The converter composes cover_sleep.bin at exactly this size, artwork scaled
@@ -57,6 +57,6 @@ inline constexpr int kHomeCoverH = 479;
 // Application.cpp static_asserts these against the panel — the first version of
 // this said 800 and every cover silently failed the size check.
 inline constexpr int kSleepCoverW = 480;
-inline constexpr int kSleepCoverH = 786;
+inline constexpr int kSleepCoverH = 793;
 
 }  // namespace wintergreen

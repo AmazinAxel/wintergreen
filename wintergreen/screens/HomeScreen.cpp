@@ -262,6 +262,9 @@ void HomeScreen::on_start() {
   num_books_ = 0;
   for (int i = 0; i < kMaxBooks; ++i)
     slots_[i] = BookSlot{};
+  // slots_ is about to be rebuilt from the book index, so a cached slot index
+  // is meaningless even where the number is unchanged — a sync or a serial
+  // upload reorders the recents under us.
   cover_slot_ = -1;
   cover_data_.clear();
   cover_w_ = cover_h_ = 0;

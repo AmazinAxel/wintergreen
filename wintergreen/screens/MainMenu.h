@@ -89,7 +89,6 @@ class MainMenu final : public ListMenuScreen {
   const char* books_dir_ = nullptr;
   std::string initial_selection_;   // path to pre-select after scan
   DrawBuffer* buf_ = nullptr;
-  bool needs_scan_ = false;
   // Cached BookIndex::generation() value from the last populate_list_(). When
   // update() detects a mismatch, the index was mutated externally (e.g. by a
   // serial upload/delete/rename while this screen is showing) and we refresh
@@ -148,7 +147,7 @@ class MainMenu final : public ListMenuScreen {
     return count() - 1;
   }
 
-  void scan_directory_(DrawBuffer& buf);
+  void scan_directory_();
   void populate_list_();
   // Land on the first book rather than on Sync when the screen opens. Called
   // after populate_list_() from the two paths that build the list on entry, so
@@ -166,6 +165,11 @@ class MainMenu final : public ListMenuScreen {
 
   // Last sync state painted, so the Sync row repaints when it changes.
   SyncState sync_shown_ = SyncState::Unavailable;
+  // TEMPORARY bring-up diagnostics shown on the Sync row; remove with
+  // wg_sync::FailStage once the sync is confirmed working.
+  uint8_t sync_fail_stage_ = 0;
+  uint32_t sync_fail_heap_kb_ = 0;
+  mutable char sync_label_buf_[32] = {};
   // Cached in update(): on_select() gets no runtime and the base class keeps
   // its own pointer private.
   IRuntime* sync_runtime_ = nullptr;
