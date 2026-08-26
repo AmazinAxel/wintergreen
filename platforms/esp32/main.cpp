@@ -174,6 +174,10 @@ extern "C" void app_main(void) {
   // while the panel is mid-waveform.
   wg_sync::bind(app, buf);
 
+  // The clicker borrows the same spare framebuffer, but only when the heap is
+  // too tight for the BT controller to allocate beside it.
+  wg_clicker::bind(buf);
+
   app.start(buf, runtime);
 
   // Discard the power-button press that woke us from deep sleep.

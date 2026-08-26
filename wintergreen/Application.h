@@ -81,7 +81,6 @@ class Application {
       return;
     settings_path_ = std::string(dir) + "/.wintergreen";
     index_path_ = std::string(dir) + "/.wintergreen-index";
-    reader_.set_data_dir(dir);
   }
 
   const std::string& index_path() const {
@@ -148,6 +147,12 @@ class Application {
   // The reader does not need the index while a book is open, and every screen
   // reloads it from disk when empty — see BookIndex::release_memory.
   void release_ram_for_radio();
+  // Counterpart: lifts the reader's cache cap once no radio is up.
+  void restore_ram_after_radio();
+
+  // Last clicker state seen by update(), so a disconnect the user did not ask
+  // for still lifts the cache cap.
+  ClickerState clicker_prev_ = ClickerState::Unavailable;
 
   // Called when a book is opened: bumps the open-order counter in the in-memory
   // index and persists settings. The index itself is written once per session,

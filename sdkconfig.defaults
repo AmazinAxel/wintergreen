@@ -66,7 +66,15 @@ CONFIG_ESP_SYSTEM_MEMPROT_FEATURE=n
 CONFIG_VFS_SUPPORT_SELECT=n
 
 # RAM optimizations
-# Optimize for performance (-O2) — faster CPU-bound inflate/XML parsing
+# -O2. **-Os was tried on hardware and is not better** — page turns felt the
+# same or slightly slower, never faster. Don't switch on the size number alone.
+#
+# The theory was that the C3's 16 KB instruction cache (fixed in silicon) would
+# favour smaller hot loops — draw_glyph_impl_'s bit blitting, word_width's
+# per-character scan — staying resident across a page. What actually happens is
+# that -Os gives up the unrolling and inlining that make those loops fast, and
+# the cache does not pay it back. -Os is ~100 KB smaller, which buys nothing:
+# app0 is 6.4 MB against a ~1.2 MB image.
 CONFIG_COMPILER_OPTIMIZATION_PERF=y
 CONFIG_COMPILER_OPTIMIZATION_DEBUG=n
 
@@ -156,6 +164,47 @@ CONFIG_PM_ENABLE=y
 # footprint.
 CONFIG_BT_ENABLED=y
 CONFIG_BT_NIMBLE_ENABLED=y
+#
+# **Required because CONFIG_PM_ENABLE=y, and its absence is a hard crash.**
+# Without modem sleep the BLE controller takes no PM lock, so DFS is free to
+# drop APB from 160 to 80 MHz while the link layer is programming its timing
+# registers. The LL comes up mis-timed, the baseband EMI check trips and the
+# controller spins in an ISR until the 300 ms interrupt watchdog reboots the
+# device:
+#
+#   BLE assert emi.c 164, param 00000000 00001000
+#   Guru Meditation Error: Core 0 panic'ed (Interrupt wdt timeout on CPU0)
+#   ... r_lld_core_init
+#
+# Deterministic, on the first esp_bt_controller_enable() after a cold boot —
+# no Wi-Fi or sync involved. MODEM_SLEEP + the main-crystal low-power clock is
+# what registers the controller with the PM subsystem.
+CONFIG_BT_CTRL_MODEM_SLEEP=y
+CONFIG_BT_CTRL_MODEM_SLEEP_MODE_1=y
+CONFIG_BT_CTRL_LPCLK_SEL_MAIN_XTAL=y
+#
+# **Full RF calibration on every PHY enable. Without it BLE cannot come up at
+# all on a device that has never run Wi-Fi.**
+#
+# IDF defaults to CONFIG_ESP_PHY_RF_CAL_PARTIAL, which reads a calibration blob
+# out of NVS and only refreshes part of it. Nothing writes that blob until the
+# Wi-Fi stack runs a full calibration, so on a freshly flashed device the BT
+# controller enables the PHY against absent or stale calibration data, the
+# baseband comes up wrong, and the controller spins in an ISR until the 300 ms
+# interrupt watchdog reboots:
+#
+#   BLE assert emi.c 164, param 00000000 00001000
+#   Guru Meditation Error: Core 0 panic'ed (Interrupt wdt timeout on CPU0)
+#   ... r_lld_core_init
+#
+# The tell is that **running a sync fixes it permanently**: esp_wifi_init()
+# calibrates fully and stores the result, and every later BLE bringup finds
+# good data. Partial calibration is a boot-time optimisation worth a few ms on
+# a device whose radio is the primary function; here the radio is opt-in and
+# rare, so paying full calibration each time it is switched on is free.
+CONFIG_ESP_PHY_RF_CAL_FULL=y
+CONFIG_ESP_PHY_RF_CAL_PARTIAL=n
+CONFIG_ESP_PHY_CALIBRATION_MODE=2
 CONFIG_BT_NIMBLE_ROLE_CENTRAL=y
 CONFIG_BT_NIMBLE_ROLE_OBSERVER=y
 CONFIG_BT_NIMBLE_MAX_CONNECTIONS=1
@@ -195,9 +244,6 @@ CONFIG_BT_NIMBLE_HOST_TASK_STACK_SIZE=6144
 # are sized for a throughput case this device does not have, and they come out
 # of internal RAM (MEM_ALLOC_MODE_INTERNAL) on a build that already holds 160 KB
 # statically. Frees ~12 KB of the heap the reader competes for.
-CONFIG_BT_NIMBLE_TRANSPORT_ACL_FROM_LL_COUNT=8
-CONFIG_BT_NIMBLE_MSYS_2_BLOCK_COUNT=8
-CONFIG_BT_NIMBLE_TRANSPORT_EVT_COUNT=12
 CONFIG_BT_NIMBLE_TRANSPORT_EVT_DISCARD_COUNT=4
 CONFIG_BT_NIMBLE_MAX_BONDS=2
 
@@ -208,7 +254,6 @@ CONFIG_BT_NIMBLE_MAX_BONDS=2
 # reason and is only ever used for a few seconds at connect time.
 CONFIG_BT_CTRL_BLE_MAX_ACT=2
 CONFIG_BT_CTRL_SCAN_DUPL_CACHE_SIZE=10
-CONFIG_BT_NIMBLE_MSYS_1_BLOCK_COUNT=6
 
 # MTU 256 sizes every ATT buffer for a payload this device never sends. A HID
 # report map is a few hundred bytes read once at connect; the reports themselves
@@ -232,13 +277,29 @@ CONFIG_BT_CTRL_BLE_SCAN_DUPL=n
 # ACL buffers. A HID clicker's traffic is an 8-byte report and, once at connect,
 # a report map of a few hundred bytes. 255-byte buffers eight deep are sized for
 # a data link. 128 x 4 still carries a report map fragment per buffer.
-CONFIG_BT_NIMBLE_ACL_BUF_COUNT=4
+CONFIG_BT_NIMBLE_ACL_BUF_COUNT=8
 CONFIG_BT_NIMBLE_ACL_BUF_SIZE=128
 CONFIG_BT_NIMBLE_TRANSPORT_ACL_SIZE=128
-CONFIG_BT_NIMBLE_TRANSPORT_ACL_FROM_LL_COUNT=4
-CONFIG_BT_NIMBLE_TRANSPORT_EVT_COUNT=8
-CONFIG_BT_NIMBLE_MSYS_1_BLOCK_COUNT=4
-CONFIG_BT_NIMBLE_MSYS_2_BLOCK_COUNT=4
+CONFIG_BT_NIMBLE_TRANSPORT_ACL_FROM_LL_COUNT=8
+CONFIG_BT_NIMBLE_TRANSPORT_EVT_COUNT=16
+
+# **mbuf pool. Trimming this below ~12/8 aborts the device on connect.**
+#
+# These were 4 and 4, and HID service discovery ran the pool dry: NimBLE
+# returned BLE_HS_ENOMEM (-18) and esp_hid asserts on it rather than failing
+# the connect —
+#
+#   assert failed: read_device_services at nimble_hidh.c:325
+#
+# with S7 = 0xffffffee = -18 in the register dump. Discovery walks every
+# service, characteristic and descriptor on the peer and holds the responses as
+# mbufs, so it is the deepest the pool ever gets — far deeper than the 8-byte
+# reports that follow, which is what the old numbers were sized for.
+#
+# This is a separate pool from the heap, so no amount of freeing framebuffers
+# or book index helps it. ~2 KB total; it is not where RAM is worth saving.
+CONFIG_BT_NIMBLE_MSYS_1_BLOCK_COUNT=24
+CONFIG_BT_NIMBLE_MSYS_2_BLOCK_COUNT=12
 
 # ── Wi-Fi book sync ────────────────────────────────────────────────────────
 #
@@ -250,6 +311,19 @@ CONFIG_BT_NIMBLE_MSYS_2_BLOCK_COUNT=4
 # radio is tens of mA against a ~15 mA idle, so a sync that runs twice as fast
 # at full power costs less than one that dawdles while power-saving. That is
 # also why WIFI_PS_NONE is set in code rather than trimming buffers to nothing.
+
+# Coexistence. The C3 has ONE radio and one PHY/BB shared by Wi-Fi and BLE.
+# Without this the BT controller has no arbiter and asserts in its baseband
+# layer the moment the Wi-Fi side has touched the PHY:
+#
+#   BLE assert emi.c 164, param 00000000 00007800
+#   Interrupt wdt timeout on CPU0 ... r_bt_bb_recorrect_is_dead
+#
+# It fires even when the two are never up at the same time, because
+# esp_wifi_init/deinit reconfigures shared RF calibration state that the BT
+# controller then re-enables on top of. Nothing in this build uses both radios
+# concurrently, but the arbiter must exist for either to survive the other.
+CONFIG_ESP_COEX_SW_COEXIST_ENABLE=y
 
 # Buffers: bulk sequential TCP, one socket at a time.
 CONFIG_ESP_WIFI_STATIC_RX_BUFFER_NUM=6

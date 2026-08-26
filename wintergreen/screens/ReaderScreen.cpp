@@ -152,7 +152,7 @@ void ReaderScreen::start(DrawBuffer& buf, IRuntime& runtime) {
     goto show_error;
   }
 
-  pos_path_ = book_pos_path(wgb_path_.c_str(), data_dir_.c_str());
+  pos_path_ = book_pos_path(wgb_path_.c_str());
 
   open_ok_ = true;
   chapter_idx_ = 0;
@@ -404,6 +404,20 @@ void ReaderScreen::prerender_next_page_(DrawBuffer& buf) {
   if (next == page_pos_)
     return;
 
+  // **Bail out before laying anything out when there is no spare to draw into.**
+  // The whole point of this function is to have the next page *drawn* by the
+  // time the user asks for it; without the spare the draw cannot happen, and
+  // the layout below is speculative work whose only product is a cached page.
+  //
+  // It used to fall through to begin_offscreen() at the draw step instead, so
+  // with a radio up — which is exactly when the spare is released — every
+  // forward turn still paid a full speculative layout and cached its result.
+  // That is a whole page's worth of line and word vectors allocated on a heap
+  // that has none to spare, and it is where split_words' reserve threw
+  // std::bad_alloc (an abort, with exceptions off).
+  if (!buf.can_offscreen())
+    return;
+
   const PagePosition cur_pos = page_pos_;
   const PageContent cur_meta{{}, {}, page_.start, page_.end, page_.at_chapter_end};
 
@@ -509,6 +523,11 @@ void ReaderScreen::load_chapter_(size_t idx) {
   if (idx < wgb_.chapter_count()) {
     chapter_src_ = std::make_unique<WgbChapterSource>(wgb_, static_cast<uint16_t>(idx));
     chapter_idx_ = idx;
+    // A fresh source starts with the full 32-slot window; re-apply the cap when
+    // a radio is up, or changing chapter while connected undoes release_caches()
+    // and the heap goes straight back to where it was crashing.
+    if (radio_ram_hold_)
+      chapter_src_->set_window_limit(4);
     layout_engine_.set_source(*chapter_src_);
   }
 }

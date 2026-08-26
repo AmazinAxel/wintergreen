@@ -439,8 +439,9 @@ inline bool run_sync_() {
   using wintergreen::BookIndex;
 
   const char* books_dir = g_app->main_menu()->books_dir();
-  const char* data_dir = g_app->data_dir_;
-  if (!books_dir || !data_dir)
+  // data_dir_ is not used directly any more (cover/pos paths derive from the
+  // book), but index_path() is built from it, so a null root is still fatal.
+  if (!books_dir || !g_app->data_dir_)
     return false;
 
   auto& index = BookIndex::instance();
@@ -466,7 +467,7 @@ inline bool run_sync_() {
     append_escaped_(req, dir);
 
     uint32_t p[4];
-    if (read_pos_(wintergreen::book_pos_path(path.c_str(), data_dir), p)) {
+    if (read_pos_(wintergreen::book_pos_path(path.c_str()), p)) {
       if (!first_pos)
         pos_json.push_back(',');
       first_pos = false;
@@ -575,7 +576,7 @@ inline bool run_sync_() {
       continue;
     if (g_buf)
       g_buf->wait_panel_idle();
-    write_pos_(wintergreen::book_pos_path(wgb.c_str(), data_dir), e.v);
+    write_pos_(wintergreen::book_pos_path(wgb.c_str()), e.v);
   }
 
   // 3. Remove what the server confirmed it has recorded.
@@ -852,7 +853,13 @@ inline void start() {
 
   // Both radios cannot fit. The clicker goes down first, and stays down for the
   // session unless its quick-menu row is pressed again.
-  wg_clicker::radio_off();
+  //
+  // release_for_wifi(), not radio_off(): the latter disables the controller but
+  // leaves it initialised and holding its buffers, which left esp_wifi_init()
+  // ~18 KB short of the ~50 KB it wants. The sync then failed immediately
+  // ("Fail 5, 18k") *and* left the heap too full to open a book afterwards —
+  // WgbReader::open aborted allocating an 8 KB StringPool chunk for the TOC.
+  wg_clicker::release_for_wifi();
 
   // **The book index is deliberately NOT released here.**
   //

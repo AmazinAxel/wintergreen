@@ -170,6 +170,42 @@ class WgbChapterSource : public IParagraphSource {
     return total_chars_;
   }
 
+  // Shrink the live window while a radio holds the heap, freeing the text and
+  // run vectors of every slot above the limit.
+  //
+  // **Only safe between pages**, never mid-layout: LayoutWord::text points into
+  // these slots, so dropping one under a laid-out page leaves dangling
+  // pointers. It is called from Application::release_ram_for_radio(), which
+  // also clears the page and paragraph caches that hold those pointers — the
+  // three have to happen together or not at all.
+  //
+  // The vectors themselves are not resized: that would move the Paragraph
+  // objects and dangle the same pointers by another route. Only the contents
+  // above the limit are released, and find_slot_ stops handing them out.
+  // `keep` names a paragraph whose slot must not be freed — the page currently
+  // on the glass, whose LayoutWord::text points into it. Everything else above
+  // the limit is released.
+  //
+  // Slots are never moved or resized, only emptied: a Paragraph that moves
+  // dangles the same pointers by another route, which is why this frees in
+  // place and leaves window_limit_ to keep find_slot_ out of the tail.
+  void set_window_limit(size_t slots, size_t keep = SIZE_MAX) const {
+    if (slots < 4)
+      slots = 4;  // a page can span several paragraphs; do not cut into it
+    if (slots > slots_.size())
+      slots = slots_.size();
+    for (size_t i = slots; i < slots_.size(); ++i) {
+      if (slot_index_[i] == UINT32_MAX)
+        continue;
+      // Neighbours too: a page starting in `keep` can run into the next one.
+      if (keep != SIZE_MAX && slot_index_[i] + 1 >= keep && slot_index_[i] <= keep + 1)
+        continue;
+      slots_[i] = Paragraph{};
+      slot_index_[i] = UINT32_MAX;
+    }
+    window_limit_ = slots;
+  }
+
   const Paragraph& paragraph(size_t index) const override {
     // Check if already in window
     for (size_t i = 0; i < slot_index_.size(); ++i) {
@@ -192,12 +228,16 @@ class WgbChapterSource : public IParagraphSource {
   uint32_t total_chars_ = 0;                 // total chars in this chapter
   mutable std::vector<Paragraph> slots_;
   mutable std::vector<uint32_t> slot_index_;  // UINT32_MAX = empty
+  // Slots find_slot_ may hand out; the whole window normally, fewer while a
+  // radio is up. See set_window_limit.
+  mutable size_t window_limit_ = kWindowSize;
 
   // Find best slot: prefer empty, then evict the one furthest from `index`
   size_t find_slot_(size_t index) const {
     size_t best = 0;
     uint32_t best_dist = 0;
-    for (size_t i = 0; i < slot_index_.size(); ++i) {
+    const size_t n = window_limit_ < slot_index_.size() ? window_limit_ : slot_index_.size();
+    for (size_t i = 0; i < n; ++i) {
       if (slot_index_[i] == UINT32_MAX)
         return i;  // empty slot
       uint32_t d = (slot_index_[i] > index) ? static_cast<uint32_t>(slot_index_[i] - index)

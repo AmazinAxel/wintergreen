@@ -71,6 +71,8 @@ class QuickmenuScreen final : public ListMenuScreen {
   static constexpr int kRowPad = 12;
   int row_h_() const { return ui_font_.y_advance() + kRowPad; }
   static constexpr int kLM = 14, kRM = 14;
+  // Minimum gap between an ellipsised label and its right-hand value.
+  static constexpr int kValueGap = 12;
   static constexpr int kPctGap = 10;    // title text → its percentage
   static constexpr int kBlockGap = 10;  // between title, chapter and the rule
   // The settings/chapters hairline uses the shared ListMenuScreen geometry

@@ -229,6 +229,50 @@ class TextLayout {
     cache_valid_ = false;
   }
 
+  // Paragraph cache slots. 8 rather than 16: a page spans a handful of
+  // paragraphs and both the forward and backward walk stay within that, so the
+  // hit rate is effectively unchanged while the resident cost halves. Dropping
+  // below ~6 would start thrashing on a backward turn, which crosses a
+  // paragraph boundary by definition — accepted deliberately by
+  // set_cache_limit() while a radio is up, where the alternative is an abort.
+  static constexpr size_t kCacheCapacity = 8;
+
+  // Hand the paragraph cache's memory back, not merely mark it stale.
+  //
+  // cache_valid_ = false leaves every slot's line and word vectors holding
+  // their capacity, which is the bulk of what the cache costs — the point here
+  // is the free, so each slot is assigned a default-constructed value to drop
+  // its allocations outright.
+  //
+  // For use when a radio is up and the heap has to be shared. Costs a re-layout
+  // of the paragraphs a page spans; that is the same work a font-size change
+  // already triggers, and far better than the alternative, which is
+  // assemble_page's word_pool reserve throwing std::bad_alloc — an abort() with
+  // exceptions off, i.e. the device rebooting mid-page-turn.
+  void release_cache_memory() {
+    for (auto& slot : para_cache_)
+      slot = LaidOutParagraph{};
+    cache_next_ = 0;
+    cache_valid_ = false;
+  }
+
+  // Number of cache slots actually used. Lowered while a radio is resident so
+  // the cache cannot simply refill to its full size a few page turns after
+  // release_cache_memory() — a one-shot free is not enough when the user then
+  // goes on reading and moving between menus.
+  //
+  // Slots above the limit are cleared as it drops, so this frees immediately as
+  // well as capping. 2 is the floor that still lets a single page's paragraphs
+  // stay resident; a backward turn re-lays out more often, which is the trade
+  // against rebooting.
+  void set_cache_limit(size_t slots) {
+    cache_limit_ = slots < 1 ? 1 : (slots > kCacheCapacity ? kCacheCapacity : slots);
+    for (size_t i = cache_limit_; i < kCacheCapacity; ++i)
+      para_cache_[i] = LaidOutParagraph{};
+    if (cache_next_ >= cache_limit_)
+      cache_next_ = 0;
+  }
+
   // Replace the image size query (e.g. when a book is opened).
   void set_image_size_fn(ImageSizeQuery fn) {
     size_fn_ = std::move(fn);
@@ -368,8 +412,10 @@ class TextLayout {
   // unchanged while the resident cost halves. Dropping below ~6 would start
   // thrashing on a backward turn, which crosses a paragraph boundary by
   // definition.
-  static constexpr size_t kCacheCapacity = 8;
   mutable std::array<LaidOutParagraph, kCacheCapacity> para_cache_{};
+  // Slots in use; kCacheCapacity normally, lowered by set_cache_limit() while a
+  // radio holds the heap.
+  size_t cache_limit_ = kCacheCapacity;
   mutable size_t cache_next_ = 0;
   mutable bool cache_valid_ = false;
 };

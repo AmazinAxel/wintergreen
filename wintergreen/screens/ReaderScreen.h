@@ -29,10 +29,6 @@ class ReaderScreen final : public IScreen {
   bool has_path() const {
     return !path_.empty();
   }
-  void set_data_dir(std::string dir) {
-    data_dir_ = std::move(dir);
-  }
-
   // Set the proportional bitmap font for rendering. If null, falls back to
   // the builtin 8×8 bitmap font at 2× scale. The font data must outlive
   // this screen.
@@ -47,6 +43,41 @@ class ReaderScreen final : public IScreen {
   bool render_current_page(DrawBuffer& buf);
   bool next_page_and_render(DrawBuffer& buf);
   bool is_open_ok() const;
+
+  // Drop every cache that exists only to make a page turn fast: the laid-out
+  // page and the layout engine's paragraph cache. Called when a radio comes up,
+  // because both are large and both rebuild themselves on demand.
+  //
+  // The reader keeps working — a turn re-lays out instead of being a memcpy.
+  // Without this a backward turn with BLE resident throws std::bad_alloc inside
+  // assemble_page's word_pool reserve, and with exceptions off that is an
+  // abort(): the device reboots mid-book.
+  // True while a radio holds the heap, so load_chapter_() re-applies the caps
+  // to a newly built chapter source.
+  bool radio_ram_hold_ = false;
+
+  void release_caches() {
+    radio_ram_hold_ = true;
+    // Order matters: both caches hold LayoutWord::text pointers into the
+    // chapter source's paragraph slots, so they must be dropped *before* the
+    // window shrinks under them.
+    page_cache_ = LaidOutPageCache{};
+    layout_engine_.release_cache_memory();
+    layout_engine_.set_cache_limit(2);
+    // page_ still points into the slot holding the current paragraph, so that
+    // one is named as live and kept.
+    if (chapter_src_)
+      chapter_src_->set_window_limit(4, page_pos_.paragraph);
+  }
+
+  // Undo release_caches()'s cap once the radio is down. The caches themselves
+  // refill on demand, so nothing needs restoring but the limit.
+  void restore_caches() {
+    radio_ram_hold_ = false;
+    layout_engine_.set_cache_limit(TextLayout::kCacheCapacity);
+    if (chapter_src_)
+      chapter_src_->set_window_limit(WgbChapterSource::kWindowSize);
+  }
 
   size_t current_chapter_index() const;
 
@@ -96,7 +127,6 @@ class ReaderScreen final : public IScreen {
   BitmapFontSet font_set_;                       // owned set (for single-font set_font() path)
   const BitmapFontSet* ext_font_set_ = nullptr;  // external set (from set_fonts())
   std::string path_;
-  std::string data_dir_;
   std::string wgb_path_;
   std::string pos_path_;       // <book dir>/book.pos, beside the book itself
   DrawBuffer* buf_ = nullptr;  // set in start(), cleared in stop()

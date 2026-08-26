@@ -12,6 +12,12 @@
 
 namespace wintergreen {
 
+// Largest bitmap load_cover_ can produce: it never scales beyond the layout
+// box, so this bounds every cover. cover_data_ is reserved to it once and then
+// never reallocates — see load_cover_ for why that matters.
+static constexpr size_t kCoverBytesMax =
+    static_cast<size_t>((kHomeCoverW + 7) / 8) * kHomeCoverH;
+
 // Filled diamond (a square on its corner), one fill_rect per row. Hard edges —
 // the panel is 1-bit, so anything rounded only reads as a ragged circle.
 
@@ -144,7 +150,20 @@ void HomeScreen::load_cover_(int i, int box_w, int box_h) const {
 
   const int src_stride = (src_w + 7) / 8;
   const int dst_stride = (dst_w + 7) / 8;
-  cover_data_.assign(static_cast<size_t>(dst_stride) * dst_h, 0xFF);
+  // **Reserve to the largest cover once; never reallocate.** `assign` on a
+  // vector whose size differs reallocates, holding the old and new blocks at
+  // the same time — ~25 KB each here. With the clicker's ~40 KB of BLE also
+  // resident that spike is what throws std::bad_alloc, and with exceptions off
+  // that is an abort(): the device reboots mid-session, in load_cover_, with
+  // no BLE frame anywhere in the backtrace.
+  //
+  // Reserving the maximum makes the capacity constant for the life of the
+  // screen, so every later cover is a fill into memory already held.
+  const size_t need = static_cast<size_t>(dst_stride) * dst_h;
+  if (cover_data_.capacity() < kCoverBytesMax)
+    cover_data_.reserve(kCoverBytesMax);
+  cover_data_.clear();
+  cover_data_.resize(need, 0xFF);
   std::vector<uint8_t> src_row(src_stride);
 
   auto set_ink = [&](int dx, int dy) {
@@ -336,10 +355,8 @@ void HomeScreen::on_start() {
     slots_[i].path = e.path.to_string(pool);
     slots_[i].title.assign(e.title.view(pool));
     slots_[i].author.assign(e.author.view(pool));
-    if (app_ && app_->data_dir_) {
-      slots_[i].bin_path = cover_bin_path(slots_[i].path.c_str(), app_->data_dir_);
-      slots_[i].home_path = cover_home_bin_path(slots_[i].path.c_str(), app_->data_dir_);
-    }
+    slots_[i].bin_path = cover_bin_path(slots_[i].path.c_str());
+    slots_[i].home_path = cover_home_bin_path(slots_[i].path.c_str());
     add_item(slots_[i].title);
   }
 

@@ -96,10 +96,41 @@ struct WordSpan {
 
 static std::vector<WordSpan> split_words(const char* text, size_t text_len) {
   std::vector<WordSpan> spans;
-  // One span per word; ~6 bytes per word in English prose is a close upper
-  // bound and overshooting costs a few hundred bytes, where growing costs a
-  // realloc that holds both blocks at once. See build_page_items.
-  spans.reserve(text_len / 6 + 8);
+  // **Count first, then reserve exactly.** text_len / 6 + 8 was an *average*
+  // dressed up as a bound: "~6 bytes per word in English prose". Two things
+  // beat it routinely, and when they do, push_back reallocates while holding
+  // the old block — the realloc spike that throws std::bad_alloc on a heap
+  // shared with a radio (seen as a 5,544-byte request from a 1,340-byte
+  // paragraph, i.e. an estimate of 231 spans that was not enough).
+  //
+  //   - CJK text pushes one span per *character*, so a 3-byte codepoint is a
+  //     span every 3 bytes — twice the assumed density.
+  //   - Latin text full of one- and two-letter words ("I am a", initials,
+  //     punctuation split off as its own run) does the same.
+  //
+  // The pre-pass walks the same string with the same predicates, so the count
+  // cannot disagree with the loop below. It is a second scan of a paragraph
+  // that is already in cache, against a realloc of the whole vector.
+  {
+    size_t n = 0;
+    size_t j = 0;
+    while (j < text_len) {
+      size_t wl;
+      while (j < text_len && (wl = ws_len(text, text_len, j)) > 0)
+        j += wl;
+      if (j >= text_len)
+        break;
+      if (is_cjk_break_char(text, text_len, j)) {
+        j += utf8_char_len(text, text_len, j);
+        ++n;
+        continue;
+      }
+      while (j < text_len && ws_len(text, text_len, j) == 0 && !is_cjk_break_char(text, text_len, j))
+        ++j;
+      ++n;
+    }
+    spans.reserve(n);
+  }
   size_t i = 0;
   while (i < text_len) {
     // Skip whitespace.
@@ -477,8 +508,11 @@ const TextLayout::LaidOutParagraph& TextLayout::get_laid_out_(size_t pi) const {
     if (!e.empty() && e.para_idx == static_cast<uint16_t>(pi))
       return e;
 
+  // Ring over cache_limit_, not kCacheCapacity: the limit is lowered while a
+  // radio is up, and wrapping on the full capacity would let the cache refill
+  // past it a few page turns later.
   LaidOutParagraph& slot = para_cache_[cache_next_];
-  cache_next_ = (cache_next_ + 1) % kCacheCapacity;
+  cache_next_ = (cache_next_ + 1) % cache_limit_;
 
   const IFont& font = *font_;
   const PageOptions& opts = opts_;

@@ -1252,25 +1252,10 @@ reload from disk, mutators call `ensure_loaded_()` — so nothing truncates the 
 BLE's allocations all come from `MALLOC_CAP_INTERNAL`
 (`CONFIG_BT_NIMBLE_MEM_ALLOC_MODE_INTERNAL`), on a build that already holds ~160 KB
 statically out of 320 KB. It is not a stack-size problem, and raising stacks makes it
-worse. Everything below is sized for this device rather than left at IDF's defaults,
-which assume a multi-peripheral hub:
-
-| Key | Default | Here | Why |
-|---|---|---|---|
-| `BT_CTRL_BLE_MAX_ACT` | 6 | **2** | one scan + one connection; each slot carries its own controller buffers, and this is the largest single saving |
-| `BT_CTRL_SCAN_DUPL_CACHE_SIZE` | 100 | 10 | only live during the few-second connect scan |
-| `BT_NIMBLE_TRANSPORT_ACL_FROM_LL_COUNT` | 24 | 8 | 8-byte reports, not a data link |
-| `BT_NIMBLE_MSYS_1_BLOCK_COUNT` | 12 | 6 | |
-| `BT_NIMBLE_MSYS_2_BLOCK_COUNT` | 24 | 8 | |
-| `BT_NIMBLE_TRANSPORT_EVT_COUNT` | 30 | 12 | |
-| `BT_NIMBLE_MAX_BONDS` | 3 | 2 | |
-| `BT_NIMBLE_ACL_BUF_COUNT` / `_SIZE` | 24 / 255 | 4 / 128 | reports are 8 bytes; the report map is the only bulk read and happens once |
-| `BT_NIMBLE_TRANSPORT_ACL_SIZE` | 255 | 128 | |
-| `BT_NIMBLE_ATT_PREFERRED_MTU` | 256 | 128 | sizes every ATT buffer |
-| `BT_NIMBLE_GATT_MAX_PROCS` | 4 | 2 | one service walked at connect, then notifications only |
-| `BT_NIMBLE_MAX_CCCDS` | 8 | 3 | report + battery |
-| `BT_NIMBLE_50_FEATURE_SUPPORT` | y | **n** | extended advertising/PHY is unreachable for a central talking to a legacy HID peripheral |
-| `BT_CTRL_BLE_SCAN_DUPL` | y | n | the scan runs 5 s once per connect |
+worse. Every `BT_*` buffer key in `sdkconfig.defaults` is therefore sized down from
+IDF's defaults, which assume a multi-peripheral hub rather than one clicker sending
+8-byte reports — each is commented in place. `BT_CTRL_BLE_MAX_ACT` (6 → 2) is the
+largest single saving.
 
 `bringup_stack()` also **refuses to start below `kMinHeapKb` (24)**, which turns the
 worst failure mode — half initialise, time out at sync, leave a session that cannot
@@ -1618,104 +1603,60 @@ compressed form the old blob carried. Flash is not scarce and the device does no
 
 ## Measured size budget
 
-`.pio/build/esp32c3/firmware.elf`, current tree. app0 is 6.4 MB so there is no
-capacity pressure — this is about upload time and instruction-cache pressure.
+app0 is 6.4 MB against a ~1.2 MB image, so **flash is not scarce** — size work
+here buys upload time and instruction-cache pressure, nothing else. Both radios
+are opt-in and they stack:
 
-| Section | Now | Before the 2026-08-19 pass |
+| Build | image | static RAM |
 |---|---|---|
-| image (`firmware.bin`) | 442,656 | 745,712 |
-| `.flash.text` | 311,504 | 403,550 |
-| `.flash.rodata` | 93,480 | 313,256 |
-| `.iram0.text` | 26,580 | 25,546 |
-| `.dram0.bss` | 157,200 | 109,816 |
-
-"Now" is the bare build — both radios undefined. Each is opt-in and they stack:
-
-| Build | flash | static RAM |
-|---|---|---|
-| neither | 430,790 | 159,820 |
+| neither radio | 430,790 | 159,820 |
 | BLE only | 728,888 | 164,128 |
-| **BLE + Wi-Fi sync** (the configured default) | **1,213,488** | **132,920** |
+| **BLE + Wi-Fi sync** (the configured default) | **1,213,008** | **132,944** |
 
-The RAM figure being *lower* than the BLE-only row is not an error — `DrawBuffer`'s
-spare framebuffer moved from BSS to the heap in between, taking 48 KB of static RAM
-with it.
+The RAM figure being *lower* than the BLE-only row is not an error:
+`DrawBuffer`'s spare framebuffer moved from BSS to the heap in between, taking
+48 KB of static RAM with it.
 
-Where `.flash.text` actually goes, by symbol prefix (approximate — weak symbols and
-inlining blur the edges, and ~245 KB of it is not ours):
+Current sections, default build: `.flash.text` 988,598, `.flash.rodata` 143,624,
+`.iram0.text` 69,872, `.dram0.bss` 122,760. Roughly 245 KB of `.flash.text` is
+IDF, picolibc and the C++ runtime; ~51 KB is the five screens; everything else of
+ours is under 20 KB apiece.
 
-| Area | Bytes |
-|---|---|
-| IDF + picolibc + C++ runtime | ~245,000 |
-| screens (`ListMenuScreen`, `HomeScreen`, `MainMenu`, `Quickmenu`, `Reader`) | 51,476 |
-| book format + index (`Wgb*`, `BookIndex`, `CoverPaths`) | 17,228 |
-| drivers (`EInkDisplay`, input, runtime) | 15,276 |
-| `DrawBuffer` + drawing | 14,356 |
-| app shell (`Application`, `ScreenManager`) | 9,606 |
-| text layout + font parsing | ~11,000 |
+**Nothing left in the IDF share is worth arguing with.** FatFs, SD, SPI, power
+management, FreeRTOS and the heap allocator are all load-bearing. The few
+genuinely dead pieces — `f_mkfs` (2,360 B, unreachable but referenced
+unconditionally) and `__d_vfprintf`/`__d_vfscanf` (~5 KB) — are reachable only
+through IDF code, so removing them means patching the framework in place, which
+is exactly what `tools/patch_ffconf.py` was deleted for.
 
-And inside the IDF share, the pieces big enough to argue with:
+rodata is dominated by the three UI fonts (54,138) and the hyphenation trie
+(26,943) — together 87% of it. Both could move to a flash partition like the
+reader font did (mmapped flash and rodata are both XIP, so it would be free at
+runtime), but the image is not under pressure.
 
-| | Bytes | Removable? |
-|---|---|---|
-| FatFs + VFS-FAT | 16,814 | no — the card is FAT32 |
-| SD (`sdspi`/`sdmmc`) | 14,814 | no |
-| C++ runtime + STL | 14,422 | only by writing less STL |
-| SPI master driver | 13,750 | no |
-| power mgmt + sleep + clocks | 12,998 | no — this is what DFS and deep sleep run on |
-| FreeRTOS | 11,204 | no |
-| picolibc stdio/string/malloc | 10,578 | ~5 KB of it is `__d_vfprintf`/`__d_vfscanf` |
-| mbedtls SHA | 7,896 | no — image validation |
-| heap allocator | 7,630 | no |
-| VFS core | 6,230 | partially, and not worth it |
-| `f_mkfs` | 2,360 | unreachable, but referenced unconditionally |
-| timezone/`localtime_r`/`mktime` | ~2,700 | no — `vfs_fat.c` uses it for FAT timestamps |
-
-The last two are the shape of everything left: reachable only through IDF code we do
-not control, so removing them means patching the framework in place — exactly what
-`tools/patch_ffconf.py` was deleted for.
-
-BSS is up 47 KB on purpose: `DrawBuffer`'s third framebuffer. Static use is 159,820 of
-327,680, leaving ~165 KB of heap.
-
-rodata fell by 220 KB because the reader font and sleep image left the app image for
-their own flash partitions. What remains is dominated by the three UI fonts (54,138)
-and the hyphenation trie (26,943) — together 87% of it.
-
-`.flash.text` fell by 86 KB, largest first: ~34 KB of `std::sort` / `std::stable_sort`
-template instantiations, ~24 KB of image decoders unlinked when images became
-pre-rasterised, ~4 KB of triplicated cover-path bodies, ~3 KB of mbedtls SHA-512 and
-~2 KB of `esp_mprot_set_prot` unlinked by config changes, and the rest from the
-removed benchmarks, grayscale LUT tables, font provisioning and diagnostic commands.
-
-Re-measure rather than trusting these:
+Re-measure rather than trusting any of this:
 
 ```
-~/.platformio/packages/toolchain-riscv32-esp/bin/riscv32-esp-elf-nm \
-  --print-size --size-sort --radix=d .pio/build/esp32c3/firmware.elf | tail -40
 ~/.platformio/packages/toolchain-riscv32-esp/bin/riscv32-esp-elf-size -A \
   .pio/build/esp32c3/firmware.elf
+~/.platformio/packages/toolchain-riscv32-esp/bin/riscv32-esp-elf-nm \
+  --print-size --size-sort --radix=d .pio/build/esp32c3/firmware.elf | tail -40
 ```
 
-`CONFIG_COMPILER_OPTIMIZATION_SIZE` (-Os) takes `.flash.text` from 346,482 to 243,666
-— 30% smaller — and the image to 374,816. It is *not* the setting in use:
-`CONFIG_COMPILER_OPTIMIZATION_PERF` (-O2) stays, because this device is tuned for
-page-turn latency, flash is abundant, and the reader's hot loops (`draw_glyph_impl_`'s
-bit blitting, `word_width`'s per-character scan) are exactly the code `-Os` stops
-unrolling and inlining. See "Still open".
+**`-Os` was tried on hardware and rejected — don't re-open it.**
+`CONFIG_COMPILER_OPTIMIZATION_SIZE` takes `.flash.text` from 346,482 to 243,666
+(30% smaller), and page turns came out the same or *slightly slower*, never
+faster.
 
-`CONFIG_ESP_SYSTEM_MEMPROT_FEATURE=n` and `CONFIG_VFS_SUPPORT_SELECT=n` are set:
-neither was reachable, and they were costing `esp_mprot_set_prot` (~2 KB) plus PMS
-programming on every boot, and the VFS select shim respectively.
+The theory was that the C3's 16 KB instruction cache — fixed in silicon, not
+configurable as on the S3 — would favour smaller hot loops staying resident
+across a page. In practice `-Os` gives up the unrolling and inlining that make
+`draw_glyph_impl_`'s bit blitting and `word_width`'s per-character scan fast, and
+the cache does not pay it back. `CONFIG_COMPILER_OPTIMIZATION_PERF` (-O2) stays.
 
-Four `sdkconfig.defaults` keys were silently ignored because `espressif32 @ ^7.0.1`
-renamed or removed them — `CONFIG_NEWLIB_NANO_FORMAT`,
-`CONFIG_FREERTOS_PLACE_FUNCTIONS_INTO_FLASH` (`CONFIG_FREERTOS_IN_IRAM` already
-defaults off, same outcome), `CONFIG_FREERTOS_DEBUG_OCDAWARE` and
-`CONFIG_SPI_MASTER_ISR_IN_IRAM` — along with `CONFIG_FREERTOS_ISR_STACKSIZE=1024`,
-which the generated config clamped straight back to 1536. **An unknown key in
-`sdkconfig.defaults` is ignored, not an error** — after any IDF bump, diff
-`sdkconfig.defaults` against the generated `sdkconfig.esp32c3`.
+Note what the size number was worth here: nothing, for the reason in the first
+paragraph. That is why it could never settle the question and why it took a
+device to.
 
 ## Content pipeline
 
@@ -2149,12 +2090,8 @@ normalises a settings file left over from an older firmware with removed keys.
 ## Still open
 
 Everything else previously listed here has shipped and been confirmed on the device.
-Three items remain, each needing a measurement rather than an opinion:
+Two items remain, each needing a measurement rather than an opinion:
 
-- **Measure `-Os` against `-O2`.** 30% smaller code (see "Measured size budget"). The
-  theory that a smaller hot path wins back more from the 16 KB I-cache than it loses
-  is untested and **only a device with a stopwatch settles it** — the size number
-  alone does not.
 - **Pre-draw skips image pages.** `draw_image_()` must drain the waveform before
   touching the card, so a speculative draw would block the UI loop for the couple of
   hundred ms the current page is still painting. Needs a second spare buffer, or an SD
@@ -2231,197 +2168,135 @@ Three items remain, each needing a measurement rather than an opinion:
 
 Instruction cache size (fixed in C3 silicon, not configurable as it is on the S3), QIO
 flash mode, SD clock above 20 MHz, tickless idle, region-only refresh for menu cursor
-movement, and `CONFIG_NEWLIB_NANO_FORMAT` (the option no longer exists under
-picolibc). See "Build & flash", "Idle power" and "Refresh latency".
+movement, `CONFIG_NEWLIB_NANO_FORMAT` (the option no longer exists under
+picolibc), and **`-Os`** (tried on hardware: same or slightly slower page turns —
+see "Measured size budget"). See "Build & flash", "Idle power" and "Refresh
+latency".
 
 ## Removed (don't resurrect without asking)
 
-Settings menu, theme picker, Stats / GlobalStats / WhatsNew / Alert / ConvertAll
-screens, the bouncing-ball and grayscale demos, BMP sleep-image conversion,
-sleep-image cycling, SD-card font selection, and the on-device System tab (clear
-cache, rebuild index, rebuild SPIFFS, OTA partition switch).
+Only the reasons are kept — the symbol-by-symbol inventories are in git history.
 
-**`RecentBooksScreen` and `HiddenBooksMenu`**, with `ScreenId::RecentBooks` and
-`ScreenId::HiddenBooks`; and **`ChapterSelectScreen`**, merged into the quick menu.
-Remember `platforms/esp32/CMakeLists.txt` lists core `.cpp` files **explicitly**, so
-deleting a screen means editing it too — the failure is at CMake generate time, not
-compile time, with a "Cannot find source file" that names the wrong call site.
+Screens and settings: the settings menu, theme picker, Stats / GlobalStats /
+WhatsNew / Alert / ConvertAll screens, the bouncing-ball and grayscale demos, BMP
+sleep-image conversion, sleep-image cycling, SD-card font selection, and the
+on-device System tab. Also `RecentBooksScreen`, `HiddenBooksMenu` and
+`ChapterSelectScreen` — recents became the home carousel, hidden books a
+`MainMenu` mode, chapters an inline quick-menu list. **Deleting a screen means
+editing `platforms/esp32/CMakeLists.txt` too** (it lists core `.cpp` files
+explicitly); the failure is at CMake generate time with a "Cannot find source
+file" naming the wrong call site.
 
-**Antialiased (grayscale) text in the reader.** `ReaderScreen::apply_grayscale_`, the
-`grayscale_pending_` / `grayscale_active_` state and the `revert_grayscale` calls are
-gone; a page turn is now a single `buf.refresh()` and `render_text_` only ever draws
-`GrayPlane::BW`.
+**Antialiased (grayscale) text in the reader**, and the whole multi-pass
+machinery behind it. It was removed because it was **visible as motion**:
+`kLutGrayscale`'s waveforms put white and black both on LUT0 = *do nothing*, so
+gray was only reachable by driving a pixel black and then partially pulling it
+back. Every page turn became three physical updates, the middle one showing the
+font's mid/dark AA levels as solid black — text that appeared to thicken and then
+visibly thin after the page had already changed. That intermediate is inherent to
+the LUT, not a sequencing bug, so no reordering fixes it.
 
-It was removed because it was **visible as motion**. `kLutGrayscale`'s four waveforms
-are indexed by (MSB, LSB), and white and black both land on LUT0 = *do nothing* — the
-gray levels are only reachable by first driving the pixel to black and then partially
-pulling it back. So every page turn was three physical panel updates: revert-to-BW, a
-BW-only refresh in which the font's *mid* and *dark* AA levels appear **solid black**
-(the BW plane draws wherever its bit is clear), and finally the grayscale pass
-lightening exactly those edge pixels. The middle frame read as bolder text that then
-visibly thinned — text appearing to move after the page had already changed. That
-intermediate is inherent to the LUT, not a sequencing bug.
+Text is consequently a hard threshold at the 50% AA level and reads slightly
+heavier than the old settled state. If that weight ever becomes a problem the
+escape hatch is the one-pass `kLutFactoryQuality` LUT already used for sleep
+images — it drives each pixel to an absolute level with no prior-state
+dependency, so a page could land in final form in a single update, at the cost of
+squashing the font's 5 AA levels into the panel's 4 and composing both RAM planes
+by hand. Note its RAM polarity is **inverted** relative to normal drawing (state
+`(RED<<1|BW)` = 00 is white); the per-row comments inside the table say the
+opposite and are wrong.
 
-Text is consequently a hard threshold at the 50% AA level and reads slightly heavier
-than the old settled state. The alternative, if the weight ever becomes a problem, is
-the one-pass `kLutFactoryQuality` LUT already used for sleep images: it drives each
-pixel to an absolute level with no prior-state dependency, so a page could land in
-final form in a single update — at the cost of squashing the font's 5 AA levels into
-the panel's 4 and composing the two RAM planes by hand. Note its RAM polarity is
-**inverted** relative to normal drawing (state `(RED<<1|BW)` = 00 is white, per
-`make_sleep_image.py` and the enum comment above the table; the per-row comments
-inside `kLutFactoryQuality` say the opposite and are wrong).
+**Hyperlinks, entirely** — `LinksScreen`, the nav-history stack, `href` on `Run`
+and `LayoutWord`, and the underline rendering. An `<a>` now contributes only its
+text. WGB run-flag bit `0x02` was its last remnant and is free.
 
-**The multi-pass grayscale machinery is gone too**, not merely unreachable.
-`kLutGrayscale`, `kLutGrayscaleRevert`, `EInkDisplay::grayscale_refresh`,
-`revert_grayscale`, `grayscale_revert_`, `set_grayscale_lut` /
-`set_grayscale_revert_lut` / their `clear_*` pairs, the two 112-byte
-`custom_grayscale_*_lut_` buffers, `in_grayscale_mode_` and
-`DrawBuffer::show_grayscale_image` are all deleted, along with the `0xDEADBEEF` serial
-LUT-upload frame that was the only reason to keep them tunable. `IDisplay` lost
-`grayscale_refresh`, `revert_grayscale`, `in_grayscale_mode` and `set_rotation` with
-them, and `partial_refresh` now takes one argument — its `prev_pixels` parameter
-existed solely for the grayscale revert path. The one-pass path
-(`grayscale_refresh_1pass` + `kLutFactoryQuality`) is still live: it draws the sleep
-image, and it remains the escape hatch if reader text ever needs to be lighter.
+**Every page-geometry setting except font size.** H-Margin, V-Margin, Alignment,
+Line spacing and Publisher Sizes, with their overrides and persisted keys. Layout
+now always takes alignment and line height from the book's CSS and always honours
+publisher font sizes; where the book specifies nothing, body text is
+**justified**. `para.alignment` is a genuine optional throughout — WGB
+round-trips the empty state through the `kWgbAlignDefault` (`0xFF`) sentinel, so
+changing that default needs no re-conversion. Note dead `static constexpr` class
+members produce no compiler warning, so leftovers have to be found by grep.
 
-**Hyperlinks, entirely.** `LinksScreen`, the quick menu's "Links (n)" item, the
-reader's nav-history stack, `Run::href`, `LayoutWord::href`, the `<a href>` tracking
-in `EpubParser`, the href write path in `WgbWriter`, and the link-underline rendering
-in `DrawBuffer`'s line renderer (now `draw_layout_line`). An `<a>` element now
-contributes only its text. The last remnant went with the `WGB2` bump: `WgbReader`
-used to read an href length and **skip** those bytes when a run's flag bit `0x02` was
-set. Bit `0x02` is now free.
-
-**Every page-geometry setting except font size.** H-Margin, V-Margin, Alignment, Line
-spacing and Publisher Sizes are gone — along with `AlignOverride`, `SpacingOverride`,
-their preset/name tables, the persisted `align_override`, `padding_h`, `padding_v`,
-`spacing_override` and `override_pub_fonts` keys, and the matching fields on
-`LayoutOptions` and `PageOptions`. The layout engine now always takes alignment and
-line height from the book's CSS (`para.alignment`, `para.text.line_height_pct`) and
-always honours publisher font sizes. Where the book specifies no alignment, body text
-is **justified** — the `value_or` default in `layout_para_lines`. `para.alignment` is
-a genuine optional all the way through: `EpubParser` only fills it when CSS said
-something, and WGB round-trips the empty state through the `kWgbAlignDefault` (`0xFF`)
-sentinel, so changing that default does not require re-converting cached books.
-`ReaderScreen::make_page_opts()` is fully determined by the page size, and
-`ReaderSettings::progress_bottom()` was renamed `bottom_margin()`. `ReaderScreen`'s
-`kPaddingRight` and `kPaddingBottom` went with them — note that dead `static
-constexpr` class members produce no compiler warning, so they have to be found by
-grep, not by build.
-
-**The hyphenation toggle** (the feature stays, always on) and, with it, the last
-caller of `ListMenuScreen::add_separator()`. That helper and its parallel
-`std::vector<bool> separators_` are gone; the base `is_separator()` now just returns
-false. `MainMenu` is unaffected — it has its **own** `separators_` member
-(`vector<pair<int,string>>`) and overrides `is_separator()`, which also means the base
+**The hyphenation toggle** (the feature stays, always on), taking
+`ListMenuScreen::add_separator()` and its `vector<bool> separators_` with it.
+`MainMenu` is unaffected — it has its own `separators_`
+(`vector<pair<int,string>>`) and overrides `is_separator()`, which means the base
 member had been shadowed all along.
 
-**The reading progress indicator**, entirely — bar, percentage, `ProgressStyle`,
-`ProgressScope`, their quick-menu entries and their persisted settings keys.
-`ReaderScreen::draw_bottom_` is gone; nothing is drawn in the reader's bottom margin.
-`progress_pct()` / `chapter_progress_pct()` **stay** — they feed the book-details card.
+**The reading progress indicator** — bar, percentage, styles, scopes and keys.
+Nothing is drawn in the reader's bottom margin now. `progress_pct()` /
+`chapter_progress_pct()` **stay**; they feed the book-details card.
 
-**On-device EPUB conversion, and with it EPUB support entirely.** A book is a `.wgb`;
-`BookIndex` does not recognise `.epub` at all, so an unconverted book is not listed
-rather than listed-and-broken. `ReaderScreen` opens the WGB or shows an error — no
-fallback and no "Converting…" progress screen. The `Book`, `EpubParser`, `CssParser`,
-`XmlReader`, `HtmlEntities` and `WgbConverter` translation units are **out of the
-firmware build** (they remain in the repo for `tools/epub2wgb`), as are the `X`/`I`/`D`
-serial benchmark commands that were their last callers. `Application::ensure_cover_bin()`
-went too. Together ~95 KB of flash. `ZipReader` **stays** — it is how embedded images
-are read, as stored entries pointing into the WGB. `WgbWriter` does **not**: its only
-caller is `WgbConverter`.
+**On-device EPUB conversion, and EPUB support entirely.** A book is a `.wgb`;
+`BookIndex` does not recognise `.epub`, so an unconverted book is not listed
+rather than listed-and-broken. `Book`, `EpubParser`, `CssParser`, `XmlReader`,
+`HtmlEntities` and `WgbConverter` are **out of the firmware build** but remain in
+the repo for `tools/epub2wgb` — ~95 KB of flash. `ZipReader` **stays**: it reads
+embedded images as stored entries inside the WGB. `WgbWriter` does not.
 
-Because those TUs are host-only, every `#ifdef ESP_PLATFORM` inside them was
-unreachable, and they have been flattened to the host branch. Gone with them:
-`WgbConverter`'s three `benchmark_*` functions, all the `esp_timer` sub-stage
-instrumentation, the `heap_caps_get_largest_free_block` reserve-capping and
-capacity-triggered `flush_run()` in `EpubParser`'s run accumulator, and
-`CssCache::low_memory()` (which was `esp_get_free_heap_size() < 24 KB` on device and a
-constant `false` off it, so eviction is now driven by `over_budget` alone). The
-never-defined `WINTERGREEN_DIAG_STREAMING` blocks went too. None of this changes
-converter output.
+Because those TUs are host-only, every `#ifdef ESP_PLATFORM` in them was
+unreachable and they are flattened to the host branch — taking the `benchmark_*`
+functions, the `esp_timer` instrumentation, `EpubParser`'s heap-driven reserve
+capping and `CssCache::low_memory()` (a constant `false` off-device, so eviction
+is now driven by `over_budget` alone). Converter output is unchanged.
 
-**Font sideloading**, both paths: the serial `FONT` upload and `SDFN` uploads to
-`/sdcard/fonts/`, plus the `'Y'` and `'F'` serial commands and
-`Application::invalidate_font()`.
+**Font sideloading**, both the serial `FONT` upload and `SDFN` uploads to
+`/sdcard/fonts/`. The two compiled-in fonts are the only fonts the device can
+have.
 
-**exFAT**, along with `tools/patch_ffconf.py` which enabled it. SD cards are FAT32,
-16 GB or smaller — an exFAT card will simply fail to mount. exFAT cost 7,892 bytes of
-flash and required patching `ffconf.h` inside the ESP-IDF package on every build;
-ESP-IDF ships it disabled because it is patent-encumbered, so there is no Kconfig
-option for it.
+**exFAT**, with `tools/patch_ffconf.py` which enabled it. Cards are FAT32, 16 GB
+or smaller; an exFAT card simply fails to mount. It cost 7,892 bytes and required
+patching `ffconf.h` inside the IDF package on every build — ESP-IDF ships it
+disabled because it is patent-encumbered, so there is no Kconfig option.
 
-**All reading statistics.** Read time, times opened, page turns and estimated time
-left are gone from the reader, the `.pos` file, `BookIndexEntry`, the index file
-format, and both places they were displayed. With them went
-`Application::update_book_read_time()`, `BookIndex::update_reading_stats()`, the
-reading-time accumulator (`tick_activity_`, `kActivityWindowMs`, `last_activity_ms_`)
-and `ListMenuScreen::subtitle3_`.
+**All reading statistics** — read time, times opened, page turns, estimated time
+left — from the reader, `.pos`, `BookIndexEntry`, the index format and both
+places they were displayed. `.pos` is now four numbers and the index line is
+`path|title|author|last_open_order|progress_pct`. Both readers tolerate older
+short and longer forms (a missing field reads as 0, extras are not consumed), so
+`INDEX_FORMAT_VERSION` did not need bumping.
 
-`.pos` is now four numbers; the index line is
-`path|title|author|last_open_order|progress_pct`. Both readers tolerate the old
-shorter and longer forms — a missing field reads as 0 and extra ones are not consumed
-— so `INDEX_FORMAT_VERSION` did not need bumping.
+`progress_pct` is the one exception, and it is there for cost: the book list
+shows a percentage per row, and deriving it live would mean opening every WGB
+*and* every `.pos` on the card each time the list is built.
+`Application::record_book_progress()` reloads the index before saving —
+`MainMenu::pause()` clears the in-memory entries whenever the reader is pushed,
+so saving without reloading would truncate the file — and re-clears afterwards.
+`progress_pct()` itself and the `total_chars` / `char_before_para()` machinery
+stay: computed live from position, not accumulated. `last_open_order` stays; it
+drives the most-recently-read sort.
 
-`progress_pct` is the one exception to "no statistics in the index", and it is there
-for cost: the book list shows a percentage per row, and deriving it live would mean
-opening every WGB *and* every `.pos` on the card every time the list is built.
-`ReaderScreen::stop()` hands it to `Application::record_book_progress()`, which
-reloads the index first — `MainMenu::pause()` (the default, = `stop()`) clears the
-in-memory entries whenever the reader is pushed, so saving without reloading would
-truncate the file — and re-clears afterwards. `progress_pct()` and the `total_chars` /
-`char_before_para()` machinery stay: computed live from the reading position, not
-accumulated over time. `last_open_order` stays — it drives the most-recently-read sort.
+**Debug and benchmark surface, entirely.** Every log statement, `HeapLog.h`, the
+`'S'`/`'Q'`/`'G'`/`'P'` serial commands, `bench_render`, `bench_flash`,
+`top_screen_name()`, and the layout instrumentation — whose `g_layout_hyph_us`
+and `g_layout_metrics_us` bracketed **every `word_width()` call** with
+`esp_timer_get_time()`, two hardware timer reads per word, thousands per page.
 
-**Debug and benchmark surface, entirely** (2026-08-19). Every log statement and
-`wintergreen/HeapLog.h`; the serial `'S'` heap query, `'Q'` state dump, `'G'` flash
-benchmark and `'P'` render benchmark; `ReaderScreen::bench_render` and
-`FontPartition::bench_flash`; `Application::top_screen_name()` and the
-`g_top_screen_name` copy that ran every frame; the `esp_timer` scaffolding that fed
-the removed timing logs; and the `esp_log_level_set()` calls. Also the layout
-instrumentation — `g_layout_hyph_us`, `g_layout_metrics_us`, `g_layout_para_us`,
-`g_layout_cache_misses` and the `MR_TRACE` / `MR_LAYOUT_TRACE` facility. The first two
-bracketed **every `word_width()` call** with `esp_timer_get_time()` — two hardware
-timer reads per word, thousands per page.
+**Dead `IRuntime` and `DrawBuffer` surface.** `step_mode()`, `consume_step()`,
+`yield()` and `should_continue()` were never overridden to anything but a
+constant, so the branches testing them were dead; `Loop.cpp::run_loop()` went
+with the desktop build. On `DrawBuffer`: the no-arg `write_ram_*` wrappers,
+`draw_circle()`, `draw_text_centered()` and `set_rotation_transform()` (identical
+to `set_rotation` once driver-side rotation was removed).
 
-**Dead `IRuntime` and `DrawBuffer` surface.** `IRuntime::step_mode()`,
-`consume_step()`, `yield()` and `should_continue()` were never overridden to anything
-but a constant, so the step-mode branch in `Loop.cpp` and the
-`runtime.should_continue()` test in `main.cpp` were dead; all four are gone, as is
-`Loop.cpp::run_loop()`. On `DrawBuffer`: `write_ram_bw()`/`write_ram_red()` (the
-no-arg wrappers — the sleep path calls `display_.` directly), `grayscale_refresh()`,
-`revert_grayscale()`, `draw_circle()`, `draw_text_centered()` and
-`set_rotation_transform()` (identical to `set_rotation` once driver-side rotation was
-removed).
+**The scratch-buffer loan** (`scratch_buf1()` / `scratch_buf2()` /
+`reset_after_scratch()`), which handed both framebuffers to on-device conversion
+and image decoding. The three surviving `reset_after_scratch()` calls were
+actively harmful — blanking both buffers and marking the frame stale after serial
+index ops that never touched them. `DrawBuffer::active_valid_` went too: with
+nothing invalidating it, it was always true.
 
-**The scratch-buffer loan.** `DrawBuffer::scratch_buf1()`/`scratch_buf2()`/
-`reset_after_scratch()` handed both framebuffers out to on-device EPUB conversion and
-image decoding. Both are gone — and the three surviving `reset_after_scratch()` calls
-were actively harmful, blanking both buffers and marking the displayed frame stale
-after a serial index op that never touched them. `BookIndex::build_index()` and
-`index_file()` lost the `DrawBuffer&` they only ever `(void)`-cast, and
-`DrawBuffer::active_valid_` went with them: with nothing invalidating it, it was
-always true.
+**`BookIndex::is_book_path`** (byte-identical to `is_wgb_path`) and
+**`build_index`'s counting pass**, which walked the whole card once just to
+produce a total that only a compiled-out log read. One tree walk now, with
+`iterate_books` templated on its callback rather than taking a `std::function`.
 
-**`BookIndex::is_book_path`** — byte-identical to `is_wgb_path`, its doc comment still
-claiming `.epub`. **`build_index`'s first pass** — it walked the whole card recursively
-once just to count books into a `total` that only a compiled-out log ever read, then
-walked it again. One tree walk now; its `iterate_books` helper is templated on the
-callback instead of taking `std::function`, which cost a heap allocation and an
-indirect call per book.
+**Font provisioning and the "Installing fonts..." screen**, i.e. the entire
+asset-blob mechanism — the font is flashed straight to its partition now (see
+"Assets are flashed, not embedded"). `IDisplay::partial_refresh_region` went with
+it.
 
-**Font provisioning and the "Installing fonts..." progress screen** (2026-08-19): the
-entire asset-blob mechanism (`asset_blob.{h,cpp}`, `assets_embedded.S`,
-`tools/build_assets.py`), five unused `FontPartition` methods,
-`FontManager::ensure_ready`, `DrawBuffer::show_loading` / `render_loading_box_` /
-`mini_target_` and the `kLoad*`/`kBar*` geometry, and `IDisplay::partial_refresh_region`.
-Two smaller things went at the same time: `FontManager::any_corrupt()` and
-`Application::font_warning_shown_`, which after their log line was deleted did nothing
-but scan eight fonts once per frame and set a flag nobody read; and
-`FontManager::load_bundle()`, which lost its last caller with the desktop build.
-
-**The 3-second post-flash boot delay.** `app_main` used to `vTaskDelay(3000)` on
-`ESP_RST_SW` so a serial monitor had time to attach. There is no serial monitor output
-any more.
+**The 3-second post-flash boot delay** on `ESP_RST_SW`, which existed so a serial
+monitor could attach. There is no serial monitor output any more.

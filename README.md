@@ -27,15 +27,12 @@ Paste and fill the following settings into the `WintergreenConfig.h` file in you
 #pragma once
 
 #include <cstdint>
-#define WG_BLUETOOTH_PAGE_TURNER "7B:70:25:80:D8:27"
+#define WG_BLUETOOTH_PAGE_TURNER "7B:70:25:80:D8:27" // you need a mac address like this one!
 #define WG_WIFI_SYNC
 
 namespace wintergreen::config {
   inline constexpr const char* kWifiName = "";
   inline constexpr const char* kWifiPassword = "";
-  // **A `.local` name will not work here** — that is mDNS, and the firmware has
-  // no mDNS resolver. Use a literal IP (no lookup at all), or a plain hostname
-  // if your router resolves its own DHCP leases.
   inline constexpr const char* syncServer = "10.0.0.194";
 
   inline constexpr bool kSunlightFadingFix = false;
@@ -65,3 +62,4 @@ This is a VERY opinionated custom firmware! I want people to flash this firmware
 | No stats | You don't *really* need stats. It's a nice-to-have but also unnecessary and distracting. There is no other menus than the homescreen and book menu, and I want to keep it that way! |
 | Just chapter control | There is no link support. It keeps book builds faster and this is a mostly unused feature for many books. Chapters get first class support! |
 | Bluetooth & networking stack | I personally use a 2 key clicker and want syncing, so these are a must for me. |
+| Very minimal reader settings | I only keep the stuff that actually matters for changing while reading, not the things that you set once and forget. It is global, so you can connect a bluetooth turner and change the orientation for it to affect all books! |

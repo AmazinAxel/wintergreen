@@ -30,6 +30,7 @@
 #include "WintergreenConfig.h"
 #include "wintergreen/Input.h"
 #include "wintergreen/Runtime.h"
+#include "wintergreen/display/DrawBuffer.h"
 
 namespace wg_clicker {
 
@@ -125,10 +126,49 @@ inline bool g_hidh_up = false;       // esp_hidh_init — once
 inline bool g_host_task_started = false;  // esp_nimble_enable — once; the task is never deleted
 inline bool g_host_up = false;       // host synced with the controller; false again after radio_off
 
-// Internal RAM required before it is worth starting. A floor for the hopeless
-// case, deliberately far below what the stack actually wants — a threshold set
-// at the real figure refuses attempts that would have succeeded.
-inline constexpr size_t kMinHeapKb = 24;
+// **There is deliberately no free-heap floor here any more.** kMinHeapKb
+// existed to turn a hopeless attempt into a clean refusal, and in practice it
+// did the opposite: it returned false without touching g_state, so the row sat
+// on "Disconnected" and the device looked like it had ignored the button. Worse,
+// whether it tripped depended on heap fragmentation, so the same press worked
+// or did nothing depending on what had run before — which is exactly what made
+// "run a sync first" look like a fix. A press now always attempts a connect.
+//
+// DrawBuffer's spare, released for the length of a connection attempt and taken
+// back when the radio goes down. Set by bind(); null on a build that never
+// calls it, and every use is guarded.
+//
+// **The clicker does not fit without this.** The BT controller wants a
+// contiguous block of internal DRAM, and this device has one 50 KB pool of it
+// (the boot log's "At 3FCB3490 len 0000CB70 (50 KiB): RAM"; the other ~123 KB
+// is retention RAM). DrawBuffer's two framebuffers are 96 KB of BSS in that
+// space and the spare is another 48 KB on the heap. Releasing the book index
+// alone left the controller reporting, verbatim:
+//
+//   E BLE_INIT: Malloc failed
+//   E BLE_INIT: esp_bt_controller_init -4      (ESP_ERR_NO_MEM)
+//
+// With slightly more free RAM the same shortage got one stage further and
+// asserted inside the closed controller blob instead — "BLE assert emi.c 164"
+// followed by an interrupt watchdog reboot from r_lld_core_init. Same cause,
+// two symptoms; neither is a coexistence, modem-sleep or PHY-calibration
+// problem, all of which were tried first and changed nothing.
+//
+// It is given up on **every** connect. Keeping it when the heap looked roomy
+// was tried and made the failure depend on fragmentation rather than on
+// anything the user did. Page turns fall back to re-rendering for as long as
+// the clicker is connected, which is the documented behaviour without a spare
+// and is the trade this device has to make: the clicker worked with the spare
+// intact before Wi-Fi sync existed, and what changed is ~17 KB of Wi-Fi static
+// RAM (g_cnxMgr, s_wifi_nvs, TxRxCxt, gWpaSm) that is present whether or not a
+// sync ever runs.
+inline wintergreen::DrawBuffer* g_buf = nullptr;
+inline bool g_spare_released = false;
+
+// Set by release_for_wifi() so the next radio_off() also deinits the
+// controller. A flag rather than a parameter because radio_off() is reached
+// from the HID callback path and from poll(), neither of which knows why.
+inline bool g_deep_teardown = false;
 
 // "AA:BB:CC:DD:EE:FF" -> 6 bytes, **reversed**. NimBLE's ble_addr_t.val is
 // little-endian (ble_gap.c tests addr[5] & 0xC0) and esp_hidh_dev_open memcpy's
@@ -351,14 +391,30 @@ inline void radio_off() {
     g_ctrl_enabled = false;
     g_host_up = false;  // resync on the next enable
   }
+  if (g_deep_teardown) {
+    // Hands the controller's own allocation back, which disable() alone does
+    // not: disable() returns it to INITED, still holding its buffers. Only
+    // reached from release_for_wifi() — see there for why this is not the
+    // default.
+    esp_bt_controller_deinit();
+    g_ctrl_inited = false;
+    g_deep_teardown = false;
+  }
+  // Page turns go back to being a memcpy. Reached from every path out of the
+  // radio — toggling off, a failed bringup (connect_task's `if (!ok)`) and
+  // poll() acting on a disconnect — so the spare is never left released.
+  // Guarded by g_spare_released because bringup only takes it under pressure.
+  if (g_buf && g_spare_released) {
+    g_buf->reacquire_spare();
+    g_spare_released = false;
+  }
+
   g_last_key = 0;
   g_battery_pct = 0;
   g_state = wintergreen::ClickerState::Disconnected;
 }
 
 inline bool bringup_stack() {
-  if (!g_ctrl_inited && heap_caps_get_free_size(MALLOC_CAP_INTERNAL) / 1024 < kMinHeapKb)
-    return false;
 
   // NVS backs the bond store and nothing else here uses it, so a device with
   // the radio off never pays for it.
@@ -369,6 +425,17 @@ inline bool bringup_stack() {
   }
   if (nvs != ESP_OK)
     return false;
+
+  // **Unconditional.** A conditional release (only below some free-heap
+  // threshold) was tried and is why a connect could refuse or die depending on
+  // how fragmented the heap happened to be — a sync in between changed the
+  // answer, which is what made this look like a Wi-Fi interaction. The radio
+  // gets the 48 KB every time, so a connect attempt behaves the same on a
+  // fresh boot as after an hour of reading.
+  if (g_buf && !g_spare_released) {
+    g_buf->release_spare();
+    g_spare_released = true;
+  }
 
   if (!g_ctrl_inited) {
     esp_bt_controller_mem_release(ESP_BT_MODE_CLASSIC_BT);
@@ -475,6 +542,31 @@ inline void connect_task(void*) {
 
 // ── Public API ─────────────────────────────────────────────────────────────
 
+// The spare framebuffer this hands to the radio for the length of a connection.
+// Call once at startup; without it the clicker cannot allocate — see g_buf.
+inline void bind(wintergreen::DrawBuffer& buf) {
+  g_buf = &buf;
+}
+
+// Take the clicker down as far as it can go, for a Wi-Fi sync.
+//
+// radio_off() alone is not enough: it disables the controller but leaves it
+// *initialised*, still holding its buffers, so esp_wifi_init() came up ~18 KB
+// short of the ~50 KB it needs and the sync failed instantly. This also deinits
+// the controller.
+//
+// What it deliberately does **not** touch is the NimBLE host and esp_hidh. With
+// CONFIG_BT_NIMBLE_STATIC_TO_DYNAMIC=y, esp_nimble_deinit() leaves ble_hs_ctx
+// dangling and the next esp_nimble_init() panics in os_mempool_init — cycling
+// the host is not supported by this IDF and fails by crashing. They stay up and
+// quiescent; bringup_stack() skips them on a reconnect and re-inits only the
+// controller, so pressing the clicker row again after a sync works without a
+// reboot.
+inline void release_for_wifi() {
+  g_deep_teardown = true;
+  radio_off();
+}
+
 inline wintergreen::ClickerState state() {
   return g_state;
 }
@@ -485,8 +577,16 @@ inline uint8_t battery_pct() {
 }
 
 inline void toggle() {
-  if (g_busy)
+  // A press while a connect is still running means "give up", not "ignore me".
+  // Without this the row is inert for the whole attempt, and if the worker ever
+  // fails to clear g_busy — an abort mid-discovery, a peer that vanishes with
+  // no CLOSE event — the clicker is stuck reading Connected until a reboot,
+  // with the row refusing to disconnect it.
+  if (g_busy) {
+    if (g_state == wintergreen::ClickerState::Connecting)
+      g_disconnect_request = true;  // poll() tears down once the worker exits
     return;
+  }
   g_busy = true;
   // Anything not Connected is an off state: toggling retries.
   if (g_state != wintergreen::ClickerState::Connected) {
@@ -530,6 +630,8 @@ inline uint8_t battery_pct() {
 }
 inline void toggle() {}
 inline void poll() {}
+inline void bind(wintergreen::DrawBuffer&) {}
+inline void release_for_wifi() {}
 }  // namespace wg_clicker
 
 #endif  // WG_BLUETOOTH_PAGE_TURNER

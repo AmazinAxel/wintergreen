@@ -104,6 +104,8 @@ class DrawBuffer {
   }
 
   ~DrawBuffer() {
+    std::free(bufs_[0]);
+    std::free(bufs_[1]);
     std::free(spare_);
   }
 
@@ -556,6 +558,13 @@ class DrawBuffer {
     return true;
   }
 
+  // Whether begin_offscreen() would succeed, without the side effects. Lets a
+  // caller skip speculative work it could not use — the spare is absent
+  // whenever a radio holds the heap.
+  bool can_offscreen() const {
+    return spare_ != nullptr;
+  }
+
   void end_offscreen() {
     draw_target_ = nullptr;
     spare_use_ = Spare::Offscreen;
@@ -811,9 +820,20 @@ class DrawBuffer {
   }
 
   IDisplay& display_;
-  alignas(4) uint8_t bufs_[2][kBufSize];
-  // Heap, not BSS — see release_spare(). Allocated once at construction; a
-  // failed allocation just means every page turn renders normally.
+  // **Heap, not BSS, and this is what makes the BLE controller fit.** As a
+  // member array these were 96 KB of .bss, and .bss lands in the one ~50 KB
+  // contiguous DRAM pool the BT controller must allocate from (the boot log's
+  // "At 3FCB3490 len 0000CB70 (50 KiB): RAM" — the other ~123 KB is retention
+  // RAM, which .bss does not reach). The controller therefore had nowhere to
+  // go and reported "esp_bt_controller_init -4" / ESP_ERR_NO_MEM.
+  //
+  // On the heap the allocator is free to place them in the retention pool and
+  // leave the scarce region for the radio. Nothing else changes: they are
+  // allocated once at construction and never freed.
+  uint8_t* bufs_[2] = {static_cast<uint8_t*>(std::malloc(kBufSize)),
+                       static_cast<uint8_t*>(std::malloc(kBufSize))};
+  // Heap for the same reason, but also released outright while a radio is up —
+  // see release_spare().
   uint8_t* spare_ = static_cast<uint8_t*>(std::malloc(kBufSize));
   Spare spare_use_ = Spare::None;
   // Non-null while begin_offscreen() is in effect; see draw_().

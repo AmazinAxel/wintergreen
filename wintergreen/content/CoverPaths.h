@@ -4,18 +4,19 @@
 
 namespace wintergreen {
 
-// Where a book's cover bitmaps live.
+// Where a book's cover bitmaps live: beside the book, written by tools/epub2wgb
+// — the device cannot generate them, since there is no EPUB on the card.
+// Deriving a path from the file stem would be wrong as well as useless: every
+// converted book is literally named book.wgb.
 //
-// For a converted book (`<book>/book.wgb`) they sit beside it, written by
-// tools/epub2wgb — the device cannot generate them, since there is no EPUB on
-// the card. Deriving a path from the file stem would be wrong as well as
-// useless: every converted book is literally named book.wgb.
-//
-// The `<data_dir>/cache/<stem>/` form is kept only for the EPUB conversion
-// path, which no longer exists on-device but still runs in the host converter.
-std::string cover_bin_path(const char* book_path, const char* data_dir);
-std::string cover_sleep_bin_path(const char* book_path, const char* data_dir);
-std::string cover_home_bin_path(const char* book_path, const char* data_dir);
+// These took a `data_dir` for a second `<data_dir>/cache/<stem>/` form used by
+// on-device EPUB conversion. That path went with EPUB support: BookIndex only
+// ever indexes .wgb, so the branch selecting it was unreachable. The host
+// converter never called these at all — it string-replaces "book.wgb" in its
+// own output path (WgbConverter.cpp).
+std::string cover_bin_path(const char* book_path);
+std::string cover_sleep_bin_path(const char* book_path);
+std::string cover_home_bin_path(const char* book_path);
 
 // Reading position, written beside the book as <book dir>/book.pos.
 //
@@ -24,7 +25,7 @@ std::string cover_home_bin_path(const char* book_path, const char* data_dir);
 // a hash collision away from two books sharing a bookmark, and a position that
 // silently reset if a publisher edited the metadata. Beside the book it is
 // obvious, deleted with the book, and needs no key at all.
-std::string book_pos_path(const char* book_path, const char* data_dir);
+std::string book_pos_path(const char* book_path);
 
 // The home carousel's cover box, in panel pixels. The converter renders
 // cover_home.bin to fit exactly this, so HomeScreen can blit it 1:1 instead of

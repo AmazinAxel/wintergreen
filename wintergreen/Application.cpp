@@ -108,7 +108,7 @@ void Application::auto_open_book(const char* epub_path, DrawBuffer& buf, IRuntim
 static bool show_book_cover_sleep_(DrawBuffer& buf, const char* data_dir, const std::string& book_path) {
   if (!data_dir || book_path.empty()) return false;
 
-  const std::string cpath = cover_sleep_bin_path(book_path.c_str(), data_dir);
+  const std::string cpath = cover_sleep_bin_path(book_path.c_str());
   FILE* f = std::fopen(cpath.c_str(), "rb");
   if (!f) return false;
 
@@ -149,13 +149,17 @@ static bool show_book_cover_sleep_(DrawBuffer& buf, const char* data_dir, const 
     std::fclose(f);
   }
 
-  // Half, not Full: Full is differential and takes active_() as the waveform's
-  // starting state, but active_() is only correct when the last panel write went
-  // through refresh()/full_refresh(). commit_offscreen() and restore_snapshot()
-  // both write inactive_() without flipping active_idx_, so after a pre-drawn
-  // page turn or a quick-menu dismiss the "previous" frame is wrong and the
-  // waveform under-drives — leaving the book text on the glass instead of the
-  // cover. Half ignores prev and paints from `pixels` alone.
+  // Half ignores prev (CTRL1_BYPASS_RED) and paints from `pixels` alone, which
+  // is what keeps it to a single pass and makes the sleep screen appear quietly.
+  //
+  // RefreshMode::Full was tried here for a reported left/right fade on one
+  // cover. It did not fix it and its extra inversion phases were visibly
+  // flashier, so it was reverted. The fade is not a panel artefact: measuring
+  // cover_sleep.bin directly, ink coverage runs 0.52 at the centre column band
+  // down to ~0.30 at both edges, smoothly. That cover's artwork simply has a
+  // vignette and the panel is rendering it faithfully. Other covers are
+  // near-uniform (the hobbit ~0.95, lord of the flies ~0.10) and have no
+  // gradient to show. Don't go looking for a waveform fix for this one.
   buf.full_refresh(RefreshMode::Half, /*turnOffScreen=*/true);
   buf.deep_sleep();
   return true;
@@ -324,6 +328,17 @@ void Application::update(const ButtonState& buttons, uint32_t dt_ms, DrawBuffer&
     fwd.press_history_count = n;
   }
 
+  // Track the clicker so the reader's cache cap follows the radio rather than
+  // the quick-menu row. A clicker can drop on its own — it goes out of range,
+  // its battery dies, the peer disconnects — and the cap must lift then too, or
+  // a session pays for a radio that is no longer there.
+  const ClickerState clicker_now = runtime.clicker_state();
+  if (clicker_now != clicker_prev_) {
+    if (clicker_now == ClickerState::Disconnected || clicker_now == ClickerState::Unavailable)
+      restore_ram_after_radio();
+    clicker_prev_ = clicker_now;
+  }
+
   IScreen* top = screen_mgr_.top();
   if (top) {
     top->update(fwd, buf, runtime);
@@ -419,15 +434,31 @@ void Application::save_settings_() {
 
 
 void Application::release_ram_for_radio() {
-  // **Only the book index.** DrawBuffer's spare and the reader's page caches
-  // are deliberately NOT released: they are what make a page turn a memcpy
-  // instead of a layout, and a clicker exists to turn pages. Trading page-turn
-  // latency for radio headroom defeats the point of the feature.
-  //
   // The index costs nothing to be without while a book is open — every screen
   // reloads it from disk on demand — and the reading position is already on
   // disk, so nothing here is the only copy.
   BookIndex::instance().release_memory();
+
+  // **The reader's caches go too, and the earlier reasoning for keeping them
+  // was wrong.** It ran: they are what make a page turn a memcpy instead of a
+  // layout, and a clicker exists to turn pages, so releasing them defeats the
+  // feature. What that missed is that the alternative is not a slow page turn,
+  // it is no page turn at all — a backward turn with the radio up threw
+  // std::bad_alloc from assemble_page's word_pool reserve (a 912-byte
+  // allocation; the heap was simply empty) and with exceptions disabled that
+  // aborts and reboots the device mid-book.
+  //
+  // Freed here rather than at each allocation site because the shortage is
+  // global: any screen that allocates while BLE is resident is exposed, and the
+  // reader's caches are the largest thing that can be given back without
+  // losing state.
+  reader_.release_caches();
+}
+
+void Application::restore_ram_after_radio() {
+  // Only the cap is restored; the caches themselves refill on demand. The book
+  // index reloads from disk the next time a screen asks for it.
+  reader_.restore_caches();
 }
 
 void Application::record_book_opened(const std::string& path) {

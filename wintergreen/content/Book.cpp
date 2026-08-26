@@ -136,6 +136,21 @@ bool Book::write_cover_bin(const char* cover_path, int max_w, int max_h,
 // was tried and is gone with this comment. Covers are close enough to the
 // panel's aspect that filling it outright reads as a full-bleed image, which is
 // what a sleep screen wants — and there is no bar geometry left to get wrong.
+//
+// **Never resample the decoder's output.** It returns a dithered 1-bit bitmap,
+// and scaling that means picking whole pixels out of an error-diffused pattern:
+// the dropped pixels are the ones carrying the diffused error, so the local
+// average stops matching the original tone and the result bands and mottles.
+// This function used to decode at W x H and then nearest-neighbour the trimmed
+// sub-rectangle up to the panel, which is exactly that — and it silently
+// contradicted the "dithered once" comment two lines above it.
+//
+// So the scale is pushed into the decoder, which scales from *grayscale* and
+// dithers in the same pass (see dither_row's x_step). Two decodes: one to
+// measure the trim box, one at dimensions inflated so the trimmed region lands
+// at exactly W x H. The second decode's crop is then a pure copy, no resampling
+// at any point. Decoding twice costs converter time only, and the converter
+// already decodes this cover three times for the three sizes.
 bool Book::write_sleep_cover_bin(const char* cover_path, int W, int H,
                                  uint8_t* work_buf, size_t work_buf_size) {
   const int idx = epub_.cover_zip_idx();
@@ -144,32 +159,34 @@ bool Book::write_sleep_cover_bin(const char* cover_path, int W, int H,
   if (W <= 0 || H <= 0)
     return false;
 
-  // scale_to_fill so a small cover is scaled up from the grayscale and dithered
-  // once, rather than being dithered small and pixel-replicated afterwards.
-  DecodedImage img;
   auto& entry = epub_.zip().entry(static_cast<uint16_t>(idx));
-  if (decode_image_from_entry(file_, entry, static_cast<uint16_t>(W), static_cast<uint16_t>(H), img,
+
+  // Pass 1: decode at panel size purely to locate the blank bands. Only the
+  // trim box is taken from this; none of its pixels reach the output.
+  DecodedImage probe;
+  if (decode_image_from_entry(file_, entry, static_cast<uint16_t>(W), static_cast<uint16_t>(H), probe,
                               work_buf, work_buf_size, /*scale_to_fill=*/true) != ImageError::Ok)
     return false;
-  if (img.data.empty() || img.width == 0 || img.height == 0)
+  if (probe.data.empty() || probe.width == 0 || probe.height == 0)
     return false;
 
-  const int cw = img.width, ch = img.height;
-  const size_t stride = img.stride();
-  const uint8_t* src = img.data.data();
-  auto ink = [&](int x, int y) { return ((src[static_cast<size_t>(y) * stride + (x >> 3)] >> (7 - (x & 7))) & 1) == 0; };
+  const int cw = probe.width, ch = probe.height;
+  const size_t pstride = probe.stride();
+  const uint8_t* psrc = probe.data.data();
+  auto pink = [&](int x, int y) {
+    return ((psrc[static_cast<size_t>(y) * pstride + (x >> 3)] >> (7 - (x & 7))) & 1) == 0;
+  };
 
-  // Trim fully blank rows and columns before stretching. Publishers bake white
-  // bands into cover artwork, and stretching those to the panel just makes them
-  // bigger.
+  // Trim fully blank rows and columns. Publishers bake white bands into cover
+  // artwork, and stretching those to the panel just makes them bigger.
   int x0 = 0, y0 = 0, x1 = cw, y1 = ch;
   {
     auto row_blank = [&](int y) {
-      for (int x = 0; x < cw; ++x) if (ink(x, y)) return false;
+      for (int x = 0; x < cw; ++x) if (pink(x, y)) return false;
       return true;
     };
     auto col_blank = [&](int x) {
-      for (int y = y0; y < y1; ++y) if (ink(x, y)) return false;
+      for (int y = y0; y < y1; ++y) if (pink(x, y)) return false;
       return true;
     };
     while (y0 < y1 - 1 && row_blank(y0)) ++y0;
@@ -177,19 +194,52 @@ bool Book::write_sleep_cover_bin(const char* cover_path, int W, int H,
     while (x0 < x1 - 1 && col_blank(x0)) ++x0;
     while (x1 > x0 + 1 && col_blank(x1 - 1)) --x1;
   }
-  const int src_w = x1 - x0, src_h = y1 - y0;
-  if (src_w <= 0 || src_h <= 0)
+  const int keep_w = x1 - x0, keep_h = y1 - y0;
+  if (keep_w <= 0 || keep_h <= 0)
     return false;
 
   const size_t out_stride = (static_cast<size_t>(W) + 7) / 8;
-  std::vector<uint8_t> out(out_stride * static_cast<size_t>(H), 0xFF);
-  for (int dy = 0; dy < H; ++dy) {
-    const int sy = y0 + dy * src_h / H;
-    uint8_t* orow = out.data() + static_cast<size_t>(dy) * out_stride;
-    for (int dx = 0; dx < W; ++dx) {
-      const int sx = x0 + dx * src_w / W;
-      if (ink(sx, sy))
-        orow[dx >> 3] &= static_cast<uint8_t>(~(0x80u >> (dx & 7)));
+  std::vector<uint8_t> out;
+
+  if (keep_w == cw && keep_h == ch) {
+    // Nothing to trim: the probe is already the final image at the right size.
+    out = std::move(probe.data);
+  } else {
+    // Pass 2: inflate the decode so the kept region scales up to exactly W x H,
+    // then take that region out of it. Rounding up keeps the crop inside the
+    // decoded image; any excess is absorbed by clamping the origin below.
+    const int dec_w = static_cast<int>((static_cast<int64_t>(W) * cw + keep_w - 1) / keep_w);
+    const int dec_h = static_cast<int>((static_cast<int64_t>(H) * ch + keep_h - 1) / keep_h);
+    if (dec_w <= 0 || dec_h <= 0 || dec_w > 0xFFFF || dec_h > 0xFFFF)
+      return false;
+
+    DecodedImage full;
+    if (decode_image_from_entry(file_, entry, static_cast<uint16_t>(dec_w), static_cast<uint16_t>(dec_h), full,
+                                work_buf, work_buf_size, /*scale_to_fill=*/true) != ImageError::Ok)
+      return false;
+    if (full.data.empty() || full.width < W || full.height < H)
+      return false;
+
+    // Map the trim origin into the inflated image, clamped so the W x H window
+    // always lies inside it.
+    int ox = static_cast<int>(static_cast<int64_t>(x0) * full.width / cw);
+    int oy = static_cast<int>(static_cast<int64_t>(y0) * full.height / ch);
+    if (ox > full.width - W) ox = full.width - W;
+    if (oy > full.height - H) oy = full.height - H;
+    if (ox < 0) ox = 0;
+    if (oy < 0) oy = 0;
+
+    const size_t fstride = full.stride();
+    const uint8_t* fsrc = full.data.data();
+    out.assign(out_stride * static_cast<size_t>(H), 0xFF);
+    for (int dy = 0; dy < H; ++dy) {
+      const uint8_t* srow = fsrc + static_cast<size_t>(oy + dy) * fstride;
+      uint8_t* orow = out.data() + static_cast<size_t>(dy) * out_stride;
+      for (int dx = 0; dx < W; ++dx) {
+        const int sx = ox + dx;
+        if (((srow[sx >> 3] >> (7 - (sx & 7))) & 1) == 0)
+          orow[dx >> 3] &= static_cast<uint8_t>(~(0x80u >> (dx & 7)));
+      }
     }
   }
 

@@ -11,6 +11,79 @@ namespace wintergreen {
 constexpr uint8_t ReaderSettings::kNumFontSizePresets;
 constexpr const char* ReaderSettings::kFontSizeNames[];
 
+static std::string_view strip_chapter_prefix(std::string_view label);
+
+// ---------------------------------------------------------------------------
+
+// Drop a leading "CHAPTER " from a TOC label, keeping the numeral: "CHAPTER I.
+// Down the Rabbit-Hole" reads "I. Down the Rabbit-Hole". The word is pure
+// redundancy in a list that is entirely chapters, and it costs the width that
+// the actual title needs — every row in a book like The Hobbit started with the
+// same eight characters.
+//
+// Only stripped when something recognisable follows, so a bare "CHAPTER" (a
+// part divider in some books) is left alone rather than blanked. The numeral
+// itself stays: it is the chapter's identity, and its punctuation varies by
+// publisher ("I." vs "I:"), so it is kept verbatim rather than reformatted.
+static std::string_view strip_chapter_prefix(std::string_view label) {
+  static constexpr std::string_view kWord = "CHAPTER";
+  if (label.size() <= kWord.size())
+    return label;
+
+  // Case-insensitive: books use "CHAPTER", "Chapter" and "chapter".
+  for (size_t i = 0; i < kWord.size(); ++i) {
+    const char c = label[i];
+    const char u = (c >= 'a' && c <= 'z') ? static_cast<char>(c - 32) : c;
+    if (u != kWord[i])
+      return label;
+  }
+  if (label[kWord.size()] != ' ')
+    return label;  // "CHAPTERHOUSE", not a prefix
+
+  std::string_view rest = label.substr(kWord.size() + 1);
+  while (!rest.empty() && rest.front() == ' ')
+    rest.remove_prefix(1);
+  if (rest.empty())
+    return label;  // nothing left to show; keep the original
+
+  return rest;
+}
+
+// Left-aligned text, ellipsised when it does not fit in max_w. Chapter titles
+// come from the book and are arbitrarily long ("Chapter 1: In Which Pooh Goes
+// Visiting And Gets Into A Tight Place"), so without this they run off the
+// right edge — and in the TOC they can also collide with the row beneath.
+//
+// Truncation advances by whole UTF-8 sequences: cutting mid-sequence would feed
+// draw_text_proportional a partial codepoint.
+static void draw_text_ellipsised(DrawBuffer& buf, int x, int baseline, const char* text, size_t len,
+                                 const BitmapFont& f, int max_w, bool invert) {
+  if (len == 0 || max_w <= 0) return;
+  if (f.word_width(text, len, FontStyle::Regular) <= max_w) {
+    buf.draw_text_proportional(x, baseline, text, len, f, invert);
+    return;
+  }
+
+  static const char kEll[] = "...";
+  const int budget = max_w - f.word_width(kEll, 3, FontStyle::Regular);
+  size_t fit = 0;
+  while (fit < len) {
+    const uint8_t b = static_cast<uint8_t>(text[fit]);
+    const size_t cb = b < 0x80 ? 1u : b < 0xE0 ? 2u : b < 0xF0 ? 3u : 4u;
+    if (fit + cb > len) break;
+    if (f.word_width(text, fit + cb, FontStyle::Regular) > budget) break;
+    fit += cb;
+  }
+
+  // Not even one character fits beside the ellipsis: draw the ellipsis alone
+  // rather than nothing, so the row still reads as "there is text here".
+  char trunc[260];
+  const size_t cp = std::min<size_t>(fit, sizeof(trunc) - 4);
+  std::memcpy(trunc, text, cp);
+  std::memcpy(trunc + cp, kEll, 3);
+  buf.draw_text_proportional(x, baseline, trunc, cp + 3, f, invert);
+}
+
 // ---------------------------------------------------------------------------
 
 void QuickmenuScreen::populate(const TableOfContents& toc, uint16_t current_chapter, uint16_t current_para,
@@ -28,7 +101,10 @@ void QuickmenuScreen::populate(const TableOfContents& toc, uint16_t current_chap
     }
   }
   if (best_match >= 0) {
-    chapter_title_ = toc_->entries[best_match].label.to_string(toc_->pool);
+    // Same treatment as the TOC rows below: the header names the chapter you are
+    // in, so it would otherwise read "CHAPTER I. ..." while the list reads "I. ...".
+    const std::string full = toc_->entries[best_match].label.to_string(toc_->pool);
+    chapter_title_ = std::string(strip_chapter_prefix(full));
   }
 
   book_progress_pct_ = book_progress_pct;
@@ -372,7 +448,9 @@ void QuickmenuScreen::draw_all_(DrawBuffer& buf, std::optional<uint8_t> battery_
     // ": " ("Chapter 1: The Beginning") and must never be split into columns.
     std::string_view display_label = label;
     std::string_view display_value;
-    if (!is_chapter) {
+    if (is_chapter) {
+      display_label = strip_chapter_prefix(label);
+    } else {
       const auto pos = label.find(": ");
       if (pos != std::string_view::npos) {
         display_label = label.substr(0, pos);
@@ -385,12 +463,17 @@ void QuickmenuScreen::draw_all_(DrawBuffer& buf, std::optional<uint8_t> battery_
 
     const int text_y = y + (row_h_() - ui_font_.y_advance()) / 2 + ui_font_.baseline();
     const int text_x = kLM + (is_chapter ? get_item_indent(i) * 12 : 0);
-    buf.draw_text_proportional(text_x, text_y, display_label.data(), display_label.size(), ui_font_, sel);
 
+    // The value keeps its full width and the label gives way: a settings row
+    // reads "Font Size: 28", and losing the 28 would defeat the row.
+    int label_w = W - kRM - text_x;
     if (!display_value.empty()) {
       const int vw = ui_font_.word_width(display_value.data(), display_value.size(), FontStyle::Regular);
       buf.draw_text_proportional(W - kRM - vw, text_y, display_value.data(), display_value.size(), ui_font_, sel);
+      label_w -= vw + kValueGap;
     }
+
+    draw_text_ellipsised(buf, text_x, text_y, display_label.data(), display_label.size(), ui_font_, label_w, sel);
 
     y += row_h_();
   }
@@ -446,8 +529,12 @@ void QuickmenuScreen::on_select(int index) {
       // device the two do not fit at once — a connect used to fail with the
       // host task unable to start (11 KB free), or succeed and then abort the
       // reader on its next page layout.
-      if (runtime_->clicker_state() != ClickerState::Connected && app_)
-        app_->release_ram_for_radio();
+      if (app_) {
+        if (runtime_->clicker_state() != ClickerState::Connected)
+          app_->release_ram_for_radio();
+        else
+          app_->restore_ram_after_radio();  // toggling off; the heap is ours again
+      }
       // Returns immediately: connecting takes seconds. The row redraws as
       // "Connecting", and update() below repaints it when the outcome lands.
       runtime_->toggle_clicker();

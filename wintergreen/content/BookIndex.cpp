@@ -94,6 +94,26 @@ bool BookIndex::load(const std::string& index_file) {
   pool_.reset();
   dirty_ = false;  // freshly parsed from disk; nothing to write back
 
+  // Reserve before growing anything sized by file content. Without this the
+  // entry vector reallocates its way up as it parses while the string pool is
+  // also allocating chunks, and a vector realloc holds the old and new blocks at
+  // once — the same transient spike that threw bad_alloc in build_page_items.
+  //
+  // Sized from the file rather than MAX_BOOKS: a 3-book library should not take
+  // 4 KB for 250 slots. One line is a path, a title, an author and two numbers,
+  // so bytes/64 is a floor on the entry count that never over-reserves for a
+  // real index. Off by a little is harmless — this only has to stop the
+  // reallocation chain, not predict exactly.
+  if (std::fseek(f, 0, SEEK_END) == 0) {
+    const long bytes = std::ftell(f);
+    if (bytes > 0) {
+      const size_t est = static_cast<size_t>(bytes) / 64 + 1;
+      entries_.reserve(est > MAX_BOOKS ? MAX_BOOKS : est);
+      pool_.reserve(static_cast<size_t>(bytes));
+    }
+  }
+  std::rewind(f);
+
   char line[1024];
   bool first_line = true;
   bool needs_rebuild = false;
@@ -309,6 +329,12 @@ void BookIndex::build_index(const std::string& root_dir) {
 
   entries_.clear();
   pool_.reset();
+  // Same reasoning as load(): the scan pushes an entry per book found while
+  // WgbReader is holding its own chapter-table buffer, so let the vector settle
+  // its allocation up front. The previous entry count is the best estimate
+  // available before walking the card.
+  if (!old_stats.empty())
+    entries_.reserve(old_stats.size());
   // Process books as we find them to avoid storing all paths in memory.
   int done = 0;
 
