@@ -20,8 +20,8 @@ hardcoding it breaks cross-platform flashing.
 `platforms/esp32/CMakeLists.txt` list core sources **explicitly** — adding or
 deleting a core `.cpp` means editing both, or CMake fails at generate time with an
 error naming `idf_component_register` rather than anything you touched.
-`wintergreen/Loop.cpp` is the last remnant of the desktop entry point; `run_loop()`
-is gone and `main.cpp` drives `run_loop_iteration()` itself.
+`wintergreen/Loop.{h,cpp}` is gone with the rest of the desktop entry point;
+`main.cpp` polls input, calls `app.update()` and paces the frame inline.
 
 `ESP_PLATFORM` is ESP-IDF's own macro (not a QEMU leftover) and is the seam between
 firmware and the host converter. It stays. The `esp32c3-qemu` env and every
@@ -367,8 +367,8 @@ rendering normally.
 `begin_offscreen()` redirects `draw_()` — the target every drawing helper resolves
 through — at the spare; `end_offscreen()` publishes it and `commit_offscreen()` moves
 it into the inactive buffer for the caller's refresh. The commit paths (`refresh`,
-`full_refresh`, `write_ram_bw`, `restore_snapshot`, the MGR2 sleep blit) use
-`inactive_()` directly and are unaffected.
+`full_refresh`, `restore_snapshot`, the MGR2 sleep blit) use `inactive_()` directly
+and are unaffected.
 
 Two things `prerender_next_page_()` must get right:
 
@@ -411,7 +411,7 @@ waveforms:
 
 | When | What runs |
 |---|---|
-| going to sleep | the sleep image — `full_refresh(RefreshMode::Full)` for a book cover, or `grayscale_refresh_1pass` for the wordmark |
+| going to sleep | the sleep image — `full_refresh(RefreshMode::Full)` for a book cover, `RefreshMode::Half` for the wordmark |
 | waking | `Application::start()`'s `full_refresh()` (Half) |
 
 With `kAutoSleepMinutes = 1` that is a full-panel waveform every time the device is
@@ -424,8 +424,8 @@ minute. Page turns every 45 s keep `inactivity_ms_` below the auto-sleep timeout
 indefinitely, so a 30-minute stretch is ~40 partial updates with no full refresh in
 the middle. That is within normal e-reader practice (Kobo exposes 1–100 pages *and*
 "never"), and the page-turn waveform is the vendor's OTP fast LUT rather than a
-hand-rolled table — `custom_lut_active_` is false for page turns, so
-`EPD_FAST_REFRESH` sets LUT_LOAD and uses the waveform the panel shipped with. Expect
+hand-rolled table — `EPD_FAST_REFRESH` sets LUT_LOAD unconditionally and uses the
+waveform the panel shipped with. Expect
 faint ghosting late in a long session; expect it gone after the next sleep.
 
 The canary is visible ghosting that *survives* a sleep/wake cycle. Nothing in the
@@ -698,7 +698,6 @@ platforms/esp32/           firmware entry point + every hardware driver, header-
 
 wintergreen/               portable core
   Application.{h,cpp}      screen ownership, ScreenId, settings I/O, sleep screen
-  Loop.{h,cpp}             run_loop_iteration() — poll, update, pace the frame
   ScreenManager.h          8-deep screen stack, start/stop/pause/resume
   Input.h                  Button, ButtonState, HoldRepeat
   Runtime.h                IRuntime
@@ -2485,13 +2484,14 @@ the LUT, not a sequencing bug, so no reordering fixes it.
 
 Text is consequently a hard threshold at the 50% AA level and reads slightly
 heavier than the old settled state. If that weight ever becomes a problem the
-escape hatch is the one-pass `kLutFactoryQuality` LUT already used for sleep
-images — it drives each pixel to an absolute level with no prior-state
-dependency, so a page could land in final form in a single update, at the cost of
-squashing the font's 5 AA levels into the panel's 4 and composing both RAM planes
-by hand. Note its RAM polarity is **inverted** relative to normal drawing (state
-`(RED<<1|BW)` = 00 is white); the per-row comments inside the table say the
-opposite and are wrong.
+escape hatch is the one-pass `kLutFactoryQuality` LUT, which **has now been
+deleted along with `setCustomLUT_()` and `custom_lut_active_`** — recover it from
+git history (`platforms/esp32/epd.h`). It drove each pixel to an absolute level
+with no prior-state dependency, so a page could land in final form in a single
+update, at the cost of squashing the font's 5 AA levels into the panel's 4 and
+composing both RAM planes by hand. Note its RAM polarity was **inverted**
+relative to normal drawing (state `(RED<<1|BW)` = 00 is white); the per-row
+comments inside the table said the opposite and were wrong.
 
 **Hyperlinks, entirely** — `LinksScreen`, the nav-history stack, `href` on `Run`
 and `LayoutWord`, and the underline rendering. An `<a>` now contributes only its
@@ -2563,10 +2563,34 @@ and `g_layout_metrics_us` bracketed **every `word_width()` call** with
 
 **Dead `IRuntime` and `DrawBuffer` surface.** `step_mode()`, `consume_step()`,
 `yield()` and `should_continue()` were never overridden to anything but a
-constant, so the branches testing them were dead; `Loop.cpp::run_loop()` went
-with the desktop build. On `DrawBuffer`: the no-arg `write_ram_*` wrappers,
+constant, so the branches testing them were dead; `Loop.{h,cpp}` went with the
+desktop build entirely, its three-line `run_loop_iteration()` inlined into
+`main.cpp`'s loop. On `DrawBuffer`: the no-arg `write_ram_*` wrappers,
 `draw_circle()`, `draw_text_centered()` and `set_rotation_transform()` (identical
 to `set_rotation` once driver-side rotation was removed).
+
+**The last of the grayscale plumbing**, orphaned when the MGR2 sleep blit moved
+to `RefreshMode::Half` and nothing drove the panel a plane at a time any more:
+`IDisplay::write_ram_bw` / `write_ram_red` / `grayscale_refresh_1pass` and both
+`EInkDisplay` overrides, `DrawBuffer::sync_bw_ram()` (`write_ram_bw`'s only
+caller), and `draw_text_plane()`, whose comment still said "for grayscale
+two-pass". With them went `kLutFactoryQuality`, `setCustomLUT_()`,
+`custom_lut_active_` (so `EPD_FAST_REFRESH` is a bare `0x1C`) and the four
+`CMD_GATE_VOLTAGE` / `CMD_SOURCE_VOLTAGE` / `CMD_WRITE_VCOM` / `CMD_WRITE_LUT`
+defines. `CMD_WRITE_RAM_RED` **stays** — `full_refresh` still writes both planes.
+
+**`wg_sync::FailStage`**, the sync bring-up scaffolding: the 14-stage enum,
+`g_fail` / `g_fail_heap_kb` / `fail_()`, `IRuntime::sync_fail_stage()` and
+`sync_fail_heap_kb()` with their ESP32 overrides, and `MainMenu`'s
+`Sync (fail %u, %uk)` label with its `sync_label_buf_`. Every bail-out in
+`bring_up_wifi_()` is a plain `return false` and the row reads `Sync` for both
+Idle and Failed, exactly as the clicker's equivalent was retired. Its own comment
+said to remove it once sync was confirmed on hardware, which it is.
+
+**`Application::tick_count()` / `uptime_ms()`** and the `ticks_` / `uptime_ms_`
+counters behind them — incremented every frame, never read. `running()` stays;
+`main.cpp`'s loop is built on it. `ScreenManager::restart_top()` had no callers
+either.
 
 **The scratch-buffer loan** (`scratch_buf1()` / `scratch_buf2()` /
 `reset_after_scratch()`), which handed both framebuffers to on-device conversion

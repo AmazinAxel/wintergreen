@@ -8,12 +8,21 @@ Some goals:
 
 - Syncs to a scripted NAS server
   - Because all books have to be converted to a binary format, the NAS server runs a script to convert all of them locally so that the Xteink can pull just the binary files and not the unconverted epubs. This saves space and makes syncing *much* faster.
-  - All of the book reading progress is saved to a simple json file! And when a book is finished, it gets deleted and saved to a different json file listing all your finshed books!
-- Bluetooth clicker support with auto pair (only supports reprogammable clickers with left/right arrow for page navigation)
+  - When a book is finished, a Sync deletes it and saves it to a different JSON file with all your finshed books!
+- Bluetooth clicker support (only supports reprogammable clickers with left/right arrow for page navigation)
+  - Highly optimized, works great (NOT a beta feature!) and supports back/select keys with page caching!
 - Nix-first building!!
+  - A Homelab setup works best with NixOS so you can convert your books and sync them locally
 - NO settings menu!! Everything is hardcoded for performance with very sane defaults so you don't have to think twice. Just flash and start reading!
+  - If you want syncing or bluetooth support, you will HAVE to build from scratch
 - No unnecessary UI, stat tracking or other extra features. It's meant for very fast and productive reading for quick moments, and nothing else to distract you from that.
+  - The use cases here optimize for in-bed reading with a Bluetooth clicker and reading out-and-about with the built-in keys!
 - The best possible performance and battery life possible from an X4! This is about as lightweight and optimized of a cfw as you'd get.
+  - Everything is built around making things feel fast and we cache wherever possible!
+
+## Media
+
+
 
 ## Flashing this
 
@@ -63,5 +72,4 @@ This is a VERY opinionated custom firmware! I want people to flash this firmware
 | Just chapter control | There is no link support. It keeps book builds faster and this is a mostly unused feature for many books. Chapters get first class support! |
 | Bluetooth & networking stack | I personally use a 2 key clicker and want syncing, so these are a must for me. |
 | Very minimal reader settings | I only keep the stuff that actually matters for changing while reading, not the things that you set once and forget. It is global, so you can connect a bluetooth turner and change the orientation for it to affect all books! |
-
-The main ideas of this firmware is to keep things as easy
+| Battery low bar | A small bar along the bottom screen indicates that you're <=15% on battery! It's not distracting yet visible enough to remind you to charge. No battery indicator or icon when reading books! |

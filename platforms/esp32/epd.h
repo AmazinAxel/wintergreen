@@ -39,54 +39,10 @@
 #define CMD_MASTER_ACTIVATION 0x20
 #define CTRL1_NORMAL 0x00
 #define CTRL1_BYPASS_RED 0x40
-#define CMD_GATE_VOLTAGE 0x03
-#define CMD_SOURCE_VOLTAGE 0x04
-#define CMD_WRITE_VCOM 0x2C
-#define CMD_WRITE_LUT 0x32
 #define CMD_WRITE_TEMP 0x1A
 #define CMD_AUTO_WRITE_BW_RAM 0x46
 #define CMD_AUTO_WRITE_RED_RAM 0x47
 #define CMD_DEEP_SLEEP 0x10
-
-// clang-format off
-// ---- Grayscale LUT tables (112 bytes each) ----
-// Layout: 50 bytes VS waveform (5 levels × 10), 50 bytes TP/RP timing (10 groups × 5),
-//         5 bytes frame rate, 1 byte VGH, 3 bytes VSH1/VSH2/VSL, 1 byte VCOM, 2 reserved.
-
-
-// One-pass 4-level grayscale LUT.
-// State bits are (RED_bit << 1 | BW_bit), mapping directly to 4 gray levels:
-//   00 = white, 01 = light gray, 10 = dark gray, 11 = black
-static const uint8_t kLutFactoryQuality[] = {
-    // VS L0–L3 + VCOM (10 bytes each)
-    0x00,0x4A,0x88,0x00,0x00,0x00,0x00,0x00,0x00,0x00,  // LUT0: state 00 (black)
-    0x80,0x62,0x00,0x00,0x00,0x00,0x00,0x00,0x00,0x00,  // LUT1: state 01 (dark gray)
-    0x88,0x60,0x00,0x00,0x00,0x00,0x00,0x00,0x00,0x00,  // LUT2: state 10 (light gray)
-    0xA8,0x44,0x04,0x00,0x00,0x00,0x00,0x00,0x00,0x00,  // LUT3: state 11 (white)
-    0x00,0x00,0x00,0x00,0x00,0x00,0x00,0x00,0x00,0x00,  // LUT4: VCOM
-
-    // TP/RP groups
-    0x08,0x0B,0x02,0x03,0x00,  // G0: 24 frames
-    0x0C,0x02,0x07,0x02,0x00,  // G1: 23 frames
-    0x01,0x00,0x02,0x00,0x00,  // G2:  3 frames
-    0x00,0x00,0x00,0x00,0x00,  // G3
-    0x00,0x00,0x00,0x00,0x00,  // G4
-    0x00,0x00,0x00,0x00,0x00,  // G5
-    0x00,0x00,0x00,0x00,0x00,  // G6
-    0x00,0x00,0x00,0x00,0x00,  // G7
-    0x00,0x00,0x00,0x00,0x00,  // G8
-    0x00,0x00,0x00,0x00,0x01,  // G9
-
-    // Frame rate
-    0x22,0x22,0x22,0x22,0x22,
-
-    // Voltages (VGH, VSH1, VSH2, VSL, VCOM)
-    0x17,0x41,0xA8,0x32,0x30,
-    // Reserved
-    0x00,0x00,
-};
-
-// clang-format on
 
 // ---- Refresh modes (internal) ----
 enum EpdRefreshMode { EPD_FULL_REFRESH, EPD_HALF_REFRESH, EPD_FAST_REFRESH };
@@ -103,7 +59,6 @@ class EInkDisplay : public wintergreen::IDisplay {
   // millis() at MASTER_ACTIVATION of a refresh that was fired without waiting;
   // 0 = nothing outstanding. Collected by waitWhileBusy().
   uint32_t pending_refresh_start_ = 0;
-  bool custom_lut_active_ = false;
 
   bool is_busy() const override {
     return gpio_get_level(EPD_BUSY) == 1;
@@ -349,8 +304,8 @@ class EInkDisplay : public wintergreen::IDisplay {
   // wait=false fires the waveform and returns immediately, leaving the panel busy.
   // Safe because every public entry point opens with wakeIfNeeded()+waitWhileBusy(),
   // so the next panel operation collects the outstanding refresh before touching RAM.
-  // Callers that send further SPI commands right afterwards (setCustomLUT_, deep
-  // sleep, screen power-off) must keep wait=true — a command mid-waveform aborts it.
+  // Callers that send further SPI commands right afterwards (deep sleep, screen
+  // power-off) must keep wait=true — a command mid-waveform aborts it.
   void refreshDisplay(EpdRefreshMode mode, bool turnOffScreen = false, bool wait = true) {
     sendCommand(CMD_DISPLAY_UPDATE_CTRL1);
     // Only EPD_HALF_REFRESH bypasses RED. Fast has always used it as the previous
@@ -450,8 +405,9 @@ class EInkDisplay : public wintergreen::IDisplay {
         displayMode |= 0xD4;
         break;
       case EPD_FAST_REFRESH:
-        // Skip LUT_LOAD (bit 4) when custom LUT is active so it isn't overwritten by OTP.
-        displayMode |= custom_lut_active_ ? 0x0C : 0x1C;
+        // LUT_LOAD (bit 4) included: page turns run the panel's OTP fast
+        // waveform, which is selected via the temperature register.
+        displayMode |= 0x1C;
         break;
     }
 
@@ -539,33 +495,6 @@ class EInkDisplay : public wintergreen::IDisplay {
   void writeRamBuffer(uint8_t ramBuffer, const uint8_t* data, uint32_t size) {
     sendCommand(ramBuffer);
     sendData(data, size);
-  }
-
-  // Load a custom LUT into the SSD1677's waveform register, or clear the flag.
-  void setCustomLUT_(const uint8_t* lut_data) {
-    if (lut_data) {
-      // The grayscale paths call this before their refreshDisplay(), so it can land
-      // while a fire-and-forget partial_refresh() is still driving the panel.
-      // Rewriting the LUT mid-waveform corrupts the update in progress.
-      waitWhileBusy();
-      // Bytes 0..104: waveform + timing + frame rate → CMD_WRITE_LUT (0x32)
-      sendCommand(CMD_WRITE_LUT);
-      sendData(lut_data, 105);
-      // Byte 105: VGH
-      sendCommand(CMD_GATE_VOLTAGE);
-      sendData(lut_data[105]);
-      // Bytes 106..108: VSH1, VSH2, VSL
-      sendCommand(CMD_SOURCE_VOLTAGE);
-      sendData(lut_data[106]);
-      sendData(lut_data[107]);
-      sendData(lut_data[108]);
-      // Byte 109: VCOM
-      sendCommand(CMD_WRITE_VCOM);
-      sendData(lut_data[109]);
-      custom_lut_active_ = true;
-    } else {
-      custom_lut_active_ = false;
-    }
   }
 
 };

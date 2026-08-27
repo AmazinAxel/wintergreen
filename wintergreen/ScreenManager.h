@@ -68,14 +68,6 @@ class ScreenManager {
     pop(1, buf, runtime);
   }
 
-  // Restart the top screen (stop + start).
-  void restart_top(DrawBuffer& buf, IRuntime& runtime) {
-    if (depth_ == 0)
-      return;
-    stack_[depth_ - 1]->stop();
-    stack_[depth_ - 1]->start(buf, runtime);
-  }
-
   IScreen* top() const {
     return depth_ > 0 ? stack_[depth_ - 1] : nullptr;
   }

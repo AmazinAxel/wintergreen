@@ -41,9 +41,31 @@ void wg_release_oom_reserve();
 
 namespace wg_clicker {
 
-// Presses injected by the clicker, merged by Esp32InputSource::poll_buttons the
-// same way serial-injected presses are. Bitmask of Button indices.
-inline volatile uint8_t g_clicker_buttons = 0;
+// Presses injected by the clicker, drained by Esp32InputSource::poll_buttons.
+//
+// **A ring buffer, not a bitmask.** A mask holds one bit per button, so several
+// clicks arriving between two polls collapsed into a single press: clicking
+// seven times in a second moved the list about three rows, one per UI frame
+// that happened to contain a click. The internal buttons never had this — they
+// queue every edge in press_queue_ — and this mirrors that, so a burst of
+// clicks lands as a burst of presses in arrival order.
+//
+// Written from the HID callback and drained under Esp32InputSource's critical
+// section. Single producer, single consumer, so head/tail need no locking of
+// their own; a full queue drops the newest press rather than overwriting an
+// unread one.
+inline constexpr uint8_t kPressQueueSize = 16;
+inline volatile uint8_t g_press_queue[kPressQueueSize] = {};
+inline volatile uint8_t g_pq_head = 0;
+inline volatile uint8_t g_pq_tail = 0;
+
+inline void queue_press(uint8_t btn) {
+  const uint8_t next = static_cast<uint8_t>((g_pq_tail + 1) % kPressQueueSize);
+  if (next == g_pq_head)
+    return;  // full: drop, never overwrite an unread press
+  g_press_queue[g_pq_tail] = btn;
+  g_pq_tail = next;
+}
 
 // HID keyboard usage IDs (HID Usage Table, keyboard page 0x07). In menus left
 // maps to Button2 (down a list) and right to Button3 (up), which is the
@@ -251,7 +273,7 @@ inline void handle_report(const uint8_t* data, uint16_t len) {
     // Release edge with no hold already fired: a short click, so page turn.
     const bool left = (g_last_key == kKeyLeftArrow);
     const uint8_t btn = (left != g_in_reader) ? kBtnNext : kBtnPrev;
-    g_clicker_buttons = static_cast<uint8_t>(g_clicker_buttons | (1u << btn));
+    queue_press(btn);
   }
   g_last_key = found;
 }
@@ -331,14 +353,15 @@ inline int scan_cb(struct ble_gap_event* ev, void*) {
       ble_gap_disc_cancel();
       g_scan_done = true;
     } else if (!g_have_hid && adv_has_hid_service(&ev->disc)) {
+      // Recorded as a fallback only — the scan deliberately runs to completion.
+      // **Do not cancel here.** This is not "the clicker behind a rotated
+      // address", it is the first device on the air advertising 0x1812, which
+      // may be someone else's keyboard or mouse. Ending the scan on it means
+      // never seeing the configured MAC that was about to advertise, and the
+      // wrong peer connects and answers the battery read, so the row says
+      // Connected with a clicker whose buttons do nothing.
       g_hid_candidate = ev->disc.addr;
       g_have_hid = true;
-      // Stop here too, not just on a MAC match. A HID device usually advertises
-      // under a rotated private address, so this is the *common* path — letting
-      // it run to BLE_GAP_EVENT_DISC_COMPLETE spent the whole kScanMs on the
-      // case that hits most often.
-      ble_gap_disc_cancel();
-      g_scan_done = true;
     }
   } else if (ev->type == BLE_GAP_EVENT_DISC_COMPLETE) {
     g_scan_done = true;
@@ -843,7 +866,7 @@ inline void poll() {
           static_cast<int64_t>(wintergreen::config::kHoldDelayMs) * 1000) {
     g_hold_fired = true;
     const uint8_t btn = (g_last_key == kKeyLeftArrow) ? kBtnBack : kBtnConfirm;
-    g_clicker_buttons = static_cast<uint8_t>(g_clicker_buttons | (1u << btn));
+    queue_press(btn);
   }
 
   if (!g_disconnect_request || g_busy)

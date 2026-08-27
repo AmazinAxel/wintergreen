@@ -392,12 +392,6 @@ class DrawBuffer {
     return draw_text_proportional(x, baseline_y, text, text ? strlen(text) : 0, font, white, style);
   }
 
-  // -- Plane-aware text rendering (for grayscale two-pass) -----------------
-
-  // Render text from a specific grayscale plane into an explicit buffer.
-  int draw_text_plane(uint8_t* buf, int x, int baseline_y, const char* text, size_t len, const BitmapFontSet& fonts,
-                      GrayPlane plane, bool white, FontStyle style = FontStyle::Regular, uint8_t size_pct = 100);
-
   // Render all words of a LayoutLine and — on the BW plane only — draw continuous
   // underline decorations spanning each run of consecutive linked words. This is the
   // correct level of abstraction: underlines are line decorations, not per-word.
@@ -1084,22 +1078,6 @@ inline int DrawBuffer::draw_text_impl_(const RenderTarget& t, int x, int baselin
 inline int DrawBuffer::draw_text_proportional(int x, int baseline_y, const char* text, size_t len,
                                               const BitmapFont& font, bool white, FontStyle style) {
   return draw_text_impl_(full_target_(), x, baseline_y, text, len, font, GrayPlane::BW, white, style, rotation_);
-}
-
-inline int DrawBuffer::draw_text_plane(uint8_t* buf, int x, int baseline_y, const char* text, size_t len,
-                                       const BitmapFontSet& fonts, GrayPlane plane, bool white, FontStyle style,
-                                       uint8_t size_pct) {
-  const BitmapFont* f = fonts.get(size_pct);
-  if (!f || !f->valid())
-    return x;
-  const RenderTarget t{buf,
-                       DisplayFrame::kStride,
-                       0,
-                       0,
-                       DisplayFrame::kPhysicalWidth,
-                       DisplayFrame::kPhysicalHeight,
-                       -DisplayFrame::kPanelOffsetX};
-  return draw_text_impl_(t, x, baseline_y, text, len, *f, plane, white, style, rotation_);
 }
 
 inline void DrawBuffer::draw_layout_line(uint8_t* buf, int x_offset, int baseline_y, const PageLine& line,

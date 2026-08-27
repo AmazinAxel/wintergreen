@@ -84,8 +84,17 @@ class Esp32InputSource final : public wintergreen::IInputSource {
     // clicker press can never look "held" and drive the auto-repeat.
     merge_injected_(result, g_serial_buttons);
     g_serial_buttons = 0;
-    merge_injected_(result, wg_clicker::g_clicker_buttons);
-    wg_clicker::g_clicker_buttons = 0;
+    // The clicker keeps its own ring buffer rather than a mask, so a burst of
+    // clicks between two polls arrives as separate presses instead of
+    // collapsing into one. Drained the same way as press_queue_ above.
+    while (wg_clicker::g_pq_head != wg_clicker::g_pq_tail) {
+      const uint8_t btn_idx = wg_clicker::g_press_queue[wg_clicker::g_pq_head];
+      wg_clicker::g_pq_head =
+          static_cast<uint8_t>((wg_clicker::g_pq_head + 1) % wg_clicker::kPressQueueSize);
+      result.pressed_latch |= static_cast<uint8_t>(1u << btn_idx);
+      if (result.press_history_count < wintergreen::ButtonState::kMaxPressHistory)
+        result.press_history[result.press_history_count++] = btn_idx;
+    }
     portEXIT_CRITICAL(&lock_);
     return result;
   }
