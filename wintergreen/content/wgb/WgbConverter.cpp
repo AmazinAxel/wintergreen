@@ -92,8 +92,20 @@ bool write_split_paragraph(WgbWriter& writer, Paragraph& para) {
   auto flush_range = [&](size_t start, size_t end) {
     if (start == end)
       return;
-    if (!writer.write_text_paragraph(meta, is_first ? first_spacing : kWgbSpacingDefault, runs.data() + start,
-                                     end - start))
+    // **Route through write_paragraph, not write_text_paragraph.** This splitter
+    // bounds the *serialized* size (run headers dominate in annotated books);
+    // WgbWriter::write_paragraph bounds the *text* size, which is what decides
+    // whether the device can lay the paragraph out. Calling the low-level writer
+    // here bypassed that entirely, so a chunk under kMaxSerializedBody but over
+    // kSplitParagraphBytes reached the file whole — 25 of them in the Odyssey,
+    // the largest 1,709 bytes, which is how oversized paragraphs survived a
+    // re-convert that was supposed to remove them.
+    Paragraph chunk;
+    chunk.type = ParagraphType::Text;
+    chunk.text = meta;
+    chunk.text.runs.assign(runs.begin() + start, runs.begin() + end);
+    chunk.spacing_before = is_first ? first_spacing : kWgbSpacingDefault;
+    if (!writer.write_paragraph(chunk))
       ok = false;
     if (is_first) {
       is_first = false;
@@ -202,8 +214,17 @@ bool convert_epub_to_wgb_streaming(Book& book, const char* output_path, uint8_t*
       if (need.zip_file_idx == c.current_zip_file_idx && need.fragment.size() == id_len &&
           std::memcmp(need.fragment.data(), id_p, id_len) == 0) {
         auto& entry = c.toc_work->entries[need.toc_entry_idx];
+        // **Use the writer's count, not the parser's `para_idx`.** The parser
+        // counts source paragraphs; the writer splits oversized ones, so after
+        // the first split in a chapter the two diverge and every later TOC
+        // anchor points a few paragraphs short — a chapter jump lands mid-way
+        // through the preceding text. Both are "paragraphs emitted so far" and
+        // the sink fires between paragraphs, so the writer's is the index this
+        // anchor's paragraph is about to receive.
+        (void)para_idx;
+        const uint32_t written = c.writer->chapter_paragraph_count();
         if (entry.para_index == 0)  // only record first match per entry
-          entry.para_index = static_cast<uint16_t>(para_idx < 0xFFFFu ? para_idx : 0xFFFFu);
+          entry.para_index = static_cast<uint16_t>(written < 0xFFFFu ? written : 0xFFFFu);
       }
     }
   };

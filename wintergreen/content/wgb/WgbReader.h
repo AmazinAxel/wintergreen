@@ -182,29 +182,18 @@ class WgbChapterSource : public IParagraphSource {
   // The vectors themselves are not resized: that would move the Paragraph
   // objects and dangle the same pointers by another route. Only the contents
   // above the limit are released, and find_slot_ stops handing them out.
-  // `keep` names a paragraph whose slot must not be freed — the page currently
-  // on the glass, whose LayoutWord::text points into it. Everything else above
-  // the limit is released.
+  // **Do not add a way to shrink this window. It was tried and it corrupts the
+  // displayed page.** Freeing slots above a limit — even keeping the current
+  // paragraph and its neighbours — produced text drawn from freed memory:
+  // "?  I   is mos   astonish" in place of the real line, consistently wrong
+  // rather than intermittently.
   //
-  // Slots are never moved or resized, only emptied: a Paragraph that moves
-  // dangles the same pointers by another route, which is why this frees in
-  // place and leaves window_limit_ to keep find_slot_ out of the tail.
-  void set_window_limit(size_t slots, size_t keep = SIZE_MAX) const {
-    if (slots < 4)
-      slots = 4;  // a page can span several paragraphs; do not cut into it
-    if (slots > slots_.size())
-      slots = slots_.size();
-    for (size_t i = slots; i < slots_.size(); ++i) {
-      if (slot_index_[i] == UINT32_MAX)
-        continue;
-      // Neighbours too: a page starting in `keep` can run into the next one.
-      if (keep != SIZE_MAX && slot_index_[i] + 1 >= keep && slot_index_[i] <= keep + 1)
-        continue;
-      slots_[i] = Paragraph{};
-      slot_index_[i] = UINT32_MAX;
-    }
-    window_limit_ = slots;
-  }
+  // Every LayoutWord::text in the laid-out page points into these slots, and so
+  // do the entries of TextLayout's paragraph cache. A page can span more
+  // paragraphs than any "keep the current one" heuristic predicts, and the
+  // caches outlive the page that built them, so there is no safe subset to
+  // free while a book is open. The window is freed wholesale by load_chapter_()
+  // and that is the only safe point.
 
   const Paragraph& paragraph(size_t index) const override {
     // Check if already in window
@@ -229,15 +218,12 @@ class WgbChapterSource : public IParagraphSource {
   mutable std::vector<Paragraph> slots_;
   mutable std::vector<uint32_t> slot_index_;  // UINT32_MAX = empty
   // Slots find_slot_ may hand out; the whole window normally, fewer while a
-  // radio is up. See set_window_limit.
-  mutable size_t window_limit_ = kWindowSize;
 
   // Find best slot: prefer empty, then evict the one furthest from `index`
   size_t find_slot_(size_t index) const {
     size_t best = 0;
     uint32_t best_dist = 0;
-    const size_t n = window_limit_ < slot_index_.size() ? window_limit_ : slot_index_.size();
-    for (size_t i = 0; i < n; ++i) {
+    for (size_t i = 0; i < slot_index_.size(); ++i) {
       if (slot_index_[i] == UINT32_MAX)
         return i;  // empty slot
       uint32_t d = (slot_index_[i] > index) ? static_cast<uint32_t>(slot_index_[i] - index)

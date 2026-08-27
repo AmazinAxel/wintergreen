@@ -52,31 +52,24 @@ class ReaderScreen final : public IScreen {
   // Without this a backward turn with BLE resident throws std::bad_alloc inside
   // assemble_page's word_pool reserve, and with exceptions off that is an
   // abort(): the device reboots mid-book.
-  // True while a radio holds the heap, so load_chapter_() re-applies the caps
-  // to a newly built chapter source.
-  bool radio_ram_hold_ = false;
-
   void release_caches() {
-    radio_ram_hold_ = true;
-    // Order matters: both caches hold LayoutWord::text pointers into the
-    // chapter source's paragraph slots, so they must be dropped *before* the
-    // window shrinks under them.
+    // Both of these are safe to drop: the page cache is rebuilt by the next
+    // render, and TextLayout's paragraph cache is a ring whose own eviction a
+    // page never outruns.
+    //
+    // **Shrinking WgbChapterSource's paragraph window is NOT safe and is not
+    // done here.** It was, and it corrupted the displayed text — the laid-out
+    // page's LayoutWord::text points into those slots. See the note in
+    // WgbReader.h.
     page_cache_ = LaidOutPageCache{};
     layout_engine_.release_cache_memory();
     layout_engine_.set_cache_limit(2);
-    // page_ still points into the slot holding the current paragraph, so that
-    // one is named as live and kept.
-    if (chapter_src_)
-      chapter_src_->set_window_limit(4, page_pos_.paragraph);
   }
 
   // Undo release_caches()'s cap once the radio is down. The caches themselves
   // refill on demand, so nothing needs restoring but the limit.
   void restore_caches() {
-    radio_ram_hold_ = false;
     layout_engine_.set_cache_limit(TextLayout::kCacheCapacity);
-    if (chapter_src_)
-      chapter_src_->set_window_limit(WgbChapterSource::kWindowSize);
   }
 
   size_t current_chapter_index() const;
@@ -130,6 +123,30 @@ class ReaderScreen final : public IScreen {
   std::string wgb_path_;
   std::string pos_path_;       // <book dir>/book.pos, beside the book itself
   DrawBuffer* buf_ = nullptr;  // set in start(), cleared in stop()
+  // Set alongside buf_. render_page_() needs the free-heap reading to decide
+  // whether to drop caches before laying out, and it is not passed a runtime.
+  IRuntime* runtime_ = nullptr;
+
+  // **Largest contiguous free block**, not total free heap, below which the
+  // reader drops every cache before laying a page out.
+  //
+  // Guarding on the total was wrong and shipped: `heap_caps_get_free_size`
+  // reports every free byte across a fragmented heap, and IDF's own header warns
+  // that a single block of that size probably cannot be allocated. On hardware a
+  // page layout cleared a 24 KB total-free check and then aborted on a
+  // **1,416-byte** request, on an ordinary forward page turn.
+  //
+  // The number to clear is the largest *single* allocation one layout makes,
+  // measured at 5,808 B worst case over four books (the paragraph word pool).
+  // 12 KB is about double that, leaving room for the draw path afterwards.
+  static constexpr uint32_t kLayoutMinBlockBytes = 12 * 1024;
+
+  // First stage of the same guard: give back the page cache and the pre-drawn
+  // page while there is still plenty of room. They are latency optimisations
+  // only, so shedding them early is nearly free — and every abort so far has
+  // been a *small* allocation failing, i.e. the margin was thinner than the
+  // single threshold below it predicted.
+  static constexpr uint32_t kLayoutShedBlockBytes = 20 * 1024;
   WgbReader wgb_;
   std::unique_ptr<WgbChapterSource> chapter_src_;
   size_t chapter_idx_ = 0;
@@ -207,14 +224,58 @@ class ReaderScreen final : public IScreen {
   static uint16_t bottom_padding_(bool landscape);
   void render_text_(DrawBuffer& buf, const BitmapFontSet& fset, int left_padding);
   bool next_page_();
+  // **Forward and backward agree on where a page starts because they share one
+  // line-fitting rule**, not because either consults the other.
+  //
+  // They used to differ: forward accepted a line whose *baseline* fitted and
+  // carried the descender into the next line's budget; backward had no such
+  // carry and simply gave its bottommost line a free descender. Backward
+  // therefore fitted more lines and ran past the page box on 30% of turns
+  // (bottom 780 against 753 on The Hobbit) — the same text drawn a line or two
+  // higher depending on which direction the reader arrived from. Both walks now
+  // pass `require_full_height`; see LaidOutParagraph::collect in TextLayout.cpp.
+  //
+  // What remains is structural — a page ending at a PageBreak or at the end of a
+  // chapter's content has several possible starts — and prev_page_ resolves it
+  // by anchoring one page further back and walking forward. That removes every
+  // *skip* (text the reader never saw) across all four test books and leaves a
+  // handful of one-line offsets.
+  //
+  // **A chapter-wide forward chain was built to close those too, and removed.**
+  // It worked — every mismatch went to zero — but walking the chapter drags
+  // WgbChapterSource's 32-slot paragraph window across it and peaked around
+  // 31 KB. With the clicker resident that reintroduced the heap abort, and it
+  // put a per-chapter walk on the book-open path. Don't reintroduce it without
+  // a way to walk the chapter that does not touch every paragraph.
+
+  // Bound on prev_page_'s forward walk from its anchor. Measured max is 3 steps;
+  // the bound only matters for a malformed chapter, where a slightly wrong page
+  // beats a stalled button.
+  static constexpr int kPrevPageProbeLimit = 64;
   bool prev_page_();
+  // Step back one page on a fresh open, per config::kResumeOnePageBack.
+  // Runs from render_page_, not start(): a backward layout needs the font and
+  // options that render_page_ installs.
+  void resume_one_page_back_();
+  bool resume_back_pending_ = false;
   void load_chapter_(size_t idx);
   // Stash a page the caller already laid out, keyed on its own start position.
   void cache_page_(PageContent&& pc);
   // Lay out the following page during the e-ink waveform. See the comment on the
   // definition — it releases page_'s word storage, so nothing may read page_.items
   // after a render completes.
-  void prerender_next_page_(DrawBuffer& buf);
+  // Largest contiguous block below which the speculative next-page layout is
+  // skipped. Higher than kLayoutMinBlockBytes because it has to clear a whole
+  // page's layout *twice over* — the one this would build and the real one that
+  // follows. Same fragmentation reasoning as kLayoutMinBlockBytes; see there.
+  static constexpr uint32_t kPrerenderMinBlockBytes = 20 * 1024;
+
+  // True while prerender_next_page_ is inside its nested render_page_ call, so
+  // that call's own low-heap guard does not drop the page cache the prerender
+  // just filled for it.
+  bool in_prerender_draw_ = false;
+
+  void prerender_next_page_(DrawBuffer& buf, IRuntime& runtime);
   // Commit the pre-drawn page if it still matches; false = render normally.
   bool take_predrawn_(DrawBuffer& buf);
 

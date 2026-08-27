@@ -31,8 +31,6 @@ static_assert(kSleepCoverW == DrawBuffer::kWidth, "sleep cover must be panel wid
 static_assert(kSleepCoverH == DrawBuffer::kHeight, "sleep cover must be panel height");
 
 void Application::start(DrawBuffer& buf, IRuntime& runtime) {
-  ticks_ = 0;
-  uptime_ms_ = 0;
   started_ = true;
   running_ = true;
 
@@ -215,9 +213,6 @@ void Application::update(const ButtonState& buttons, uint32_t dt_ms, DrawBuffer&
   if (!running_)
     return;
 
-  ++ticks_;
-  uptime_ms_ += dt_ms;
-
   // Dynamic frequency scaling: hold the CPU at 160 MHz while the UI is working,
   // let it idle at 80 MHz otherwise. Page layout and drawing take no PM lock of
   // their own — no driver is involved — so without this a page turn would run at
@@ -332,11 +327,20 @@ void Application::update(const ButtonState& buttons, uint32_t dt_ms, DrawBuffer&
   // the quick-menu row. A clicker can drop on its own — it goes out of range,
   // its battery dies, the peer disconnects — and the cap must lift then too, or
   // a session pays for a radio that is no longer there.
-  const ClickerState clicker_now = runtime.clicker_state();
-  if (clicker_now != clicker_prev_) {
-    if (clicker_now == ClickerState::Disconnected || clicker_now == ClickerState::Unavailable)
+  // **Keyed on whether the BLE stack is holding memory, not on whether a
+  // clicker is connected.** Those are different: the NimBLE host and esp_hidh
+  // are initialised once and never torn down (deinit panics on this IDF), so a
+  // disconnect gives back the link but not the heap. Lifting the reader's caps
+  // on Disconnected therefore restored a full-size working set on top of a
+  // stack that still owned its allocation, and the next page turn found 1,640
+  // bytes free.
+  const bool radio_holds_ram = runtime.clicker_holds_ram();
+  if (radio_holds_ram != radio_ram_held_) {
+    if (radio_holds_ram)
+      release_ram_for_radio();
+    else
       restore_ram_after_radio();
-    clicker_prev_ = clicker_now;
+    radio_ram_held_ = radio_holds_ram;
   }
 
   IScreen* top = screen_mgr_.top();
@@ -433,11 +437,19 @@ void Application::save_settings_() {
 }
 
 
-void Application::release_ram_for_radio() {
-  // The index costs nothing to be without while a book is open — every screen
-  // reloads it from disk on demand — and the reading position is already on
-  // disk, so nothing here is the only copy.
-  BookIndex::instance().release_memory();
+void Application::release_ram_for_radio(bool drop_book_index) {
+  // **The index is only safe to drop when no screen is showing its strings.**
+  // MainMenu::entries_ holds StringRefs into BookIndex's StringPool, so
+  // releasing the pool while the book list is on display leaves every title and
+  // author resolving to an empty string_view — the list stays navigable and
+  // keeps showing reading percentages, because those are uint8_t copies, so it
+  // reads as a drawing glitch rather than a dangling reference.
+  //
+  // The quick menu holds no StringRefs and passes true; the sync runs *from*
+  // the book list and passes false. It loses little: run_sync_() reloads the
+  // index from disk as its first act anyway.
+  if (drop_book_index)
+    BookIndex::instance().release_memory();
 
   // **The reader's caches go too, and the earlier reasoning for keeping them
   // was wrong.** It ran: they are what make a page turn a memcpy instead of a
@@ -531,11 +543,4 @@ void Application::load_settings_() {
 bool Application::running() const {
   return running_;
 }
-uint64_t Application::tick_count() const {
-  return ticks_;
-}
-uint32_t Application::uptime_ms() const {
-  return uptime_ms_;
-}
-
 }  // namespace wintergreen

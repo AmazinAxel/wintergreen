@@ -847,11 +847,17 @@ static void idct(const int32_t block[64], uint8_t out[64]) {
 // ---------------------------------------------------------------------------
 
 static void dither_row(const uint8_t* row, uint32_t x_step, int out_w, int16_t* err_cur, int16_t* err_nxt,
-                       int16_t* err_nxt2, uint8_t* out_row) {
+                       int16_t* err_nxt2, uint8_t* out_row, ToneLut tone_lut = nullptr,
+                       ToneHistogram* tone_hist = nullptr) {
   uint32_t sx_fp = 0;
   uint8_t acc = 0, bit = 0x80;
   for (int ox = 0; ox < out_w; ++ox) {
-    int16_t g = static_cast<int16_t>(row[sx_fp >> 16]);
+    uint8_t s = row[sx_fp >> 16];
+    if (tone_hist)
+      ++tone_hist->bins[s];
+    if (tone_lut)
+      s = tone_lut[s];
+    int16_t g = static_cast<int16_t>(s);
     sx_fp += x_step;
     int16_t val = static_cast<int16_t>(g + err_cur[ox + 1]);
     if (val < 0)
@@ -887,7 +893,8 @@ static void dither_row(const uint8_t* row, uint32_t x_step, int out_w, int16_t* 
 // ---------------------------------------------------------------------------
 
 static const char* decode_baseline(const JpegState& st, BitReader& r, uint16_t max_w, uint16_t max_h, DecodedImage& out,
-                                   bool scale_to_fill, ImageRowSink* sink) {
+                                   bool scale_to_fill, ImageRowSink* sink, ToneLut tone_lut = nullptr,
+                                   ToneHistogram* tone_hist = nullptr) {
   int w = st.width, h = st.height;
   if (!w || !h)
     return "jpeg: zero dimensions";
@@ -1023,11 +1030,13 @@ static const char* decode_baseline(const JpegState& st, BitReader& r, uint16_t m
           break;
         if (sink) {
           uint8_t temp_row[128];  // byte accumulator writes all bytes; no zero-init needed
-          dither_row(y_row.get() + py * row_w, x_step, out_w, err_cur.get(), err_nxt.get(), err_nxt2.get(), temp_row);
+          dither_row(y_row.get() + py * row_w, x_step, out_w, err_cur.get(), err_nxt.get(), err_nxt2.get(), temp_row,
+                     tone_lut, tone_hist);
           sink->emit_row(sink->ctx, static_cast<uint16_t>(out_y), temp_row, static_cast<uint16_t>(out_w));
         } else {
           uint8_t* out_row = out.data.data() + out_y * out_stride;
-          dither_row(y_row.get() + py * row_w, x_step, out_w, err_cur.get(), err_nxt.get(), err_nxt2.get(), out_row);
+          dither_row(y_row.get() + py * row_w, x_step, out_w, err_cur.get(), err_nxt.get(), err_nxt2.get(), out_row,
+                     tone_lut, tone_hist);
         }
         ++out_y;
         // Rotate three error rows: cur←nxt, nxt←nxt2, nxt2←fresh
@@ -1048,7 +1057,7 @@ static const char* decode_baseline(const JpegState& st, BitReader& r, uint16_t m
 
 ImageError decode_jpeg_from_entry(IZipFile& file, const ZipEntry& entry, uint16_t max_w, uint16_t max_h,
                                   DecodedImage& out, uint8_t* work_buf, size_t work_buf_size, bool scale_to_fill,
-                                  ImageRowSink* sink) {
+                                  ImageRowSink* sink, ToneLut tone_lut, ToneHistogram* tone_hist) {
   // If no work_buf provided, allocate one here.
   std::unique_ptr<uint8_t[]> owned_work;
   if (!work_buf || work_buf_size < ZipEntryInput::kMinWorkBufSize) {
@@ -1080,7 +1089,7 @@ ImageError decode_jpeg_from_entry(IZipFile& file, const ZipEntry& entry, uint16_
   BitReader r(inp);
 #ifdef ESP_PLATFORM
 #endif
-  err = decode_baseline(*st, r, max_w, max_h, out, scale_to_fill, sink);
+  err = decode_baseline(*st, r, max_w, max_h, out, scale_to_fill, sink, tone_lut, tone_hist);
   if (err) {
     return ImageError::InvalidData;
   }

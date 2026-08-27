@@ -1,6 +1,4 @@
 {
-  description = "wintergreen — e-reader firmware for the Xteink X4, and its EPUB converter";
-
   inputs.nixpkgs.url = "github:NixOS/nixpkgs/nixos-unstable";
 
   outputs = { self, nixpkgs }:

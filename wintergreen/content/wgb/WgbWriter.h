@@ -72,6 +72,27 @@ class WgbWriter {
   // Paragraph with a heap-allocated runs vector.  Used by the split-write path.
   bool write_text_paragraph(const TextParagraph& meta, uint16_t spacing, const Run* runs, size_t run_count);
 
+  // Emit an oversized paragraph with no <br> as several, cut at sentence
+  // boundaries. The rendered result is unchanged: the cut lands between two
+  // sentences and continuation chunks carry no spacing and no first-line indent.
+  bool write_sentence_split_paragraph_(const TextParagraph& tp, uint16_t spacing);
+
+  // Emit a <br>-delimited paragraph as several, so no single layout unit is
+  // large enough to exhaust the device's heap. See the call site.
+  bool write_split_text_paragraph_(const TextParagraph& tp, uint16_t spacing);
+
+  // Paragraphs written into the current chapter so far, i.e. the index the next
+  // paragraph will get.
+  //
+  // TOC entries store a paragraph index, and the EPUB parser counts *source*
+  // paragraphs while the splitters above make the writer emit more than one for
+  // some of them. Resolving a TOC anchor against the parser's count therefore
+  // drifts by the number of splits before it, and a chapter jump lands in the
+  // wrong place. WgbConverter's id_sink reads this instead.
+  uint16_t chapter_paragraph_count() const {
+    return chapter_para_count_;
+  }
+
   // Call after writing all paragraphs for a chapter.
   void end_chapter();
 

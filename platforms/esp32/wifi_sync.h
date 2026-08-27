@@ -2,9 +2,10 @@
 
 // NAS book sync over HTTP.
 //
-// Pulls newly converted books off the homelab, pushes reading positions, and
-// retires books read to 100%. One button, one round trip, radio off the moment
-// it is done.
+// Pulls newly converted books off the homelab and retires books read to 100%.
+// One button, one round trip, radio off the moment it is done.
+//
+// Reading positions are **not** synced. They stayed on the device.
 //
 // **HTTP, not SMB.** ESP-IDF ships no SMB client, and SMB3 (which the server
 // pins) signs every packet — CPU time with the radio held open, on a device
@@ -19,8 +20,7 @@
 //  - **Wi-Fi and BLE do not fit together.** The clicker is powered down before
 //    the radio starts; it is re-armed by pressing its quick-menu row again.
 //  - **Writes to the SD card are the scarce resource.** A sync that changes
-//    nothing writes zero bytes: the index save is dirty-guarded, and a .pos is
-//    rewritten only where the server was strictly further along.
+//    nothing writes zero bytes: the index save is dirty-guarded.
 //
 // Compiled out entirely unless WG_WIFI_SYNC is defined, the same way
 // WG_BLUETOOTH_PAGE_TURNER gates NimBLE.
@@ -61,9 +61,12 @@ using wintergreen::SyncState;
 #include "nvs_flash.h"
 #include "wintergreen/Application.h"
 #include "wintergreen/content/BookIndex.h"
-#include "wintergreen/content/CoverPaths.h"
 #include "wintergreen/content/wgb/WgbReader.h"
 #include "wintergreen/display/DrawBuffer.h"
+
+// Defined in main.cpp — see the note there. Hands back the OOM rescue block,
+// which competes with the Wi-Fi stack for the same internal DRAM pool.
+void wg_release_oom_reserve();
 
 namespace wg_sync {
 
@@ -181,9 +184,9 @@ struct WifiGuard {
 
 // ── Tiny JSON scanning ─────────────────────────────────────────────────────
 //
-// The response has three known keys holding arrays of strings and a flat object
-// of 4-element integer arrays. A JSON library for that is a dependency to avoid;
-// these are ~40 lines and only ever see output from our own server.
+// The response has two known keys, each holding an array of strings. A JSON
+// library for that is a dependency to avoid; this is ~30 lines and only ever
+// sees output from our own server.
 
 // Find `"key"` at the top level and return the offset just past its colon.
 inline size_t find_key_(const std::string& s, const char* key) {
@@ -217,76 +220,6 @@ inline std::vector<std::string> parse_string_array_(const std::string& s, size_t
     out.push_back(std::move(item));
   }
   return out;
-}
-
-struct PosEntry {
-  std::string dir;
-  uint32_t v[4] = {};
-};
-
-// {"name":[a,b,c,d], ...}
-inline std::vector<PosEntry> parse_pos_object_(const std::string& s, size_t pos) {
-  std::vector<PosEntry> out;
-  if (pos == std::string::npos)
-    return out;
-  const size_t open = s.find('{', pos);
-  if (open == std::string::npos)
-    return out;
-  size_t i = open + 1;
-  while (i < s.size() && s[i] != '}') {
-    if (s[i] != '"') { ++i; continue; }
-    PosEntry e;
-    for (++i; i < s.size() && s[i] != '"'; ++i) {
-      if (s[i] == '\\' && i + 1 < s.size())
-        ++i;
-      e.dir.push_back(s[i]);
-    }
-    ++i;
-    const size_t lb = s.find('[', i);
-    if (lb == std::string::npos)
-      break;
-    int n = 0;
-    i = lb + 1;
-    for (; i < s.size() && s[i] != ']' && n < 4; ++i) {
-      if (s[i] == ' ' || s[i] == ',')
-        continue;
-      e.v[n++] = static_cast<uint32_t>(std::strtoul(s.c_str() + i, nullptr, 10));
-      while (i < s.size() && s[i] != ',' && s[i] != ']')
-        ++i;
-      --i;
-    }
-    const size_t rb = s.find(']', i);
-    i = (rb == std::string::npos) ? s.size() : rb + 1;
-    if (n == 4)
-      out.push_back(std::move(e));
-  }
-  return out;
-}
-
-// ── Reading position files ─────────────────────────────────────────────────
-//
-// Same four numbers and the same format ReaderScreen::save_position_ writes, so
-// the two paths cannot drift apart.
-
-inline bool read_pos_(const std::string& path, uint32_t out[4]) {
-  FILE* f = std::fopen(path.c_str(), "r");
-  if (!f)
-    return false;
-  unsigned v[4] = {};
-  const int n = std::fscanf(f, "%u %u %u %u", &v[0], &v[1], &v[2], &v[3]);
-  std::fclose(f);
-  for (int i = 0; i < 4; ++i)
-    out[i] = v[i];
-  return n >= 3;
-}
-
-inline bool write_pos_(const std::string& path, const uint32_t v[4]) {
-  FILE* f = std::fopen(path.c_str(), "w");
-  if (!f)
-    return false;
-  std::fprintf(f, "%u %u %u %u\n", static_cast<unsigned>(v[0]), static_cast<unsigned>(v[1]),
-               static_cast<unsigned>(v[2]), static_cast<unsigned>(v[3]));
-  return std::fclose(f) == 0;
 }
 
 // ── HTTP ───────────────────────────────────────────────────────────────────
@@ -439,8 +372,8 @@ inline bool run_sync_() {
   using wintergreen::BookIndex;
 
   const char* books_dir = g_app->main_menu()->books_dir();
-  // data_dir_ is not used directly any more (cover/pos paths derive from the
-  // book), but index_path() is built from it, so a null root is still fatal.
+  // data_dir_ is not used directly any more, but index_path() is built from it,
+  // so a null root is still fatal.
   if (!books_dir || !g_app->data_dir_)
     return false;
 
@@ -448,12 +381,10 @@ inline bool run_sync_() {
   if (index.entries().empty())
     index.load(g_app->index_path());
 
-  // One pass over the index builds all three request fields. Each book's
-  // position comes from its own .pos, the same file the reader reads.
+  // One pass over the index builds both request fields.
   std::string req = "{\"have\":[";
-  std::string pos_json = "\"pos\":{";
   std::string done_json = "\"done\":[";
-  bool first_have = true, first_pos = true, first_done = true;
+  bool first_have = true, first_done = true;
 
   for (const auto& e : index.entries()) {
     const std::string path(e.path.view(index.pool()));
@@ -465,19 +396,6 @@ inline bool run_sync_() {
       req.push_back(',');
     first_have = false;
     append_escaped_(req, dir);
-
-    uint32_t p[4];
-    if (read_pos_(wintergreen::book_pos_path(path.c_str()), p)) {
-      if (!first_pos)
-        pos_json.push_back(',');
-      first_pos = false;
-      append_escaped_(pos_json, dir);
-      char nums[64];
-      std::snprintf(nums, sizeof(nums), ":[%lu,%lu,%lu,%lu]", static_cast<unsigned long>(p[0]),
-                    static_cast<unsigned long>(p[1]), static_cast<unsigned long>(p[2]),
-                    static_cast<unsigned long>(p[3]));
-      pos_json += nums;
-    }
 
     // A finished book is only *eligible* for deletion; the server has to
     // confirm it recorded it before anything is unlinked.
@@ -495,7 +413,6 @@ inline bool run_sync_() {
     }
   }
   req += "],";
-  req += pos_json + "},";
   req += done_json + "]}";
 
   std::string resp;
@@ -504,7 +421,6 @@ inline bool run_sync_() {
 
   const std::vector<std::string> get = parse_string_array_(resp, find_key_(resp, "get"));
   const std::vector<std::string> del = parse_string_array_(resp, find_key_(resp, "delete"));
-  const std::vector<PosEntry> newpos = parse_pos_object_(resp, find_key_(resp, "pos"));
 
   bool index_changed = false;
 
@@ -560,26 +476,7 @@ inline bool run_sync_() {
     index_changed = true;
   }
 
-  // 2. Adopt the positions the server sent: the ones it is strictly ahead on,
-  // plus every book downloaded above. Runs *after* the downloads so those book
-  // directories already exist — a restored device resumes where it left off
-  // instead of starting every book at page one.
-  //
-  // The server only sends what actually moved, so every write here is a file
-  // that genuinely changed.
-  const std::string open_book = g_app->reader() ? g_app->reader()->get_path() : std::string();
-  for (const PosEntry& e : newpos) {
-    const std::string wgb = std::string(books_dir) + "/" + e.dir + "/book.wgb";
-    // Never touch the open book: ReaderScreen::stop() writes .pos on close and
-    // would put the stale in-memory position straight back over this.
-    if (!open_book.empty() && open_book == wgb)
-      continue;
-    if (g_buf)
-      g_buf->wait_panel_idle();
-    write_pos_(wintergreen::book_pos_path(wgb.c_str()), e.v);
-  }
-
-  // 3. Remove what the server confirmed it has recorded.
+  // 2. Remove what the server confirmed it has recorded.
   for (const std::string& dir : del) {
     const std::string book_dir = std::string(books_dir) + "/" + dir;
     if (g_buf)
@@ -607,40 +504,6 @@ inline bool run_sync_() {
 
 // ── Worker ─────────────────────────────────────────────────────────────────
 
-// ── Temporary failure diagnostics ──────────────────────────────────────────
-//
-// Every failure here looks identical from the UI: the row flicks back to
-// "Sync". That is the right end state (see the clicker's "failure codes are
-// gone" note in CLAUDE.md) but it is useless while bringing the feature up, so
-// the stage is recorded and shown after "Sync" until this is confirmed working.
-//
-// **Remove this whole block once sync is proven on hardware**, exactly as the
-// clicker's FailStage was removed.
-enum class FailStage : uint8_t {
-  None = 0,
-  NvsInit,
-  NetifInit,
-  EventGroup,
-  NetifCreate,
-  WifiInit,     // the likely one: internal RAM
-  HandlerReg,
-  SetMode,
-  SetConfig,
-  WifiStart,
-  ConnectTimeout,  // associated never happened — wrong password, wrong SSID, out of range
-  Resolve,
-  HttpInit,
-  Post,
-};
-inline volatile FailStage g_fail = FailStage::None;
-inline volatile uint32_t g_fail_heap_kb = 0;
-
-inline bool fail_(FailStage s) {
-  g_fail = s;
-  g_fail_heap_kb = heap_caps_get_free_size(MALLOC_CAP_INTERNAL) / 1024;
-  return false;
-}
-
 inline bool bring_up_wifi_(WifiGuard& guard) {
   esp_err_t nvs = nvs_flash_init();
   if (nvs == ESP_ERR_NVS_NO_FREE_PAGES || nvs == ESP_ERR_NVS_NEW_VERSION_FOUND) {
@@ -648,31 +511,31 @@ inline bool bring_up_wifi_(WifiGuard& guard) {
     nvs = nvs_flash_init();
   }
   if (nvs != ESP_OK)
-    return fail_(FailStage::NvsInit);
+    return false;
 
   if (esp_netif_init() != ESP_OK)
-    return fail_(FailStage::NetifInit);
+    return false;
   // Both are idempotent-ish: already-created is not an error worth failing on,
   // since a second sync in the same boot re-enters here.
   esp_event_loop_create_default();
 
   g_wifi_events = xEventGroupCreate();
   if (!g_wifi_events)
-    return fail_(FailStage::EventGroup);
+    return false;
 
   guard.netif = esp_netif_create_default_wifi_sta();
   if (!guard.netif)
-    return fail_(FailStage::NetifCreate);
+    return false;
 
   wifi_init_config_t cfg = WIFI_INIT_CONFIG_DEFAULT();
   if (esp_wifi_init(&cfg) != ESP_OK)
-    return fail_(FailStage::WifiInit);
+    return false;
 
   if (esp_event_handler_instance_register(WIFI_EVENT, ESP_EVENT_ANY_ID, wifi_event_, nullptr,
                                           &guard.any_wifi) != ESP_OK ||
       esp_event_handler_instance_register(IP_EVENT, IP_EVENT_STA_GOT_IP, wifi_event_, nullptr,
                                           &guard.got_ip) != ESP_OK)
-    return fail_(FailStage::HandlerReg);
+    return false;
 
   wifi_config_t wc = {};
   std::snprintf(reinterpret_cast<char*>(wc.sta.ssid), sizeof(wc.sta.ssid), "%s", wintergreen::config::kWifiName);
@@ -693,14 +556,14 @@ inline bool bring_up_wifi_(WifiGuard& guard) {
 
   g_retries = 0;
   if (esp_wifi_set_mode(WIFI_MODE_STA) != ESP_OK)
-    return fail_(FailStage::SetMode);
+    return false;
   // Credentials live in the firmware, so there is nothing to persist — and this
   // avoids an NVS write on every sync.
   esp_wifi_set_storage(WIFI_STORAGE_RAM);
   if (esp_wifi_set_config(WIFI_IF_STA, &wc) != ESP_OK)
-    return fail_(FailStage::SetConfig);
+    return false;
   if (esp_wifi_start() != ESP_OK)
-    return fail_(FailStage::WifiStart);
+    return false;
 
   // Power save OFF, deliberately. It saves current while associated and *idle*,
   // which this workload never is: connect, transfer flat out, leave. MIN_MODEM
@@ -717,7 +580,7 @@ inline bool bring_up_wifi_(WifiGuard& guard) {
   const EventBits_t bits = xEventGroupWaitBits(g_wifi_events, kConnectedBit, pdFALSE, pdFALSE,
                                                pdMS_TO_TICKS(kConnectTimeoutMs));
   if (!(bits & kConnectedBit))
-    return fail_(FailStage::ConnectTimeout);
+    return false;
 
   // Cache what actually worked, for resolve_server_ and as a scan hint.
   wifi_ap_record_t ap;
@@ -788,11 +651,7 @@ inline void sync_task(void*) {
   bool ok = false;
   {
     WifiGuard guard;  // radio down on every path out of this scope
-    if (!bring_up_wifi_(guard)) {
-      // g_fail stays where bring_up_wifi_ left it
-    } else if (!resolve_server_(g_base_url)) {
-      g_fail = FailStage::Resolve;
-    } else {
+    if (bring_up_wifi_(guard) && resolve_server_(g_base_url)) {
       esp_http_client_config_t hc = {};
       hc.url = g_base_url.c_str();
       hc.timeout_ms = kHttpTimeoutMs;
@@ -800,12 +659,8 @@ inline void sync_task(void*) {
       // book then cost one TCP handshake rather than four.
       hc.keep_alive_enable = true;
       g_http = esp_http_client_init(&hc);
-      if (!g_http) {
-        g_fail = FailStage::HttpInit;
-      } else {
+      if (g_http) {
         ok = run_sync_();
-        if (!ok && g_fail == FailStage::None)
-          g_fail = FailStage::Post;
         esp_http_client_cleanup(g_http);
         g_http = nullptr;
       }
@@ -814,6 +669,12 @@ inline void sync_task(void*) {
 
   // After the WifiGuard has run, so the radio's memory is back first.
   g_buf->reacquire_spare();
+  // Lift the reader's cache caps, but only if the BLE stack is not still
+  // holding memory — release_for_wifi() deinits the controller and leaves the
+  // NimBLE host up, so "no clicker connected" does not mean "heap is free".
+  // Application::update re-applies them if that changes.
+  if (g_app && !wg_clicker::holds_ram())
+    g_app->restore_ram_after_radio();
 
   g_state = ok ? SyncState::Done : SyncState::Failed;
   g_keep_awake = false;
@@ -825,15 +686,6 @@ inline void sync_task(void*) {
 
 inline SyncState state() {
   return g_state;
-}
-
-// TEMPORARY — see FailStage. Stage of the last failure, and free internal RAM
-// at that moment. Remove along with FailStage once sync is confirmed.
-inline uint8_t fail_stage() {
-  return static_cast<uint8_t>(g_fail);
-}
-inline uint32_t fail_heap_kb() {
-  return g_fail_heap_kb;
 }
 
 // Wired once at boot from main.cpp. The runtime's start_sync() has no access to
@@ -887,6 +739,37 @@ inline void start() {
   // doing neither.
   g_buf->release_spare();
 
+  // Same for main.cpp's OOM reserve: esp_wifi_init() wants ~50 KB of internal
+  // RAM out of the same pool, so 28 KB held back for a rescue is the difference
+  // between a sync that runs and one that bails with nothing said. The frame
+  // loop takes it back when the radio is down.
+  wg_release_oom_reserve();
+
+  // **And the reader's caches, which the spare alone does not cover when a
+  // clicker has been used this session.** The NimBLE host and esp_hidh can
+  // never be deinitialised on this IDF, so release_for_wifi() gives back the
+  // controller and nothing else — tens of KB stay held for the rest of the
+  // boot. With Wi-Fi's ~50 KB on top of that, esp_http_client_init() had
+  // nothing left: "Fail 13, 0k", i.e. stage HttpInit with zero free.
+  //
+  // Association had already succeeded at that point, so this is not a
+  // bring-up shortage; it is the last allocation in a sequence that had
+  // already spent everything. The reader's page and paragraph caches are the
+  // largest thing still reclaimable, and being without them costs a re-layout
+  // the sync screen never performs anyway.
+  // false: this runs from the book list, whose rows hold StringRefs into the
+  // index's StringPool. Dropping it blanks every title and author on a screen
+  // that stays on display for the whole sync.
+  // **The book index stays.** Releasing it here was tried twice and is wrong
+  // both ways round. Dropping the pool alone blanks every title and author,
+  // because MainMenu::entries_ holds StringRefs into it and this screen is on
+  // display for the whole sync. Clearing entries_ first and bumping the
+  // generation so the list repopulates was worse: the books did not come back,
+  // the screen repainted several times over, and it freed *less* than leaving
+  // it alone (28 KB -> 24 KB at esp_wifi_init) because the repopulate reloads
+  // the index from disk immediately, mid-bringup.
+  g_app->release_ram_for_radio(/*drop_book_index=*/false);
+
   // 6 KB: the worker runs TLS-free HTTP, JSON scanning and FATFS writes.
   if (xTaskCreate(sync_task, "wg_sync", 6144, nullptr, 4, nullptr) != pdPASS) {
     g_buf->reacquire_spare();  // the task that would have restored it never ran
@@ -916,12 +799,6 @@ namespace wg_sync {
 
 inline SyncState state() {
   return SyncState::Unavailable;
-}
-inline uint8_t fail_stage() {
-  return 0;
-}
-inline uint32_t fail_heap_kb() {
-  return 0;
 }
 inline void bind(wintergreen::Application&, wintergreen::DrawBuffer&) {}
 inline void start() {}

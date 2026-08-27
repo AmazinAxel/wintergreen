@@ -146,13 +146,15 @@ class Application {
   //
   // The reader does not need the index while a book is open, and every screen
   // reloads it from disk when empty — see BookIndex::release_memory.
-  void release_ram_for_radio();
+  // drop_book_index: false when the caller's screen displays index strings —
+  // see the comment in the definition.
+  void release_ram_for_radio(bool drop_book_index = true);
   // Counterpart: lifts the reader's cache cap once no radio is up.
   void restore_ram_after_radio();
 
-  // Last clicker state seen by update(), so a disconnect the user did not ask
-  // for still lifts the cache cap.
-  ClickerState clicker_prev_ = ClickerState::Unavailable;
+  // Whether the BLE stack currently holds heap, as last seen by update(). Not
+  // the connection state — see the comment at the check.
+  bool radio_ram_held_ = false;
 
   // Called when a book is opened: bumps the open-order counter in the in-memory
   // index and persists settings. The index itself is written once per session,
@@ -208,17 +210,13 @@ class Application {
   bool usb_powered() const {
     return usb_powered_;
   }
-  // Auto-open a book by path (skips menu, for debugging).
+  // Open a book by path, bypassing the menu: the boot resume path and the
+  // serial 'O' command.
   void auto_open_book(const char* epub_path, DrawBuffer& buf, IRuntime& runtime);
   void update(const ButtonState& buttons, uint32_t dt_ms, DrawBuffer& buf, IRuntime& runtime);
   bool running() const;
-  uint64_t tick_count() const;
-  uint32_t uptime_ms() const;
 
  private:
-  uint64_t ticks_ = 0;
-  uint32_t uptime_ms_ = 0;
-
   bool started_ = false;
   bool running_ = true;
 

@@ -27,10 +27,17 @@
 #include <cstdint>
 #include <cstdio>
 
+#include "esp_timer.h"
+
 #include "WintergreenConfig.h"
 #include "wintergreen/Input.h"
 #include "wintergreen/Runtime.h"
 #include "wintergreen/display/DrawBuffer.h"
+
+// Defined in main.cpp. Hands back the block reserved there for the out-of-memory
+// rescue, which comes out of the same internal DRAM pool the BT controller needs
+// a contiguous allocation from. See the definition and bringup_stack().
+void wg_release_oom_reserve();
 
 namespace wg_clicker {
 
@@ -38,17 +45,28 @@ namespace wg_clicker {
 // same way serial-injected presses are. Bitmask of Button indices.
 inline volatile uint8_t g_clicker_buttons = 0;
 
-// HID keyboard usage IDs (HID Usage Table, keyboard page 0x07). Left advances,
-// right goes back — deliberately the opposite of a presentation remote. Swap
-// these two lines to flip it.
+// HID keyboard usage IDs (HID Usage Table, keyboard page 0x07). In menus left
+// maps to Button2 (down a list) and right to Button3 (up), which is the
+// behaviour that reads correctly there. In the reader those same two buttons
+// mean next/previous page, so the mapping is swapped while a book is open —
+// otherwise the clicker's forward key turns the page backward. See g_in_reader.
 inline constexpr uint8_t kKeyRightArrow = 0x4F;
 inline constexpr uint8_t kKeyLeftArrow = 0x50;
+
+// Set from the main loop each iteration: true while the reader is the top
+// screen (the quick menu on top of a book counts as a menu).
+inline volatile bool g_in_reader = false;
 
 // Button2/Button3 are "next"/"previous" in the reader in both orientations
 // (unlike the side rocker, which swaps). On other screens they are list
 // navigation, which is a sane thing for a clicker to do.
 inline constexpr uint8_t kBtnNext = static_cast<uint8_t>(wintergreen::Button::Button2);
 inline constexpr uint8_t kBtnPrev = static_cast<uint8_t>(wintergreen::Button::Button3);
+
+// Held past config::kHoldDelayMs, right becomes Confirm and left becomes Back.
+// Same split point as every other button on the device.
+inline constexpr uint8_t kBtnConfirm = static_cast<uint8_t>(wintergreen::Button::Button1);
+inline constexpr uint8_t kBtnBack = static_cast<uint8_t>(wintergreen::Button::Button0);
 
 }  // namespace wg_clicker
 
@@ -85,9 +103,19 @@ inline volatile bool g_disconnect_request = false;
 inline volatile bool g_busy = false;
 
 inline esp_hidh_dev_t* g_dev = nullptr;
+// Set by ESP_HIDH_OPEN_EVENT, which fires *after* GATT discovery, report-map
+// parsing and input-report subscription. Negative = discovery failed.
+// esp_hidh_dev_open() returning non-null only means the link came up, so
+// trusting it shipped a rare "Connected, no battery, no clicks" state.
+inline volatile int8_t g_open_result = 0;
 // Last keycode seen, so a held key does not repeat and an all-zero release
-// report is not read as a press.
+// report is not read as a press. g_press_us is when it went down, for the
+// tap/hold split in handle_report.
 inline uint8_t g_last_key = 0;
+inline int64_t g_press_us = 0;
+// Set once poll() has fired the hold, so the eventual release does not also
+// inject a page turn.
+inline volatile bool g_hold_fired = false;
 
 // Clicker battery, 0 = unknown. Captured **once**, right after connecting, and
 // then left alone so the quick menu shows a number that never twitches while
@@ -170,6 +198,13 @@ inline bool g_spare_released = false;
 // from the HID callback path and from poll(), neither of which knows why.
 inline bool g_deep_teardown = false;
 
+// The controller was deinitialised for a Wi-Fi sync and cannot come back this
+// boot — the NimBLE host is still bound to the transport that went with it.
+// bringup_stack() refuses immediately rather than timing out for 10 s.
+inline bool g_ctrl_dead = false;
+
+
+
 // "AA:BB:CC:DD:EE:FF" -> 6 bytes, **reversed**. NimBLE's ble_addr_t.val is
 // little-endian (ble_gap.c tests addr[5] & 0xC0) and esp_hidh_dev_open memcpy's
 // this straight into it. Reversed, the stack hunts an address that does not
@@ -186,10 +221,20 @@ inline bool parse_mac(const char* s, uint8_t out[6]) {
   return true;
 }
 
-// Map one HID input report onto a page turn. Scanned for a keycode rather than
+// Map one HID input report onto a button. Scanned for a keycode rather than
 // parsed against the report map: a clicker sends one key at a time, and a
 // permissive scan works across the boot- and report-protocol layouts clickers
 // disagree about. esp_hidh has already done discovery and subscription.
+//
+// A page turn cannot be injected on the press edge, because a press that turns
+// out to be a hold would already have turned the page. So a **short** click
+// resolves at the release edge — one subtraction in this callback, nothing
+// deferred, picked up by the next poll_buttons() exactly as a press-edge
+// injection was.
+//
+// The **hold** does not wait for the release: a held key sends no further
+// reports, so poll() watches the clock and fires Confirm/Back the moment the
+// threshold passes, then sets g_hold_fired so the release here is a no-op.
 inline void handle_report(const uint8_t* data, uint16_t len) {
   uint8_t found = 0;
   for (uint16_t i = 0; i < len; ++i) {
@@ -199,7 +244,13 @@ inline void handle_report(const uint8_t* data, uint16_t len) {
     }
   }
   if (found != 0 && found != g_last_key) {
-    const uint8_t btn = (found == kKeyLeftArrow) ? kBtnNext : kBtnPrev;
+    // Press edge: start the clock, inject nothing yet.
+    g_press_us = esp_timer_get_time();
+    g_hold_fired = false;
+  } else if (found == 0 && g_last_key != 0 && !g_hold_fired) {
+    // Release edge with no hold already fired: a short click, so page turn.
+    const bool left = (g_last_key == kKeyLeftArrow);
+    const uint8_t btn = (left != g_in_reader) ? kBtnNext : kBtnPrev;
     g_clicker_buttons = static_cast<uint8_t>(g_clicker_buttons | (1u << btn));
   }
   g_last_key = found;
@@ -209,9 +260,13 @@ inline void hidh_event_cb(void*, esp_event_base_t, int32_t id, void* event_data)
   auto* p = static_cast<esp_hidh_event_data_t*>(event_data);
   switch (static_cast<esp_hidh_event_t>(id)) {
     case ESP_HIDH_OPEN_EVENT:
-      if (p->open.dev) {
+      // status != 0 means discovery or subscription failed: the link is up but
+      // no report will ever arrive. Treat it as a failed connect.
+      if (p->open.dev && p->open.status == ESP_OK) {
         g_dev = p->open.dev;
-        g_state = wintergreen::ClickerState::Connected;
+        g_open_result = 1;
+      } else {
+        g_open_result = -1;
       }
       break;
     case ESP_HIDH_INPUT_EVENT:
@@ -278,6 +333,12 @@ inline int scan_cb(struct ble_gap_event* ev, void*) {
     } else if (!g_have_hid && adv_has_hid_service(&ev->disc)) {
       g_hid_candidate = ev->disc.addr;
       g_have_hid = true;
+      // Stop here too, not just on a MAC match. A HID device usually advertises
+      // under a rotated private address, so this is the *common* path — letting
+      // it run to BLE_GAP_EVENT_DISC_COMPLETE spent the whole kScanMs on the
+      // case that hits most often.
+      ble_gap_disc_cancel();
+      g_scan_done = true;
     }
   } else if (ev->type == BLE_GAP_EVENT_DISC_COMPLETE) {
     g_scan_done = true;
@@ -297,11 +358,19 @@ inline bool scan_for_clicker() {
   struct ble_gap_disc_params params = {};
   params.passive = 0;  // active: some clickers put the HID UUID in the scan response
   params.filter_duplicates = 1;
+  // 100% duty: window == interval, so the radio listens continuously instead of
+  // sampling. Left at 0 these take NimBLE's low-duty defaults, which can sit
+  // between advertisements — and a clicker advertises in a short burst after a
+  // keypress, so a missed burst costs the entire kScanMs. Units are 0.625 ms.
+  params.itvl = 96;    // 60 ms
+  params.window = 96;  // 60 ms
   if (ble_gap_disc(own_addr_type, kScanMs, &params, scan_cb, nullptr) != 0)
     return false;
 
-  for (int waited = 0; !g_scan_done && waited < kScanMs + 2000; waited += 50)
-    vTaskDelay(pdMS_TO_TICKS(50));
+  // 10 ms granularity, not 50: the scan usually ends on the callback cancelling
+  // it, and the poll interval is pure added latency on that exit.
+  for (int waited = 0; !g_scan_done && waited < kScanMs + 2000; waited += 10)
+    vTaskDelay(pdMS_TO_TICKS(10));
 
   // Discovery must be fully stopped before connecting — ble_gap_connect returns
   // BLE_HS_EBUSY while it is active, and the cancel issued from the callback is
@@ -327,6 +396,11 @@ inline bool scan_for_clicker() {
 // after connecting. ble_gattc_read_by_uuid searches the whole handle range, so
 // no service discovery is needed on our side — esp_hidh has already walked the
 // peer and this is a single round trip.
+// How long to wait for ESP_HIDH_OPEN_EVENT after the link comes up. Generous:
+// GATT discovery over a 30 ms connection interval on a clicker with a long
+// report map takes seconds, and pairing runs in the middle of it.
+inline constexpr int kOpenTimeoutMs = 10000;
+
 inline constexpr uint16_t kBatteryLevelChrUuid = 0x2A19;
 inline volatile bool g_battery_read_done = false;
 
@@ -340,19 +414,57 @@ inline int battery_read_cb(uint16_t, const struct ble_gatt_error* err, struct bl
   return 0;
 }
 
-inline void read_battery_once() {
+// The live connection handle, or -1 when there is none.
+//
+// **`ble_gap_conn_find_by_addr(&g_target)` alone is not enough**, and that was
+// the bug behind "Connected with no battery percentage and a clicker that does
+// nothing". A HID device typically advertises under a resolvable private
+// address; once bonding completes the stack resolves it to the peer's
+// *identity* address, so the connection no longer matches the address the scan
+// saw and the lookup returns ENOTCONN on a link that is perfectly alive.
+//
+// The connection descriptor keeps both forms, so try the scanned address first
+// (correct before resolution, and the cheap case) and otherwise walk the handle
+// range matching either the over-the-air or the identity address.
+inline int live_conn_handle() {
   struct ble_gap_conn_desc desc;
-  if (ble_gap_conn_find_by_addr(&g_target, &desc) != 0)
-    return;
+
+  // The address the scan reported, which is what esp_hidh_dev_open used.
+  if (ble_gap_conn_find_by_addr(&g_target, &desc) == 0)
+    return static_cast<int>(desc.conn_handle);
+
+  // Resolved to an identity address after bonding: the scanned RPA no longer
+  // matches, so ask by handle instead. Handles are controller-assigned rather
+  // than 0-based indices, so this walks the range NimBLE can hand out — cheap,
+  // because CONFIG_BT_NIMBLE_MAX_CONNECTIONS is 1 and the first hit wins.
+  for (uint16_t h = 0; h < 0xF0; ++h) {
+    if (ble_gap_conn_find(h, &desc) != 0)
+      continue;
+    if (memcmp(desc.peer_ota_addr.val, g_target.val, 6) == 0 ||
+        memcmp(desc.peer_id_addr.val, g_target.val, 6) == 0 ||
+        g_dev != nullptr)  // one connection at a time: if HID has a device, it is this one
+      return static_cast<int>(desc.conn_handle);
+  }
+  return -1;
+}
+
+// Returns false when the read could not even be issued — no connection, or the
+// GATT procedure was refused. A true return only means the round trip finished;
+// g_battery_pct is still 0 for a clicker with no battery service.
+inline bool read_battery_once() {
+  const int conn = live_conn_handle();
+  if (conn < 0)
+    return false;
 
   ble_uuid16_t uuid = BLE_UUID16_INIT(kBatteryLevelChrUuid);
   g_battery_read_done = false;
-  if (ble_gattc_read_by_uuid(desc.conn_handle, 0x0001, 0xFFFF, &uuid.u, battery_read_cb, nullptr) != 0)
-    return;
+  if (ble_gattc_read_by_uuid(static_cast<uint16_t>(conn), 0x0001, 0xFFFF, &uuid.u, battery_read_cb, nullptr) != 0)
+    return false;
   // Bounded: a clicker with no battery service answers "attribute not found"
   // rather than hanging, but never block the connect on a peer that ignores us.
   for (int waited = 0; !g_battery_read_done && waited < 2000; waited += 20)
     vTaskDelay(pdMS_TO_TICKS(20));
+  return true;
 }
 
 inline void host_task(void*) {
@@ -392,14 +504,41 @@ inline void radio_off() {
     g_host_up = false;  // resync on the next enable
   }
   if (g_deep_teardown) {
-    // Hands the controller's own allocation back, which disable() alone does
-    // not: disable() returns it to INITED, still holding its buffers. Only
-    // reached from release_for_wifi() — see there for why this is not the
-    // default.
+    // **Deliberate one-way door: the sync gets the controller's ~12 KB, and
+    // the clicker is unavailable until the device restarts.**
+    //
+    // This is the chosen trade, not an oversight. Without the deinit a sync
+    // started with the clicker connected fails at stage 5 (~20 KB against the
+    // ~50 KB esp_wifi_init wants), and trimming Wi-Fi's own buffers did not
+    // close the gap. A sync that works and costs a reboot to use the clicker
+    // again beats a clicker that blocks syncing.
+    //
+    // g_ctrl_dead records it so the clicker row can say so rather than spend
+    // 10 s in "Connecting" and fall back to "Disconnected" — see below for why
+    // a reconnect cannot work.
     esp_bt_controller_deinit();
     g_ctrl_inited = false;
+    g_ctrl_dead = true;
     g_deep_teardown = false;
   }
+  // **The controller cannot be re-initialised while the NimBLE host is alive,
+  // and there is no way to take the host down on this IDF. This is settled;
+  // do not try a third time.**
+  //
+  // esp_bt_controller_deinit() destroys the HCI transport the host is attached
+  // to. The host task survives (esp_nimble_disable is a bare vTaskDelete with
+  // no state reset, and re-initialising panics in os_mempool_init), so a later
+  // esp_bt_controller_init() builds a *new* transport that the still-running
+  // host never binds to: ble_hs_synced() stays false and bringup_stack() times
+  // out after 10 s. The row reads "Connecting" then "Disconnected", with no
+  // crash and nothing on the console, until a reboot.
+  //
+  // Deiniting esp_hidh alongside it does not help — that was the second
+  // attempt. The break is between the host and the transport, below esp_hidh
+  // entirely.
+  //
+  // So the ~12 KB the controller holds is not reclaimable in-session, and a
+  // sync with the clicker connected has to fit in what is left.
   // Page turns go back to being a memcpy. Reached from every path out of the
   // radio — toggling off, a failed bringup (connect_task's `if (!ok)`) and
   // poll() acting on a disconnect — so the spare is never left released.
@@ -410,11 +549,18 @@ inline void radio_off() {
   }
 
   g_last_key = 0;
+  g_press_us = 0;
+  g_hold_fired = false;
   g_battery_pct = 0;
+  g_open_result = 0;
   g_state = wintergreen::ClickerState::Disconnected;
 }
 
 inline bool bringup_stack() {
+  // A sync deinitialised the controller; the host cannot rebind to a new one.
+  // Refuse now rather than spend 10 s waiting for a sync that cannot happen.
+  if (g_ctrl_dead)
+    return false;
 
   // NVS backs the bond store and nothing else here uses it, so a device with
   // the radio off never pays for it.
@@ -436,6 +582,12 @@ inline bool bringup_stack() {
     g_buf->release_spare();
     g_spare_released = true;
   }
+
+  // Same reasoning for main.cpp's OOM reserve: it is 28 KB of the same ~50 KB
+  // internal pool the controller allocates from, so holding it here is the
+  // difference between a connect and a row that silently stays Disconnected.
+  // The frame loop takes it back once the radio is down.
+  wg_release_oom_reserve();
 
   if (!g_ctrl_inited) {
     esp_bt_controller_mem_release(ESP_BT_MODE_CLASSIC_BT);
@@ -520,17 +672,43 @@ inline void connect_task(void*) {
   if (ok) {
     // Connect to the address and type the scan just observed, not to what the
     // config guessed. esp_ble_hidh_dev_open returns non-null as soon as the
-    // link is up; discovery happens after and cannot fail this call.
+    // link is up — discovery, report-map parsing and input-report subscription
+    // all happen after it and are reported only by ESP_HIDH_OPEN_EVENT, so wait
+    // for that rather than for the return value.
+    g_open_result = 0;
     esp_hidh_dev_t* dev = esp_hidh_dev_open(g_target.val, ESP_HID_TRANSPORT_BLE, g_target.type);
     ok = (dev != nullptr);
-    if (ok)
+    if (ok) {
       g_dev = dev;
+      // Bounded: a peer that never completes discovery must not wedge the row on
+      // "Connecting" forever.
+      // A CLOSE during discovery ends the attempt too — without this the peer
+      // dropping mid-way costs the whole timeout before the row updates.
+      for (int waited = 0; g_open_result == 0 && !g_disconnect_request && waited < kOpenTimeoutMs; waited += 20)
+        vTaskDelay(pdMS_TO_TICKS(20));
+      ok = (g_open_result > 0);
+    }
   }
+
+  // **Verify the link is really usable before claiming Connected.**
+  //
+  // ESP_HIDH_OPEN_EVENT with status ESP_OK is not sufficient on its own: it has
+  // been observed arriving for a link that then delivers no reports, and the row
+  // sat on "Connected" with a clicker whose buttons did nothing — a connection
+  // state that lied. The one cheap end-to-end check available is a GATT round
+  // trip: a peer that will not answer a read will not send input reports either.
+  //
+  // read_battery_once() returns false only when the read could not be issued or
+  // never completed, which is a dead link. A clicker with no battery service
+  // still *answers* (with "attribute not found"), so this does not reject
+  // devices that merely lack the service — those still connect and show
+  // "Connected" with no percentage, exactly as before.
+  if (ok)
+    ok = read_battery_once();
 
   // Every failure looks the same from here: back to Disconnected, radio off,
   // no retry.
   if (ok) {
-    read_battery_once();  // before Connected, so the row never shows a blank %
     g_state = wintergreen::ClickerState::Connected;
   } else {
     radio_off();
@@ -548,27 +726,61 @@ inline void bind(wintergreen::DrawBuffer& buf) {
   g_buf = &buf;
 }
 
-// Take the clicker down as far as it can go, for a Wi-Fi sync.
+// Take the clicker down for a Wi-Fi sync, and leave it in a state a later
+// reconnect can recover from.
 //
-// radio_off() alone is not enough: it disables the controller but leaves it
-// *initialised*, still holding its buffers, so esp_wifi_init() came up ~18 KB
-// short of the ~50 KB it needs and the sync failed instantly. This also deinits
-// the controller.
+// **The radio can only go down so far, and pushing past that breaks the
+// reconnect.** Three things are un-deinitialisable here for the life of the
+// boot: the NimBLE host and esp_hidh (esp_nimble_deinit leaves ble_hs_ctx
+// dangling under CONFIG_BT_NIMBLE_STATIC_TO_DYNAMIC=y, and the next init panics
+// in os_mempool_init), and — because those two stay bound to it — the
+// controller. Deiniting the controller alone was tried: g_nimble_up stays true,
+// bringup_stack() skips re-initialising the host, and the host is then talking
+// to a controller instance that no longer exists. First reconnect after a sync
+// crashed; the retry hung on "Connecting" then fell back to "Disconnected"
+// until a reboot.
 //
-// What it deliberately does **not** touch is the NimBLE host and esp_hidh. With
-// CONFIG_BT_NIMBLE_STATIC_TO_DYNAMIC=y, esp_nimble_deinit() leaves ble_hs_ctx
-// dangling and the next esp_nimble_init() panics in os_mempool_init — cycling
-// the host is not supported by this IDF and fails by crashing. They stay up and
-// quiescent; bringup_stack() skips them on a reconnect and re-inits only the
-// controller, so pressing the clicker row again after a sync works without a
-// reboot.
+// So this disables the controller and clears the transient state a reconnect
+// needs clean. The sync's headroom comes from the spare framebuffer and the
+// reader's caches instead.
 inline void release_for_wifi() {
   g_deep_teardown = true;
   radio_off();
+  // **Clear g_busy.** This is the one teardown path that does not go through
+  // toggle()/connect_task, so nothing else resets it — and a sync started while
+  // a connect was in flight left it true for the rest of the session, after
+  // which every press of the clicker row returned immediately and silently.
+  // The symptom is a row that never even says "Connecting".
+  g_busy = false;
+  g_disconnect_request = false;
+  // The sync takes the spare for itself and gives it back at the end, so the
+  // clicker's view of who holds it is stale either way. Clearing this makes the
+  // next bringup release it again rather than assume it already has.
+  g_spare_released = false;
 }
 
 inline wintergreen::ClickerState state() {
+  // After a sync the controller is gone for this boot, so the row reports
+  // Unavailable — which hides it — rather than offering a connect that would
+  // sit in "Connecting" for 10 s and then fail. It comes back on the next boot,
+  // and deep-sleep wake is a full boot.
+  if (g_ctrl_dead)
+    return wintergreen::ClickerState::Unavailable;
   return g_state;
+}
+
+// True while any part of the BLE stack still owns heap. The controller can be
+// deinited (release_for_wifi) but the NimBLE host and esp_hidh cannot — once up
+// they stay up for the boot — so this stays true after a disconnect and only
+// goes false on a build that never brought the stack up at all.
+//
+// `g_busy` is included so a connect that is still spinning up counts as holding
+// RAM before any of the three flags is set. Without it main.cpp's frame loop
+// re-claims the OOM reserve in the window between toggle() releasing it and
+// bringup_stack() allocating — taking the memory back out from under the
+// connect it was just freed for.
+inline bool holds_ram() {
+  return g_busy || g_ctrl_inited || g_nimble_up || g_hidh_up;
 }
 
 // Clicker battery percentage, or 0 when it has not reported one.
@@ -592,6 +804,18 @@ inline void toggle() {
   if (g_state != wintergreen::ClickerState::Connected) {
     g_state = wintergreen::ClickerState::Connecting;
     g_disconnect_request = false;
+
+    // **Free the reserve here, not in bringup_stack().** bringup_stack runs
+    // *inside* the worker below, so a reserve released there cannot help the
+    // xTaskCreate that has to allocate the worker's own 6 KB stack first.
+    //
+    // That is exactly how holding it broke the clicker: the task creation
+    // failed, the state went straight back to Disconnected inside this one
+    // call, and the row never repainted as "Connecting" — the press looked
+    // like it had done nothing at all. Releasing before the create is what
+    // makes the 6 KB available.
+    wg_release_oom_reserve();
+
     // 6 KB: esp_hidh_dev_open runs GATT discovery and report-map parsing on
     // this stack. Freed as soon as the connect finishes, either way.
     if (xTaskCreate(connect_task, "wg_bt_up", 6144, nullptr, 4, nullptr) != pdPASS) {
@@ -607,10 +831,21 @@ inline void toggle() {
   }
 }
 
-// Called every UI frame. Carries out the disconnect the HID callback asked for
-// — that callback runs on esp_hidh's event task and must not close the device
-// whose event it is dispatching.
+// Called every UI frame. Fires a hold the moment it crosses the threshold, and
+// carries out the disconnect the HID callback asked for — that callback runs on
+// esp_hidh's event task and must not close the device whose event it is
+// dispatching.
 inline void poll() {
+  // A held key sends no further reports, so handle_report never runs again
+  // while it is down. The threshold has to be noticed here instead.
+  if (g_last_key != 0 && !g_hold_fired &&
+      esp_timer_get_time() - g_press_us >=
+          static_cast<int64_t>(wintergreen::config::kHoldDelayMs) * 1000) {
+    g_hold_fired = true;
+    const uint8_t btn = (g_last_key == kKeyLeftArrow) ? kBtnBack : kBtnConfirm;
+    g_clicker_buttons = static_cast<uint8_t>(g_clicker_buttons | (1u << btn));
+  }
+
   if (!g_disconnect_request || g_busy)
     return;
   g_disconnect_request = false;
@@ -632,6 +867,9 @@ inline void toggle() {}
 inline void poll() {}
 inline void bind(wintergreen::DrawBuffer&) {}
 inline void release_for_wifi() {}
+inline bool holds_ram() {
+  return false;
+}
 }  // namespace wg_clicker
 
 #endif  // WG_BLUETOOTH_PAGE_TURNER

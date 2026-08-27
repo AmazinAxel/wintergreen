@@ -20,6 +20,9 @@ with no scaling or centring, so it should be exactly 800x480 (landscape). The
 visible area is inset — DisplayFrame hides 10 columns at the left edge — so keep
 anything important away from the extreme edges.
 
+A portrait source (the panel is 480x800 when held for reading) must therefore be
+rotated into landscape first: pass --rotate 90.
+
 Usage (needs Pillow, absent from the PlatformIO interpreter):
 
     nix-shell -p 'python3.withPackages(ps: [ps.pillow])' --run \\
@@ -54,9 +57,13 @@ def quantise(value):
     return best
 
 
-def to_levels(img, dither):
+def to_levels(img, dither, bw):
     """Return a width*height list of 0..3 levels."""
     w, h = img.size
+    if bw:
+        # Levels 0 and 3 only. The panel still writes both RAM planes either way,
+        # but a pure-bilevel image gives the waveform no mid-level pixels to drive.
+        return [0 if v >= 128 else 3 for v in img.getdata()]
     if dither:
         # Floyd–Steinberg onto the 4 available grays.
         pal = Image.new("P", (1, 1))
@@ -76,12 +83,19 @@ def main():
     ap.add_argument("input", help="any image Pillow can read")
     ap.add_argument("output", help="destination .mgr")
     ap.add_argument("--dither", action="store_true", help="Floyd-Steinberg; use for photos")
+    ap.add_argument("--bw", action="store_true",
+                    help="threshold to pure black/white, no gray levels (fastest waveform)")
     ap.add_argument("--invert", action="store_true", help="swap black and white")
     ap.add_argument("--no-fit", action="store_true",
                     help="use the image as-is instead of fitting it to 800x480")
+    ap.add_argument("--rotate", type=int, default=0, choices=(0, 90, 180, 270),
+                    help="rotate counter-clockwise before fitting; use 90 for a portrait source")
     args = ap.parse_args()
 
     img = Image.open(args.input).convert("L")
+
+    if args.rotate:
+        img = img.rotate(args.rotate, expand=True)
 
     if not args.no_fit:
         # Contain within the panel, then paste onto a white 800x480 field so the
@@ -100,7 +114,7 @@ def main():
         print(f"warning: {w}x{h} exceeds the {PANEL_W}x{PANEL_H} panel; it will be cropped on device",
               file=sys.stderr)
 
-    levels = to_levels(img, args.dither)
+    levels = to_levels(img, args.dither, args.bw)
 
     stride = (w + 3) // 4
     data = bytearray(stride * h)

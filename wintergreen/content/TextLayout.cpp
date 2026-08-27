@@ -94,8 +94,20 @@ struct WordSpan {
   bool no_space_before;  // true when this span is adjacent (no whitespace) to the previous span
 };
 
-static std::vector<WordSpan> split_words(const char* text, size_t text_len) {
-  std::vector<WordSpan> spans;
+// Fills `spans` rather than returning a new vector.
+//
+// **The allocation, not its size, was the problem.** This ran once per *run* and
+// each call allocated and freed a fresh block — a paragraph of many small runs
+// therefore churned dozens of short-lived allocations of varying size, which is
+// how a heap fragments. On hardware that showed up as a `std::bad_alloc` on a
+// 1,416-byte request with plenty of total free heap, aborting the device on an
+// ordinary forward page turn.
+//
+// Reusing one buffer across every run of the paragraph makes the capacity
+// monotonic: it grows to the largest run once and then every later call is a
+// fill into memory already held.
+static void split_words(const char* text, size_t text_len, std::vector<WordSpan>& spans) {
+  spans.clear();
   // **Count first, then reserve exactly.** text_len / 6 + 8 was an *average*
   // dressed up as a bound: "~6 bytes per word in English prose". Two things
   // beat it routinely, and when they do, push_back reallocates while holding
@@ -160,7 +172,6 @@ static std::vector<WordSpan> split_words(const char* text, size_t text_len) {
     bool no_spc = !had_space && !spans.empty();
     spans.push_back({start, i - start, no_spc});
   }
-  return spans;
 }
 
 // ---------------------------------------------------------------------------
@@ -243,7 +254,48 @@ static std::vector<LayoutLine> layout_para_lines(const IFont& font, const Layout
   const int16_t indent = para.indent.value_or(0);
 
   std::vector<LayoutLine> lines;
-  lines.reserve(12);
+  // Reserve from the paragraph's own size rather than a fixed 12. Growing this
+  // vector is the dominant allocation spike in the layout: a realloc holds the
+  // old and new arrays at once *and* move-constructs every LayoutLine, each of
+  // which owns a heap word vector. Measured on the Odyssey's longest paragraph
+  // (chapter 2, the verse quotation in the first preface), the doubling chain
+  // 12 -> 24 -> 48 -> 96 took the peak to 2.3x the paragraph's final size, and
+  // with the BLE clicker resident that peak is what threw std::bad_alloc — an
+  // abort() with exceptions off, so the device rebooted on that page every time.
+  //
+  // A line holds at least one character, so bytes/avg_line_bytes is an estimate
+  // that overshoots only for very narrow columns. Over-reserving costs a few
+  // hundred bytes briefly; under-reserving costs a realloc, so the estimate is
+  // deliberately generous and clamped to keep a pathological paragraph from
+  // reserving more than it could ever use.
+  {
+    size_t para_bytes = 0;
+    for (const auto& r : para.runs)
+      para_bytes += r.text.size();
+    // Characters per line from the font's own metrics, not a guessed constant.
+    // A fixed 6 px/char was tried and undershot on 930 of the Odyssey's
+    // paragraphs, so the realloc it exists to avoid still happened. 'n' is a
+    // reasonable stand-in for average advance in Latin text; the +1 floor keeps
+    // a degenerate font from dividing by zero.
+    uint16_t avg_w = font.char_width('n', FontStyle::Regular);
+    if (avg_w == 0)
+      avg_w = space_width;
+    if (avg_w == 0)
+      avg_w = 1;
+    size_t chars_per_line = max_width / avg_w;
+    if (chars_per_line < 8)
+      chars_per_line = 8;
+    // Round up, then add a line for the ragged last one and a little slack: a
+    // paragraph is a sequence of words, so line breaks land short of the column
+    // and the true line count runs above bytes/chars_per_line.
+    size_t est = (para_bytes + chars_per_line - 1) / chars_per_line;
+    est += est / 4 + 2;
+    if (est < 4)
+      est = 4;
+    if (est > kMaxReservedLines)
+      est = kMaxReservedLines;
+    lines.reserve(est);
+  }
   LayoutLine current;
   current.words.reserve(16);
   uint16_t x = opts.first_line_extra_indent + ((indent > 0) ? static_cast<uint16_t>(indent) : 0);
@@ -254,6 +306,22 @@ static std::vector<LayoutLine> layout_para_lines(const IFont& font, const Layout
   // For Center/End alignment, words start at margin_left (not 0), which would
   // otherwise skew the centering. This helper normalises word x to [0..text_width]
   // before computing room so that align_line produces a symmetric result.
+  // **Lines are not shrunk to fit, and that is deliberate.**
+  //
+  // `current.words` is reserved to 16 while a justified line averages ~8, so a
+  // per-line `shrink_to_fit()` was added to reclaim the slack — it cut the
+  // Odyssey's worst page from 18.6 KB to 13.2 KB resident. It was removed again
+  // because it made the *real* failure worse.
+  //
+  // `shrink_to_fit` reallocates: it allocates the exact size, copies, and frees
+  // the old block. Once per line plus once per paragraph is ~80 extra
+  // allocate/free pairs per page, taking the page from 114 allocations to 197.
+  // Churn of many short-lived blocks of varying size is precisely what fragments
+  // a heap, and fragmentation — not total free bytes — is what aborts this
+  // device: a 1,416-byte request failed with well over 20 KB free.
+  //
+  // Both figures fit the budget, so the trade is 5 KB of headroom against 40% of
+  // the allocation traffic, and the traffic is what actually bites.
   auto flush_line = [&](uint16_t lw, std::vector<LayoutWord>& words, bool is_last) {
     if (!words.empty() && (align == Alignment::Center || align == Alignment::End)) {
       uint16_t x_first = words.front().x;
@@ -267,6 +335,10 @@ static std::vector<LayoutLine> layout_para_lines(const IFont& font, const Layout
       align_line(align, room, lw, space_width, words, is_last);
     }
   };
+
+  // One buffer for every run in this paragraph — see split_words. Declared here
+  // rather than inside the loop so its capacity survives from run to run.
+  std::vector<WordSpan> spans;
 
   for (const auto& run : para.runs) {
     uint8_t eff_size_pct = run.size_pct;
@@ -292,7 +364,7 @@ static std::vector<LayoutLine> layout_para_lines(const IFont& font, const Layout
       }
     }
 
-    auto spans = split_words(text, text_len);
+    split_words(text, text_len, spans);
     bool first_word_of_run = true;
     for (const auto& span : spans) {
       const char* word_ptr = text + span.start;
@@ -408,6 +480,13 @@ static std::vector<LayoutLine> layout_para_lines(const IFont& font, const Layout
     flush_line(cur_line_width, current.words, true);
     lines.push_back(std::move(current));
   }
+
+  // **`lines` is not shrunk to fit either.** Same reasoning as flush_line above:
+  // shrink_to_fit reallocates, and the slack it reclaims (128 slots for 116
+  // lines on the Odyssey's largest paragraph, 384 bytes) costs an extra
+  // allocate/copy/free of the whole array — including move-constructing every
+  // heap-owning LayoutLine. Trading allocation churn for a few hundred bytes is
+  // the wrong direction on a heap that fails by fragmenting.
   return lines;
 }
 
@@ -508,6 +587,18 @@ const TextLayout::LaidOutParagraph& TextLayout::get_laid_out_(size_t pi) const {
     if (!e.empty() && e.para_idx == static_cast<uint16_t>(pi))
       return e;
 
+  // **Do not add byte-budget eviction here.** It was tried: walking the cache
+  // and freeing entries over a size ceiling before building the new one. The
+  // pages came out garbled — random characters and whitespace, correct again
+  // after paging away and back.
+  //
+  // Why: a caller part-way through collect_page_items holds references to
+  // entries it looked up earlier in the same page (get_laid_out_ returns a
+  // reference, and PageLine::words points into the vectors it owns). Freeing
+  // any entry that is not the one being built invalidates those, and the page
+  // is then assembled from freed memory. Only the ring's own eviction is safe,
+  // because a page never spans more than the ring holds.
+  //
   // Ring over cache_limit_, not kCacheCapacity: the limit is lowered while a
   // radio is up, and wrapping on the full capacity would let the cache refill
   // past it a few page turns later.
@@ -533,6 +624,29 @@ const TextLayout::LaidOutParagraph& TextLayout::get_laid_out_(size_t pi) const {
         slot.block_height = font.y_advance();
         break;
       }
+      // **A paragraph whose runs hold only whitespace is empty too.**
+      //
+      // `<p> </p>` is a real thing publishers write — Project Gutenberg's
+      // Odyssey ends "PREFACE TO FIRST EDITION" with one — and it has a
+      // non-empty run, so the check above misses it. layout_para_lines then
+      // returns *zero* lines, and every index computed from lines.size() is
+      // zero-length: paragraph_end_idx() reports an end equal to the start, so
+      // the backward walk cannot step past the paragraph and the forward walk
+      // never sees it as exhausted. On hardware that is a hang or an abort at
+      // the chapter boundary, reproducible to the page.
+      //
+      // Treating it as empty gives it one blank line's height, which is what
+      // the markup meant, and restores a non-zero end index.
+      // **Do not mark whitespace-only paragraphs as text_runs_empty.** It was
+      // tried, to stop layout_para_lines returning zero lines, and it produces
+      // a worse failure than the one it fixes: PageItem::Empty items are
+      // collected without ever setting `has_content`, so a page made only of
+      // them never registers as full. Several in a row — which is exactly what
+      // a <br>-split paragraph yields — give a run of blank pages that cannot
+      // be paged backwards out of, only escaped by leaving the book.
+      //
+      // The zero-line hazard is handled where it actually bites instead: see
+      // paragraph_end_idx(), which never reports a zero-length unit.
       InlineImageInfo img = resolve_inline_image(para.text, cw, sp);
       slot.inline_img = img;
       LayoutOptions lo;
@@ -540,6 +654,11 @@ const TextLayout::LaidOutParagraph& TextLayout::get_laid_out_(size_t pi) const {
       if (img.has_image && img.width > 0 && img.height > 0 && !img.promoted)
         lo.first_line_extra_indent = img.width + 4;
       slot.lines = layout_para_lines(font, lo, para.text, hyphenation_lang_);
+      // Whitespace-only runs lay out to no lines. block_height is otherwise only
+      // set on the text_runs_empty branch above, so set it here too: it is the
+      // height collect_text charges for the blank line it yields for this case.
+      if (slot.lines.empty())
+        slot.block_height = font.y_advance();
       slot.line_heights.resize(slot.lines.size());
       slot.line_baselines.resize(slot.lines.size());
       for (size_t i = 0; i < slot.lines.size(); ++i) {
@@ -662,7 +781,10 @@ static uint16_t build_page_items(PageContent& page, std::vector<TextLayout::Page
         pre_lp = &get_lp(item.para_idx);
         pre_para = item.para_idx;
       }
-      total_words += pre_lp->lines[item.line_idx].words.size();
+      // Same bounds check as the draw loop below: the blank line yielded for a
+      // whitespace-only paragraph has no LayoutLine and contributes no words.
+      if (item.line_idx < pre_lp->lines.size())
+        total_words += pre_lp->lines[item.line_idx].words.size();
     }
     page.word_pool.reserve(total_words);
   }
@@ -689,6 +811,13 @@ static uint16_t build_page_items(PageContent& page, std::vector<TextLayout::Page
           cur_lp_ptr = &get_lp(item.para_idx);
           cur_lp_para = item.para_idx;
         }
+        // The blank line collect_text yields for a whitespace-only paragraph
+        // (zero laid-out lines) has no LayoutLine behind it. It still occupies
+        // its height on the page — that is what stops a run of such paragraphs
+        // from leaving the page unfillable — but there is nothing to draw, and
+        // indexing lines[] here would read off the end of an empty vector.
+        if (cur_lp_ptr->lines.empty() || item.line_idx >= cur_lp_ptr->lines.size())
+          break;
         const LayoutLine& src = cur_lp_ptr->lines[item.line_idx];
         uint16_t base = static_cast<uint16_t>(page.word_pool.size());
         page.word_pool.insert(page.word_pool.end(), src.words.begin(), src.words.end());
@@ -887,6 +1016,12 @@ PageContent TextLayout::assemble_page(std::vector<PageItem>& items, PagePosition
   page.end = end;
   page.at_chapter_end = at_chapter_end;
 
+  // The collectors return no items when source_ or font_ is null, but they are
+  // dereferenced unconditionally below, so the guard has to be repeated here —
+  // an empty item list is not by itself proof that both exist.
+  if (!source_ || !font_)
+    return page;
+
   bool is_cs = (start.paragraph == 0 && start.offset == 0);
   uint16_t y = build_page_items(page, items, opts_, *font_, *source_, is_cs,
                                 [this](size_t pi) -> const LaidOutParagraph& { return get_laid_out_(pi); });
@@ -995,6 +1130,32 @@ static std::optional<Collected> collect_text(const LaidOut& lp, size_t idx, uint
   if (lp.inline_img.promoted && lp.promoted_h > 0)
     line_idx = start_idx - lp.promoted_h;
 
+  // A text paragraph that laid out to no lines at all — `<p> </p>`, whose runs
+  // are non-empty but hold only whitespace — still occupies one unit of index
+  // space, because paragraph_end_idx() reports 1 for it. Yield the blank line
+  // that promises, rather than nothing.
+  //
+  // Returning nullopt here is what made those paragraphs *free*: they consumed
+  // no height and produced no item, so a run of them left `used` near zero and
+  // the page never filled — blank and half-blank pages, a backward walk whose
+  // start position could not move past them, and a saved .pos that reloaded
+  // straight back into the stuck state.
+  //
+  // It must be a real TextLine and not PageItem::Empty: Empty never sets
+  // `has_content` in collect_para_items, which is a second route to the same
+  // unfillable page. See the note in get_laid_out_ on text_runs_empty.
+  if (lp.lines.empty() && lp.type == ParagraphType::Text) {
+    if (start_idx != 0)
+      return std::nullopt;
+    const uint16_t h = lp.block_height > 0 ? lp.block_height : available;
+    if (h > available)
+      return std::nullopt;  // does not fit; the caller will break the page here
+    return Collected{
+        PageItem{PageItem::TextLine, lp.para_idx, 0, {}, h, h},
+        forward ? size_t(1) : size_t(0)
+    };
+  }
+
   if (line_idx >= lp.lines.size())
     return std::nullopt;
 
@@ -1099,7 +1260,16 @@ std::optional<Collected> TextLayout::LaidOutParagraph::collect(size_t idx, uint1
   std::optional<Collected> r;
   switch (type) {
     case ParagraphType::Text:
-      r = collect_text(*this, idx, available, true);
+      // require_full_height, matching the backward walk. Forward used to accept
+      // a line whose *baseline* fitted and carry the descender into the next
+      // line's budget, which let the last line on a page hang past the page box.
+      // Backward has no equivalent carry, so the two disagreed about how many
+      // lines a page holds — the same text landing a line or two higher
+      // depending on which direction the reader arrived from.
+      //
+      // One rule for both directions is what makes them agree. It costs at most
+      // one line per page, and that line was overhanging the box anyway.
+      r = collect_text(*this, idx, available, true, true);
       break;
     case ParagraphType::Image:
       r = collect_image(*this, idx, available, true);
@@ -1196,13 +1366,11 @@ static size_t collect_para_items(const LaidOut& lp, size_t start_idx, uint16_t s
       break;
     }
 
-    uint16_t item_cost = (r->item.kind == PageItem::TextLine) ? r->item.baseline : r->item.height;
-    uint16_t new_pd =
-        (r->item.kind == PageItem::TextLine) ? static_cast<uint16_t>(r->item.height - r->item.baseline) : 0;
-
-
-    used += pending_desc + gap + item_cost;
-    pending_desc = new_pd;
+    // Charge the full height, matching collect_para_items_bwd. The old model
+    // charged a TextLine's baseline and carried its descender in pending_desc,
+    // which the backward walk has no equivalent of — see the note on
+    // require_full_height in LaidOutParagraph::collect.
+    used += gap + r->item.height;
     has_content |= (r->item.kind != PageItem::Empty);
     size_t next_idx = r->next_idx;
     items.push_back(std::move(r->item));
@@ -1216,6 +1384,16 @@ static size_t collect_para_items(const LaidOut& lp, size_t start_idx, uint16_t s
 // ---------------------------------------------------------------------------
 
 TextLayout::CollectResult TextLayout::collect_page_items(PagePosition pos) const {
+  // Both are null until set_source()/set_font(), and laying out without them
+  // dereferences null inside layout_para_lines — a load fault, which on this
+  // device is a reboot mid-book rather than an error. It happened: a call added
+  // to ReaderScreen::start() ran before render_page_() installed the font.
+  // Returning an empty page instead degrades to a blank screen the next input
+  // clears. Guarding here and in the backward twin covers every entry point,
+  // since layout()/layout_backward()/layout_end() all route through them.
+  if (!source_ || !font_)
+    return {{}, pos, true};
+
   const uint16_t ph = opts_.height - opts_.padding_top - opts_.padding_bottom;
   const size_t pcnt = source_->paragraph_count();
 
@@ -1286,7 +1464,13 @@ static size_t paragraph_end_idx(const LaidOut& lp) {
       else if (lp.inline_img.promoted && lp.promoted_h > 0)
         base = (size_t)lp.promoted_h + lp.lines.size();
       else
-        base = lp.lines.size();
+        // Never zero. A text paragraph that laid out to no lines at all would
+        // otherwise have an end index equal to its start, which is a
+        // zero-length unit: the backward walk cannot step past it and the
+        // forward walk never sees it exhausted. The whitespace-only case that
+        // caused this is now caught in get_laid_out_; this is the backstop for
+        // any other route to an empty `lines`.
+        base = lp.lines.empty() ? 1 : lp.lines.size();
       break;
     case ParagraphType::Image:
       base = lp.block_height;  // 0 when image size is unknown
@@ -1322,26 +1506,39 @@ static size_t collect_para_items_bwd(const LaidOut& lp, size_t end_idx, uint16_t
       break;
     }
 
-    bool is_bottommost = rev_items.empty();
-    auto r = lp.collect_backward(idx, avail, !is_bottommost);
+    // **Every line must fit its full height, including the bottommost.**
+    //
+    // This used to pass `!is_bottommost`, i.e. the last line on the page was
+    // accepted if only its *baseline* fitted, on the reasoning that it mirrored
+    // the forward pass letting a final descender hang past the page edge.
+    //
+    // It does not mirror it. Forward carries that descender in `pending_desc`
+    // and charges it against the *next* line, so the overhang is at most one
+    // descender and only at the very bottom. Backward set `pending_desc = 0`
+    // after the bottommost line, so the allowance was never repaid — it simply
+    // gained a free line, and then went on filling. Measured over four books,
+    // 30% of backward pages ran past the page box (bottom 780 against 753 on
+    // The Hobbit), which is the same text drawn a line or two higher than the
+    // forward walk puts it.
+    //
+    // Requiring the full height costs nothing visually — a line that does not
+    // fit belongs on the next page — and makes the two walks agree.
+    auto r = lp.collect_backward(idx, avail, /*require_full_height=*/true);
     if (!r) {
       // Distinguish exhausted vs. item too tall for remaining space.
-      auto probe = lp.collect_backward(idx, ph, !is_bottommost);
+      auto probe = lp.collect_backward(idx, ph, /*require_full_height=*/true);
       if (probe) {
         page_full = true;
-      } else {
       }
       break;
     }
 
-    // Bottommost item: charge only baseline (descender hangs free, mirroring forward pass).
-    // All other items: charge full height — collect_text already enforced height <= avail.
-    uint16_t item_cost = (is_bottommost && r->item.kind == PageItem::TextLine) ? r->item.baseline : r->item.height;
-    uint16_t new_pd = 0;
-
-
-    used += pending_desc + gap + item_cost;
-    pending_desc = new_pd;
+    // Charge the full height of every item, matching the acceptance test above.
+    // The old special case charged the bottommost line only its baseline while
+    // leaving pending_desc at 0, so the descender it had been allowed was never
+    // accounted for anywhere — a free line on every backward page.
+    used += pending_desc + gap + r->item.height;
+    pending_desc = 0;
     first_item = false;
     idx = r->next_idx;
     rev_items.push_back(std::move(r->item));
@@ -1354,6 +1551,11 @@ static size_t collect_para_items_bwd(const LaidOut& lp, size_t end_idx, uint16_t
 // ---------------------------------------------------------------------------
 
 TextLayout::CollectResult TextLayout::collect_page_items_backward(PagePosition end_pos) const {
+  // See the note on collect_page_items: no source or font is a reboot, not an
+  // error, so it degrades to an empty page here too.
+  if (!source_ || !font_)
+    return {{}, {0, 0, 0}, false};
+
   const uint16_t ph = opts_.height - opts_.padding_top - opts_.padding_bottom;
   const size_t pcnt = source_->paragraph_count();
 
@@ -1401,9 +1603,17 @@ TextLayout::CollectResult TextLayout::collect_page_items_backward(PagePosition e
         // Stop here; the start of this page is right after the break.
         start = {static_cast<uint16_t>(pi + 1), 0, 0};
         stopped_at_page_break = true;
+        break;
       }
-      // If rev_items is empty, skip the PageBreak (mirrors forward behaviour:
-      // a page-break at the start of a page is ignored, not stop immediately).
+      // Nothing collected yet: this break is the tail of the page being built,
+      // so it contributes nothing and the walk continues into the content that
+      // precedes it. A *second* break — reached once items have been collected
+      // — is a real boundary and stops the walk in the branch above.
+      //
+      // Forward and backward must agree about breaks or a backward turn lands
+      // on a page the forward walk never produces. See the test in
+      // tools/tests/paginate_book_test.cpp, which paginates a real book both
+      // ways and compares.
       if (pi == 0)
         break;
       --pi;

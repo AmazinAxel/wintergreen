@@ -1,4 +1,5 @@
 #include <cstdio>
+#include <new>  // set_new_handler, see reclaim_on_oom_
 
 #include "driver/gpio.h"
 #include "driver/usb_serial_jtag.h"
@@ -12,7 +13,8 @@
 #include "input.h"
 #include "WintergreenConfig.h"
 #include "wintergreen/Application.h"
-#include "wintergreen/Loop.h"
+#include "wintergreen/Input.h"
+#include "wintergreen/Runtime.h"
 #include "wintergreen/content/BookIndex.h"
 #include "wintergreen/display/DrawBuffer.h"
 #include "runtime.h"
@@ -35,7 +37,7 @@ static void verify_ota() {
 // activity, just like the original wintergreen firmware.
 // Exception: software resets (e.g. after esptool flash) boot immediately.
 static constexpr gpio_num_t kPowerPin = GPIO_NUM_3;
-static constexpr uint32_t kPowerWakeupMs = 250;
+static constexpr uint32_t kPowerWakeupMs = 50;
 
 // True when a USB host is attached.
 //
@@ -127,7 +129,84 @@ static void verify_battery(const Esp32Runtime& runtime) {
   esp_deep_sleep_start();
 }
 
+// Last resort before an allocation failure becomes a reboot.
+//
+// With exceptions disabled a std::bad_alloc is an abort(), so every OOM in the
+// reader was a full restart mid-book. This runs *before* operator new throws
+// and hands back the two largest reclaimable blocks in the system — the spare
+// framebuffer and the book index — giving the allocation a second chance.
+//
+// It is not a substitute for the caches being sized correctly; it is the net
+// under them, for the page whose layout happens to land on a bad heap. If it
+// frees nothing (already released, or the index is dirty) the throw proceeds
+// exactly as before, so the worst case is unchanged.
+static wintergreen::DrawBuffer* g_oom_buf = nullptr;
+
+// **The reserve is what makes the rescue work with a radio up.**
+//
+// The handler used to free only the spare framebuffer and the book index. Both
+// are already gone by the time the clicker is connected — that is exactly what
+// release_ram_for_radio() does — so the handler ran, freed *nothing*, and the
+// abort proceeded. Every clicker-connected crash in this reader had a live
+// new_handler that could not help.
+//
+// This block exists solely to be freed here. It is claimed once at boot, is
+// never read or written, and is large enough for the worst cold page layout
+// measured over four books (24,066 B on the Odyssey) plus margin. Releasing it
+// turns the one allocation that would have aborted into a slow page turn, and
+// the reader keeps running in the reduced state its own guards already handle.
+static void* g_oom_reserve = nullptr;
+// 12 KB, not the 28 KB first tried. The reserve does not have to cover a whole
+// page layout — the reader's own guards drop their caches long before this
+// fires, and every failure seen on hardware has been a *small* allocation on a
+// fragmented heap (192, 256, 456, 1212, 1416 bytes). What the rescue has to
+// supply is one clean extent big enough for the request that lost the race,
+// which is far less than a page.
+//
+// Staying small also matters because this competes with the radios for the
+// single ~50 KB internal DRAM pool: 28 KB of it was over half, and that is what
+// stopped the clicker connecting at all.
+static constexpr size_t kOomReserveBytes = 12 * 1024;
+
+// **The radio needs this block back, and holding it broke the clicker.**
+//
+// The BT controller wants a contiguous allocation out of the single ~50 KB
+// internal DRAM pool this device has (see the note in bluetooth_clicker.h).
+// Reserving 28 KB of that pool at boot left too little for it: the connect
+// worker could not start, toggle() cleared g_state back to Disconnected, and the
+// row looked like the button had done nothing — it never even said "Connecting".
+//
+// So the reserve is given back on the way up, the same way DrawBuffer's spare
+// is, and re-claimed by the frame loop once the radio is down again and the
+// heap has room. wg_clicker calls this through the hook below.
+void wg_release_oom_reserve() {
+  if (g_oom_reserve) {
+    heap_caps_free(g_oom_reserve);
+    g_oom_reserve = nullptr;
+  }
+}
+
+static void reclaim_on_oom_() {
+  // **Must disarm itself.** operator new calls the handler in a loop and only
+  // stops when the handler frees nothing *and* clears itself — a handler that
+  // returns without freeing spins forever. Clearing first means one rescue
+  // attempt per re-arm, which app_main does at each frame boundary.
+  std::set_new_handler(nullptr);
+  // Reserve first: it is the only one guaranteed to still be holding memory.
+  if (g_oom_reserve) {
+    heap_caps_free(g_oom_reserve);  // IDF documents free() as equivalent; explicit for clarity
+    g_oom_reserve = nullptr;
+  }
+  if (g_oom_buf)
+    g_oom_buf->release_spare();
+  wintergreen::BookIndex::instance().release_memory();
+}
+
 extern "C" void app_main(void) {
+  // Claimed before anything else allocates, so it is guaranteed to exist and to
+  // come out of internal RAM. Never read; it is a rope for reclaim_on_oom_.
+  g_oom_reserve = heap_caps_malloc(kOomReserveBytes, MALLOC_CAP_INTERNAL);
+  std::set_new_handler(reclaim_on_oom_);
   verify_ota();
   verify_wakeup_press();
 
@@ -137,6 +216,7 @@ extern "C" void app_main(void) {
   static Esp32Runtime runtime(25, input.get_adc_handle());
   static wintergreen::Application app;
   static wintergreen::DrawBuffer buf(epd);
+  g_oom_buf = &buf;  // the spare is the largest block the OOM rescue can free
 
   // Before anything touches the panel or the card.
   verify_battery(runtime);
@@ -267,14 +347,33 @@ extern "C" void app_main(void) {
     // Carry out a BLE teardown the HID callback asked for. Compiles to nothing
     // unless a clicker MAC is configured; see bluetooth_clicker.h for why the
     // callback cannot tear its own stack down.
+    wg_clicker::g_in_reader = app.is_reader_active();
     wg_clicker::poll();
+    // Re-arm the out-of-memory rescue once per frame. It disarms itself when it
+    // fires, so without this it would rescue exactly one allocation per boot.
+    //
+    // Re-claim the reserve too, but only when the heap has recovered enough that
+    // taking 28 KB back cannot itself cause the shortage it exists to prevent.
+    // Without this the rope is single-use: the first rescue spends it and every
+    // later page turn is unprotected again.
+    //
+    // **Never while a radio holds RAM.** The reserve comes out of the same ~50 KB
+    // internal pool the BT controller needs a contiguous block from, so taking it
+    // back mid-session would starve the stack that is already up — and taking it
+    // at all is what stopped the clicker connecting in the first place.
+    if (!g_oom_reserve && !runtime.clicker_holds_ram() &&
+        heap_caps_get_largest_free_block(MALLOC_CAP_INTERNAL) > kOomReserveBytes + 16 * 1024)
+      g_oom_reserve = heap_caps_malloc(kOomReserveBytes, MALLOC_CAP_INTERNAL);
+    std::set_new_handler(reclaim_on_oom_);
 
     // Hold off auto-sleep while a sync is in flight: a multi-book transfer
     // easily outlasts kAutoSleepMinutes, and sleeping mid-download would cut
     // the radio with files half written.
     wg_sync::poll();
 
-    wintergreen::run_loop_iteration(app, buf, input, runtime);
+    const wintergreen::ButtonState buttons = input.poll_buttons();
+    app.update(buttons, runtime.frame_time_ms(), buf, runtime);
+    runtime.wait_next_frame();
   }
 
   // Hold-to-sleep leaves the power button still down, and the wake source is

@@ -303,7 +303,7 @@ static void unfilter_row(uint8_t filter, uint8_t* row, const uint8_t* prev, size
 
 static void dither_row_png(const uint8_t* src_row, const PngHeader& hdr, const uint8_t palette_grey[256],
                            uint32_t x_step, int out_w, int16_t* err_cur, int16_t* err_nxt, int16_t* err_nxt2,
-                           uint8_t* out_row) {
+                           uint8_t* out_row, ToneLut tone_lut = nullptr, ToneHistogram* tone_hist = nullptr) {
   uint32_t sx_fp = 0;
   uint8_t acc = 0, bit = 0x80;
   bool grey8 = (hdr.color_type == kColorGreyscale && hdr.bit_depth == 8);
@@ -322,6 +322,11 @@ static void dither_row_png(const uint8_t* src_row, const PngHeader& hdr, const u
       g = static_cast<int16_t>(palette_grey[n]);
     } else
       g = static_cast<int16_t>(pixel_to_grey(src_row, sx, hdr, palette_grey));
+
+    if (tone_hist)
+      ++tone_hist->bins[static_cast<uint8_t>(g)];
+    if (tone_lut)
+      g = static_cast<int16_t>(tone_lut[static_cast<uint8_t>(g)]);
 
     int16_t val = static_cast<int16_t>(g + err_cur[ox + 1]);
     if (val < 0)
@@ -354,7 +359,8 @@ static void dither_row_png(const uint8_t* src_row, const PngHeader& hdr, const u
 
 ImageError decode_png_from_entry(IZipFile& file, const ZipEntry& entry, uint16_t max_w, uint16_t max_h,
                                  DecodedImage& out, uint8_t* work_buf, size_t work_buf_size, bool scale_to_fill,
-                                 ImageRowSink* sink, ImagePixelSink* pixel_sink) {
+                                 ImageRowSink* sink, ImagePixelSink* pixel_sink,
+                                 ToneLut tone_lut, ToneHistogram* tone_hist) {
   // If no work_buf, allocate one
 #ifdef ESP_PLATFORM
 #endif
@@ -858,12 +864,12 @@ ImageError decode_png_from_entry(IZipFile& file, const ZipEntry& entry, uint16_t
             if (sink) {
               uint8_t temp_row[128];  // byte accumulator writes all bytes
               dither_row_png(curr_row.get(), hdr, palette_grey, x_step, static_cast<int>(out_w), err_cur.get(),
-                             err_nxt.get(), err_nxt2.get(), temp_row);
+                             err_nxt.get(), err_nxt2.get(), temp_row, tone_lut, tone_hist);
               sink->emit_row(sink->ctx, static_cast<uint16_t>(out_y), temp_row, static_cast<uint16_t>(out_w));
             } else {
               uint8_t* out_row = out.data.data() + out_y * out_stride;
               dither_row_png(curr_row.get(), hdr, palette_grey, x_step, static_cast<int>(out_w), err_cur.get(),
-                             err_nxt.get(), err_nxt2.get(), out_row);
+                             err_nxt.get(), err_nxt2.get(), out_row, tone_lut, tone_hist);
             }
             ++out_y;
             // Rotate three error rows: cur←nxt, nxt←nxt2, nxt2←fresh

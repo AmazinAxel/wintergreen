@@ -181,6 +181,12 @@ using ImageSizeQuery = std::function<bool(uint16_t key, uint16_t& w, uint16_t& h
 // The actual threshold is min(kMinImageSliceH, img_h/4) so small images stay proportional.
 static constexpr uint16_t kMinImageSliceH = 64;
 
+// Ceiling on the line count layout_para_lines() reserves up front. The estimate
+// it clamps is derived from the paragraph's byte count, so a pathological
+// paragraph cannot reserve unbounded memory before a single line is laid out.
+// 128 lines is already several screens of text at any font size this device has.
+static constexpr size_t kMaxReservedLines = 128;
+
 // ---------------------------------------------------------------------------
 // TextLayout — stateful layout engine
 //
@@ -265,6 +271,10 @@ class TextLayout {
   // well as capping. 2 is the floor that still lets a single page's paragraphs
   // stay resident; a backward turn re-lays out more often, which is the trade
   // against rebooting.
+  size_t cache_limit() const {
+    return cache_limit_;
+  }
+
   void set_cache_limit(size_t slots) {
     cache_limit_ = slots < 1 ? 1 : (slots > kCacheCapacity ? kCacheCapacity : slots);
     for (size_t i = cache_limit_; i < kCacheCapacity; ++i)
@@ -296,6 +306,13 @@ class TextLayout {
   // Layout the page that ends at position() (backward fill). Does not change
   // position(). Use the returned page.start to navigate to the previous page.
   PageContent layout_backward() const;
+
+  // Where the page starting at `pos` ends, without assembling it. Used to check
+  // that a backward page agrees with the forward walk; assembling would build
+  // the word pool and the line vectors for a page that is only being probed.
+  PagePosition layout_end(PagePosition pos) const {
+    return collect_page_items(pos).boundary;
+  }
 
   // Returns true if pos is mid-way through a promoted inline image (i.e. the
   // offset is a pixel row inside the promoted-image region of a Text paragraph).
@@ -367,6 +384,7 @@ class TextLayout {
     bool empty() const {
       return para_idx == UINT16_MAX;
     }
+
 
     // Result of both collect() and collect_backward().
     // next_idx is the cursor position to pass on the next call to the same function:

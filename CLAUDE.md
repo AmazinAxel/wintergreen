@@ -269,6 +269,48 @@ rather than into `PageContent`, which is why the cached page is **moved** into
 drop it explicitly: rebuilding the source frees every slot it points into, and no key
 comparison can detect that.
 
+### Forward and backward must use the same line-fitting rule
+
+**Both walks pass `require_full_height`.** Forward used to accept a line whose
+*baseline* fitted and carry the descender into the next line's budget via
+`pending_desc`; backward had no such carry and simply gave its bottommost line a
+free descender that was never repaid. Backward therefore fitted more lines than
+forward and **ran past the page box on 30% of turns** — bottom 780 against 753
+available on The Hobbit. The same text landed a line or two higher depending on
+which direction the reader arrived from, which is what "the layout is not
+consistent going backwards" is.
+
+One rule for both directions costs at most one line per page — a line that was
+overhanging the box anyway — and removed the systematic disagreement.
+
+**What remains is structural.** A page ending at a PageBreak, or at the end of a
+chapter's content, can legitimately be reached from several starts, and backward
+picks the fullest rather than the one the reader came from. Left alone that skips
+text, measured at 1-2 places per book. `prev_page_()` resolves it by stepping back
+one further page for an anchor and walking forward, keeping the last page that
+ends at or before the current start: **every skip gone across four books**, for
+one extra `layout_backward` and at most three boundary collections (measured).
+
+A handful of one-line offsets survive (25 / 5 / 2 / 2 over 520 / 579 / 170 / 640
+pages). Closing those needs a chapter-wide forward chain, which **was built and
+removed**:
+
+- It worked — every mismatch went to zero.
+- Walking the chapter drags `WgbChapterSource`'s 32-slot paragraph window across
+  it and peaked around **31 KB**. With the clicker resident that reintroduced the
+  heap abort, and it put a per-chapter walk on the book-open path.
+- Gating it on free heap was not enough: the check happens before the walk, not
+  during it.
+
+Don't reintroduce it without a way to walk a chapter that does not touch every
+paragraph. Two other approaches that do *not* work, both tried:
+
+- **A round-trip gate** ("does forward from backward's answer land back here?").
+  It does. Backward's answer is a perfectly valid page ending in the right place,
+  just not the one the reader came from, so the gate never fires.
+- **Gating on how many paragraphs the two answers differ by.** The distributions
+  overlap completely: genuine skips span 4-12 paragraphs, correct turns 0-22.
+
 ### Page-turn latency
 
 Everything CPU-side now happens off the critical path, leaving the ~300 ms waveform
@@ -291,6 +333,11 @@ as the floor:
   open and every chapter jump.
 - **Images are never decoded on the device.** An image page turns at the speed of a
   text page.
+- **Nothing walks the chapter.** Opening a book lays out one page. A per-chapter
+  forward walk was added to make backward turns exactly match forward ones and
+  removed again: it cost ~31 KB of paragraph-window pressure and put a
+  hundred-odd boundary collections on the book-open path. See "Forward and
+  backward must use the same line-fitting rule".
 - **The book index stays resident** for the whole session. `MainMenu::stop()` no
   longer calls `clear_entries()` (the method is gone), and both `MainMenu` and
   `HomeScreen` load from disk only when `entries()` is empty — i.e. once, on a cold
@@ -1109,6 +1156,29 @@ round trip, no discovery of our own (esp_hidh has already walked the peer), boun
 - `QuickmenuScreen::update` watches the percentage as well as the state, since a later
   notification can still update it.
 
+**The read doubles as the liveness check, and the state depends on it.**
+`ESP_HIDH_OPEN_EVENT` with `status == ESP_OK` is not sufficient on its own: it
+has been seen arriving for a link that then delivers no reports, leaving the row
+on "Connected" with a clicker whose buttons did nothing — a connection state that
+lied. `read_battery_once()` now returns false when the read could not be issued
+or never completed, and `connect_task` treats that as a failed connect. A peer
+that will not answer a GATT read will not send input reports either.
+
+This does **not** reject clickers without a battery service: those still *answer*
+(with "attribute not found"), so they connect and show "Connected" with no
+percentage, exactly as before. The rejected case is a link that answers nothing.
+
+**Never find the connection with `ble_gap_conn_find_by_addr(&g_target)` alone.**
+That was the underlying bug. A HID device typically advertises under a resolvable
+private address, and once bonding completes the stack resolves it to the peer's
+*identity* address — so the connection no longer matches the address the scan saw
+and the lookup returns `ENOTCONN` on a live link. The battery read was skipped,
+which is why the failure showed up as "Connected with no percentage".
+`live_conn_handle()` tries the scanned address first and otherwise walks the
+handle range matching `peer_ota_addr` or `peer_id_addr`. Note handles are
+controller-assigned, **not** 0-based indices, so iterating
+`0..CONFIG_BT_NIMBLE_MAX_CONNECTIONS` does not work.
+
 ### Stack sizes are not the defaults, deliberately
 
 `CONFIG_BT_NIMBLE_HOST_TASK_STACK_SIZE` is **6144**, not IDF's 4096, and
@@ -1226,6 +1296,239 @@ holding per-line word vectors. A page spans a handful of paragraphs, so the hit 
 is effectively unchanged; below ~6 a backward turn would thrash, since it crosses a
 paragraph boundary by definition.
 
+**What the paragraph cache actually costs**, measured over every page of four books
+with `tools/tests/layout_memory_test.cpp`'s instrumented allocator (worst case, the
+Odyssey):
+
+| `cache_limit_` | worst page peak | resident (cache + page) |
+|---|---|---|
+| 8 (no radio) | 25,823 B | 73,002 B |
+| 2 (radio up) | 27,097 B | 44,944 B |
+| 1 | 28,051 B | 44,480 B |
+
+So the cap `release_ram_for_radio()` applies buys **~28 KB of resident heap for
+~1 KB of extra peak** — the hit rate barely moves because a page spans only a few
+paragraphs. **Do not lower it to 1**: resident stops improving while the peak keeps
+rising, because a single slot thrashes on a page that spans two paragraphs.
+
+The switch is automatic and keyed on `IRuntime::clicker_holds_ram()`, so caching
+runs at full size whenever no radio is up. Nothing needs configuring.
+
+**An oversized paragraph is split by the converter, not handled on the device.**
+The Odyssey's chapter 2 (PREFACE TO FIRST EDITION) held a 3,672-byte paragraph
+that laid out to 116 lines / 683 words = 14,640 bytes resident, inside a page peak
+of 45,712 B, against roughly 13 KB free with the clicker connected. Reading that
+page aborted the device reproducibly; the allocation that finally failed was a
+**256-byte** `reserve`, i.e. the heap was simply gone.
+
+A paragraph is the device's indivisible layout unit, so nothing on the device can
+fix that — the fix is `kSplitParagraphBytes` (1,500) in `WgbFormat.h` and the two
+splitters in `WgbWriter`:
+
+- `write_split_text_paragraph_` cuts at `<br>` runs where the paragraph has them,
+  and now **recurses into the sentence splitter** for any chunk that is still
+  oversized (the Odyssey's verse quotation has a 1,165-byte stanza).
+- `write_sentence_split_paragraph_` handles the case that actually crashed:
+  running prose with no `<br>` at all. It cuts only after `.`/`!`/`?` (allowing a
+  trailing quote or bracket) followed by whitespace, so the break lands where a
+  line break could already fall. **Continuation chunks clear `indent`** and carry
+  `kWgbSpacingDefault`, so no fresh first-line indent and no extra gap appears. A
+  paragraph with no sentence boundary in range is left whole rather than cut
+  mid-clause — visible breakage is worse than a large paragraph.
+
+`kSplitParagraphBytes` is **700**, not the 1,500 first tried. The binding cost is
+not one paragraph — it is `WgbChapterSource`'s **32-slot window**, which holds the
+raw text of 32 paragraphs at once and so multiplies the *average* paragraph size
+by 32. On the Odyssey that window alone measured **26.8 KB**, more than the page
+and the paragraph cache combined. The window cannot shrink: a page legitimately
+spans up to 24 paragraphs (measured), and cutting it corrupts displayed text (see
+`WgbReader.h`). Lowering the average is the only lever.
+
+Verified invisible: concatenating all text from every paragraph, before and after,
+is **byte-identical** on all four books. Page counts move by a handful (514 → 516,
+629 → 639) because a split adds a paragraph boundary, which is a legal break the
+layout was already free to take.
+
+Measured, converting the real EPUBs in `/home/alec/Downloads/books`:
+
+| | before | after |
+|---|---|---|
+| per-page layout peak (Odyssey) | 25,823 B | **13,157 B** |
+| total chapter + page peak, cache=2 (Odyssey) | 47,434 B | **32,890 B** |
+| largest paragraph (Odyssey) | 3,672 B | 1,404 B |
+| paragraphs over the limit | 25 | 5 |
+
+The five that remain have no sentence boundary inside the window; they are left
+whole rather than cut mid-clause.
+
+**Three bugs made the first attempt look like it had done nothing**, and all three
+produced the same symptom — a re-converted book still holding oversized paragraphs:
+
+- `WgbConverter::write_split_paragraph` called `write_text_paragraph` **directly**,
+  bypassing `write_paragraph` and therefore the size split entirely. It bounds the
+  *serialized* size (run headers dominate in annotated books); the text-size bound
+  lives one level up. It now routes through `write_paragraph`.
+- `write_sentence_split_paragraph_` never flushed when the chunk was already full,
+  so `room` went to 0, `sentence_cut_` found nothing, and the whole run was
+  appended to an oversized chunk.
+- Even with room > 0, a *scrap* of room is as bad as none: chapter 22's paragraph
+  31 is runs of 658 + 5 + 848 bytes, and the third could not be cut inside the 37
+  bytes left over. `sentence_cut_fits_` now tests whether a cut is possible before
+  the run is considered, and flushes first if not, so each run gets a full window.
+
+### The OOM rescue, and why it needs its own reserve
+
+`main.cpp` installs a `std::set_new_handler`. With exceptions disabled a
+`std::bad_alloc` is an unconditional `abort()` — IDF's `__wrap___cxa_throw` is
+literally `abort()` — so the handler is the *only* place an allocation failure can
+be intercepted. A guard checked before allocating can always be overtaken by
+fragmentation between the check and the `new`; the handler cannot.
+
+**It must have something left to free, and that was the bug.** The handler
+originally released the spare framebuffer and the book index. Both are already
+gone whenever the clicker is connected — `release_ram_for_radio()` drops the index
+and `wg_clicker` drops the spare — so the handler ran, freed **nothing**, and the
+abort proceeded anyway. Every clicker-connected crash had a live handler that
+could not help.
+
+`g_oom_reserve` fixes that: **28 KB claimed at the top of `app_main` before
+anything else allocates**, never read, existing solely to be freed by the handler.
+It is sized from the worst *cold* page layout measured over four books — 24,066 B
+on the Odyssey, with an emptied paragraph cache, which is the state the reader's
+own guards force under pressure. Claiming it first also means it is one clean
+extent rather than whatever the heap has left over.
+
+Three properties that matter:
+
+- **The handler frees the reserve first**, because it is the only block
+  guaranteed to still be holding memory.
+- **The reserve is re-claimed once per frame**, but only when the largest free
+  block exceeds `kOomReserveBytes + 16 KB` — taking it back must not cause the
+  shortage it exists to prevent. Without the re-claim the rope is single-use: the
+  first rescue spends it and every later page turn is unprotected.
+- **The reserve must be released before `xTaskCreate`, not inside the worker.**
+  It comes out of the same single ~50 KB internal DRAM pool the BT controller
+  needs a *contiguous* block from (see bluetooth_clicker.h), and holding it broke
+  the clicker outright. Releasing it in `bringup_stack()` was not enough —
+  that runs *inside* the worker, so it cannot help the `xTaskCreate` that has to
+  allocate the worker's own 6 KB stack first. The release is in `toggle()`,
+  immediately before the create.
+
+  The symptom is worth recognising: `toggle()` sets Connecting, the create fails,
+  and the state goes back to Disconnected **within the same call**, so the row
+  never repaints as "Connecting" and the press looks like it did nothing at all.
+  A row that stays on Disconnected with no intermediate state is a failed task
+  creation, not a failed connect.
+
+  `wg_clicker::holds_ram()` includes `g_busy` so the frame loop cannot re-claim
+  the reserve in the window between `toggle()` freeing it and the worker
+  allocating. `wg_sync::start()` releases it for the same reason.
+
+**Anything new that reserves internal RAM up front inherits this.** The pool is
+small enough that a block held "just in case" is indistinguishable, from the
+radio's point of view, from a block genuinely in use.
+
+### The heap fails by fragmenting, not by filling
+
+Every abort in this reader has been a small allocation failing with plenty of
+total free heap: 256 bytes, 1,212 bytes, 1,416 bytes. Two things follow, and both
+were got wrong first.
+
+**Guard on `largest_free_block_bytes()`, never `free_memory_bytes()`.**
+`heap_caps_get_free_size` sums every free byte across a fragmented heap, and IDF's
+own header warns that a single block of that size probably cannot be allocated. A
+24 KB *total-free* guard passed and the layout behind it then aborted on a
+1,416-byte request, on an ordinary forward page turn.
+`heap_caps_get_largest_free_block` answers the question the guard is actually
+asking. The number to clear is the largest *single* allocation one layout makes —
+measured at **5,808 B** worst case over four books — hence
+`kLayoutMinBlockBytes` = 12 KB and `kPrerenderMinBlockBytes` = 20 KB.
+
+**Allocation churn is worse than allocation size.** `shrink_to_fit()` on each
+laid-out line and on the line vector reclaimed ~5 KB of slack per page and was
+removed again: it reallocates (allocate exact, copy, free old), so it added ~80
+allocate/free pairs per page and took the page from **114 allocations to 197**.
+Many short-lived blocks of varying size is the definition of heap churn, and churn
+is what produces the fragmentation above. 5 KB of headroom is not worth 40% more
+traffic on a heap that fails this way. Peak went 13.2 KB → 18.6 KB, both inside
+budget.
+
+The same reasoning is why `split_words` fills a caller-owned buffer reused across
+every run of a paragraph instead of returning a fresh vector per run.
+
+**A runtime guard backs all of this up.** `ReaderScreen::render_page_` checks
+`largest_free_block_bytes()` against `kLayoutMinBlockBytes` immediately before
+laying out and, if short, drops the page cache, the pre-drawn page and the
+paragraph cache and caps the cache at one slot. Exceptions are off, so an
+allocation failure inside layout is an `abort()` with nothing to catch — the check
+has to happen before allocating. The cost is a slower page turn; the page still
+renders. It deliberately does **not** release `DrawBuffer`'s spare: `render_page_`
+can be reached from inside an offscreen draw, and freeing the buffer being drawn
+into is worse than the abort it would prevent.
+
+**Every path that lays out needs the guard, not just `render_page_`.** There are
+three, and missing one is not theoretical — `prev_page_` was left unguarded and
+scrolling backwards through a book with the clicker connected aborted on a
+1,212-byte allocation inside `split_words`:
+
+| Path | Guard |
+|---|---|
+| `render_page_` | two stages — `kLayoutShedBlockBytes` (20 KB) drops the page cache and pre-drawn page; `kLayoutMinBlockBytes` (12 KB) also drops the paragraph cache |
+| `prerender_next_page_` | `kPrerenderMinBlockBytes` (20 KB) — higher, because the *real* page after it still has to fit |
+| `prev_page_` | `kLayoutMinBlockBytes`, and it also skips the forward-resync block entirely |
+
+`prev_page_` is the hungriest of the three: one `layout_backward`, then the resync
+does another plus up to three `layout_end` calls and a final `layout()`. When the
+heap is tight it drops caches *and* takes `layout_backward`'s answer unrefined,
+which costs the occasional one-line offset rather than a reboot.
+
+**A forward turn holds two pages at once**, and that is the number to budget
+against, not one page. `prerender_next_page_` lays out page N+1 while page N is
+still resident: measured worst case **25 KB** across four books against ~13 KB for
+a single page. Two consequences, both of which were bugs:
+
+- Its guard at the top of the function tests the heap *before* the speculative
+  layout exists, so it says nothing about whether the subsequent *draw* will fit.
+  It now re-checks after the layout and bails, leaving the layout cached — the
+  next turn is a normal render rather than a memcpy.
+- The draw calls `render_page_`, which runs its own guard. Left alone that guard
+  would drop the very page cache the prerender had just filled for it, forcing an
+  immediate re-layout with *less* room than the check was made against.
+  `in_prerender_draw_` suppresses it for the nested call only.
+
+Two consequences worth knowing:
+
+- **`TOC para_index` counts *written* paragraphs, not source ones.** `EpubParser`
+  numbers source paragraphs, so once a chapter splits anything the two diverge and
+  every later chapter jump lands short. `WgbConverter`'s `id_sink` reads
+  `WgbWriter::chapter_paragraph_count()` instead.
+- **The magic stays `WGB2`.** The on-disk layout is unchanged — only paragraph
+  granularity differs — so old files still open. They keep their oversized
+  paragraphs and stay exposed to the abort until re-converted.
+
+Two allocation bugs in `layout_para_lines` are also fixed, and they matter for any
+book, not just this one:
+
+- `lines` is reserved from the paragraph's byte count and the font's own
+  `char_width('n')`, not a fixed 12. The old doubling chain 12 → 24 → 48 → 96 held
+  both arrays *and* move-constructed every heap-owning `LayoutLine` per step. A
+  guessed 6 px/char was tried and undershot on 930 of the Odyssey's paragraphs, so
+  the estimate uses real metrics; it now undershoots twice in ~8,800 paragraphs.
+- every finished line's word vector is shrunk to its real size (in `flush_line`,
+  which pairs with all four push sites), and `lines` itself is shrunk before it is
+  returned. `reserve(16)` per line is held for the paragraph's whole life otherwise:
+  21.5 KB to store 10.9 KB of words.
+
+On their own those took the Odyssey's worst page from 45,712 B to 25,823 B — real,
+but still short of what BLE leaves free, which is why the converter split above is
+the actual fix. A per-paragraph **line cap** was considered and **rejected**: it
+would silently truncate text, which is worse than a visible failure.
+
+`tools/tests/layout_memory_test.cpp` asserts a 24 KB ceiling on one page's layout,
+measured with an instrumented `operator new` over every page of a book. It uses a
+proportional stand-in font, not `FixedFont`: a fixed-width font makes every line
+the same length and hides exactly the estimate error this is guarding.
+
 **`DrawBuffer`'s spare is on the heap, not in BSS.** Static RAM went 164,184 → 116,168
 with that one change. It is still allocated at construction and kept for the whole
 session — the point is that the 48 KB now sits in the pool the reader and the radio
@@ -1273,8 +1576,8 @@ failure stage inherits the same hazard.
 
 ## NAS book sync
 
-One button on the book list: pull newly converted books off the homelab, push reading
-positions, retire finished books. `platforms/esp32/wifi_sync.h` (header-only, `#ifdef
+One button on the book list: pull newly converted books off the homelab and retire
+finished books. `platforms/esp32/wifi_sync.h` (header-only, `#ifdef
 WG_WIFI_SYNC`), reached through `IRuntime::start_sync()` / `sync_state()` so
 `MainMenu` stays portable.
 
@@ -1314,59 +1617,46 @@ what the device lacks.
 | SD card | |
 |---|---|
 | nothing changed | **zero bytes** |
-| server ahead on a book | one `.pos` (~20 bytes) per book that moved |
 | N new books / deletions | the book files + **one** index save |
 
-Guaranteed by three things, all of which have a tempting wrong version:
+Guaranteed by two things, both of which have a tempting wrong version:
 
 - **Never call `BookIndex::index_file()` / `remove_path()` / `rename_in_place()`
   here.** Each ends with its own `save()`, so one call per downloaded book rewrites
   the whole ~30 KB index per book. The sync uses the in-memory `remove_entry()` /
   `add_entry()`, which only set `dirty_`, and saves once at the end. `save()` returns
   immediately when `!dirty_`.
-- **The server only sends positions it is strictly ahead on**, so every `.pos` write
-  is a file that genuinely moved.
 - **Downloads stream to `.tmp` then rename** (`remove()` first — FatFs `f_rename` does
   not replace). An interrupted download leaves a `.tmp`, never a truncated `book.wgb`
   that the reader would happily open.
 
-### Position, not percentage, is the merge key
+### Reading positions are not synced — removed, don't re-add
 
-The wire format carries the four numbers from `book.pos` — chapter, paragraph, offset,
-text_offset — compared lexicographically, furthest-read wins.
+`book.pos` is device-local. The sync carries `have` / `done` up and `get` / `delete`
+back, and nothing else. **The whole position half was built, shipped and then
+deleted** because it was buggy in practice and bought nothing: the reader is only ever
+open on one device, so there is no second reader to merge with.
 
-**`progress_pct` cannot be used for this and an earlier draft got it wrong.** It is a
-`uint8_t`, so on a 400-page book one percent spans four pages: read three pages, sync,
-and the two sides compare *equal* while the advance is silently discarded. The
-percentage stays in the index for the book-list row and is never transmitted. It
-survives in exactly one place in the sync — `>= 100` as the "finished" predicate,
-where four-pages-per-percent cannot matter because there is nothing past the end.
+Gone with it: the wire `pos` object, `parse_pos_object_` / `PosEntry` /
+`read_pos_` / `write_pos_` in `wifi_sync.h`, `state.pos` / `ahead()` / `dropPos()` /
+`handleDropped()` and the `POST /booksync/dropped` route on the server, and the
+`curl` call in `scripts/convertBooks.fish` (with `pkgs.curl` from `books.nix`).
+`.sync.json` now holds only `finished`.
 
-The tuple is only comparable when both sides hold the same `book.wgb` (chapter and
-paragraph indices are properties of the converted file). That holds by construction —
-the server is the only source of books — and the conversion unit `POST`s
-`/booksync/dropped/<name>` when it rebuilds one, so a stale position is discarded
-rather than resumed at the wrong place.
+`progress_pct` still crosses the wire in exactly one place — `>= 100` as the
+"finished" predicate in `done[]`, where the uint8 rounding that made it useless as a
+merge key cannot matter because there is nothing past the end.
 
-**Never write the `.pos` of the currently-open book.** `ReaderScreen::stop()` writes
-it on close and would put the stale in-memory position straight back over a synced
-one. `run_sync_()` skips it; the next sync carries it.
-
-**The reply must carry positions for books in `get`, not just `have`.** The first
-version iterated `have` alone, on the reasoning that the device already knows the
-rest — but a book arriving in *this* sync has no local position by definition,
-and on a wiped card `have` is empty, so nothing came back at all. Restoring a
-device pulled every book down and started every one of them at page one.
-`handleSync` iterates `[...have, ...reply.get]` now. The device already applies
-positions after downloading (step 2 runs after step 1), so the book directory
-exists by the time the `.pos` is written.
-
-**A restored book shows 0% in the list until it is opened once.** `progress_pct`
-lives in the index, not in `.pos`, and deriving it needs an open `WgbReader` with
-per-chapter character counts — a FATFS round trip per book, during a sync, for a
-cosmetic number. `ReaderScreen::stop()` recomputes and records it on close, so it
-self-corrects on first open. The *position* is correct immediately, which is the
-part that matters.
+If it is ever wanted back, the reasons the old version was the way it was: the merge
+key must be the four-number position tuple compared lexicographically, **never
+`progress_pct`** (a uint8, so one percent spans four pages on a 400-page book and two
+genuinely different positions compare equal); the reply must carry positions for books
+in `get` as well as `have` (a fresh card's `have` is empty, so iterating it alone sent
+nothing and a restored device started every book at page one); the currently-open book
+must be skipped, since `ReaderScreen::stop()` writes `.pos` on close and would put the
+stale in-memory position straight back over it; and a re-converted book's stored
+position must be dropped server-side, because the tuple indexes into a specific
+`book.wgb`.
 
 ### Finished books are deleted only after the server confirms
 
@@ -1497,31 +1787,28 @@ and moved into place so a half-written book is never visible to a concurrent syn
 `inputs.wintergreen.packages.aarch64-linux.epub2wgb`. Its `CMakeLists.txt` has no
 `install()` rule, so the derivation supplies its own `installPhase`.
 
-Endpoints: `POST /booksync` (the whole negotiation), `GET /booksync/<dir>/<file>` (one
-book file), `POST /booksync/dropped` (internal; the converter invalidating a
-stored position, name in a `dir=` form field). Book directory names are validated
-against `/^[A-Za-z0-9 ._-]+$/` and rejected if they contain `..` — they are used
-as path segments.
+Endpoints: `POST /booksync` (the whole negotiation) and `GET /booksync/<dir>/<file>`
+(one book file). Book directory names are validated against `/^[A-Za-z0-9 ._-]+$/`
+and rejected if they contain `..` — they are used as path segments.
 
-Two bugs that shipped in the first version of the conversion unit, both worth
-not repeating:
+One bug that shipped in the first version of the conversion unit, worth not
+repeating: **`DirectoryNotEmpty` is a level, not an edge.** It re-triggers for as
+long as the watched directory has *anything* in it, so the service restarted the
+instant it finished, forever, until systemd's rate limiter killed it with
+`start-limit-hit` — **part-way through the loop**, so the alphabetically last book
+was never converted and nothing said so. It is `PathChanged` now (fires once per
+upload), plus a `startLimitBurst` backstop so a future retrigger loop fails loudly
+instead of spinning.
 
-- **`DirectoryNotEmpty` is a level, not an edge.** It re-triggers for as long as
-  the watched directory has *anything* in it, so the service restarted the
-  instant it finished, forever, until systemd's rate limiter killed it with
-  `start-limit-hit` — **part-way through the loop**, so the alphabetically last
-  book was never converted and nothing said so. It is `PathChanged` now (fires
-  once per upload), plus a `startLimitBurst` backstop so a future retrigger loop
-  fails loudly instead of spinning.
-- **Book names contain spaces, and `curl` refuses them in a URL** — every
-  position-drop call died with `URL rejected: Malformed input to a URL
-  function`, which is why that hook now passes the name as a form field rather
-  than a path segment. Anything else built on these names must encode them.
+Note book names contain spaces, so anything built on them must encode them. That is
+already why `http_get_file_` percent-encodes each path segment, and it is what killed
+the old `curl` position-drop hook (`URL rejected: Malformed input to a URL function`).
 
 Two host-side tests worth keeping green:
-`hosts/alechomelab/webserver/booksync.test.js` (the merge rule, including the
-same-percentage case) and `tools/tests/json_scan_test.cpp` (the device's hand-rolled
-JSON scanner, under ASan/UBSan, including every truncation of a valid reply).
+`hosts/alechomelab/webserver/booksync.test.js` (the negotiation, including the
+confirm-before-unlink ordering) and `tools/tests/json_scan_test.cpp` (the device's
+hand-rolled JSON scanner, under ASan/UBSan, including every truncation of a valid
+reply).
 
 ## Serial protocol
 

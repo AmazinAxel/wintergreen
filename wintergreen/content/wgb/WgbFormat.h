@@ -35,6 +35,10 @@ namespace wintergreen {
 // to the layout changes these four bytes, so a stale file is rejected by the
 // existing magic check instead of being misparsed by a reader that trusted a
 // version number it did not understand. Bump the digit when the layout changes.
+// Deliberately *not* bumped for paragraph splitting. The on-disk layout is
+// unchanged — splitting only alters how many paragraphs a chapter holds — so an
+// older file parses correctly. It keeps the oversized paragraphs, so it stays
+// exposed to the heap abort until it is re-converted, but it opens and reads.
 static constexpr uint8_t kWgbMagic[4] = {'W', 'G', 'B', '2'};
 
 // ---------------------------------------------------------------------------
@@ -119,6 +123,32 @@ static constexpr uint8_t kWgbParaPageBreak = 3;
 static constexpr uint8_t kWgbAlignDefault = 0xFF;
 static constexpr int16_t kWgbIndentNone = 0x7FFF;
 static constexpr uint16_t kWgbSpacingDefault = 0xFFFF;
+
+// Text bytes above which the converter splits a paragraph into several.
+//
+// A paragraph is the device's indivisible layout unit — every word and line
+// vector for it is resident at once — so one oversized paragraph can abort the
+// reader on a device with tens of KB free. Project Gutenberg's Odyssey has a
+// 3,672-byte paragraph in its first preface, and reading that page with the BLE
+// clicker connected reproducibly aborted the device: the allocation that failed
+// was a 256-byte reserve, i.e. the heap was simply gone.
+//
+// The device budget is what sets this, not the shape of the input. Laying out a
+// paragraph costs roughly 4 bytes of heap per byte of text (a LayoutWord per
+// word at 16 bytes, plus a LayoutLine and its word vector per line), and the
+// clicker leaves about 13 KB free. 1,500 bytes therefore lays out in ~6 KB and
+// leaves room for the rest of the page; measured over four books, the worst page
+// peak falls from 25,823 B to under 11 KB.
+//
+// It also sits below ordinary prose's ceiling (~2,300 bytes across this repo's
+// test books), so a long paragraph in a normal book is now split too. That is
+// intended: the cut is invisible, and being under budget everywhere is worth
+// more than leaving big-but-not-pathological paragraphs whole.
+//
+// Splitting happens at a <br> where one exists, and otherwise between sentences.
+// Both are places a line break could already fall, so the rendered result is
+// unchanged — see write_split_text_paragraph_ and write_sentence_split_paragraph_.
+static constexpr size_t kSplitParagraphBytes = 700;
 static constexpr uint16_t kWgbNoImage = 0xFFFF;
 static constexpr uint8_t kWgbHrWidthDefault = 0xFF;
 

@@ -326,6 +326,12 @@ CONFIG_BT_NIMBLE_MSYS_2_BLOCK_COUNT=12
 CONFIG_ESP_COEX_SW_COEXIST_ENABLE=y
 
 # Buffers: bulk sequential TCP, one socket at a time.
+# Buffers: bulk sequential TCP, one socket at a time.
+#
+# Trimming these (4/8/8/4) was tried to make a sync fit alongside a resident
+# NimBLE host and did not work — stage 5 still failed, and the smaller pools
+# degraded the clicker too. esp_wifi_init's requirement is not dominated by
+# these counts.
 CONFIG_ESP_WIFI_STATIC_RX_BUFFER_NUM=6
 CONFIG_ESP_WIFI_DYNAMIC_RX_BUFFER_NUM=12
 CONFIG_ESP_WIFI_TX_BUFFER_TYPE=1

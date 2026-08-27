@@ -161,12 +161,30 @@ bool Book::write_sleep_cover_bin(const char* cover_path, int W, int H,
 
   auto& entry = epub_.zip().entry(static_cast<uint16_t>(idx));
 
-  // Pass 1: decode at panel size purely to locate the blank bands. Only the
-  // trim box is taken from this; none of its pixels reach the output.
+  // Pass 1: decode at panel size purely to locate the blank bands, and to
+  // measure the source tone range. Only the trim box and the histogram are
+  // taken from this; none of its pixels reach the output.
   DecodedImage probe;
+  ToneHistogram hist;
   if (decode_image_from_entry(file_, entry, static_cast<uint16_t>(W), static_cast<uint16_t>(H), probe,
-                              work_buf, work_buf_size, /*scale_to_fill=*/true) != ImageError::Ok)
+                              work_buf, work_buf_size, /*scale_to_fill=*/true, /*sink=*/nullptr,
+                              /*pixel_sink=*/nullptr, /*tone_lut=*/nullptr, &hist) != ImageError::Ok)
     return false;
+
+  // Contrast-stretch low-contrast covers. A cover whose tones all sit in the
+  // middle (a soft watercolour, a faded scan) dithers to a uniform speckle with
+  // no true black or paper white, and on a 1-bit panel in sunlight that reads as
+  // flat gray. Measured on "alice in wonderland": 46.5% ink with zero rows at
+  // either extreme, against ~95% (the hobbit) and ~10% (lord of the flies),
+  // both of which look right on the device untouched. build_stretch_lut
+  // declines when the image already spans the range, so those are unaffected.
+  //
+  // ponytail: 0.5% clip is a guess at how much of a cover may be specular
+  // highlight or printer's black. If a stretched cover looks blown out, raise
+  // it; if a faded one still looks flat, lower it.
+  uint8_t lut[256];
+  const bool stretch = build_stretch_lut(hist.bins, 0.005, lut);
+  const ToneLut tone = stretch ? lut : nullptr;
   if (probe.data.empty() || probe.width == 0 || probe.height == 0)
     return false;
 
@@ -201,9 +219,20 @@ bool Book::write_sleep_cover_bin(const char* cover_path, int W, int H,
   const size_t out_stride = (static_cast<size_t>(W) + 7) / 8;
   std::vector<uint8_t> out;
 
-  if (keep_w == cw && keep_h == ch) {
-    // Nothing to trim: the probe is already the final image at the right size.
+  if (keep_w == cw && keep_h == ch && !stretch) {
+    // Nothing to trim and no tone map: the probe is already the final image at
+    // the right size. With a stretch the probe is unusable — it was dithered
+    // from the raw tones — so fall through and decode again through the LUT.
     out = std::move(probe.data);
+  } else if (keep_w == cw && keep_h == ch) {
+    DecodedImage full;
+    if (decode_image_from_entry(file_, entry, static_cast<uint16_t>(W), static_cast<uint16_t>(H), full,
+                                work_buf, work_buf_size, /*scale_to_fill=*/true, /*sink=*/nullptr,
+                                /*pixel_sink=*/nullptr, tone) != ImageError::Ok)
+      return false;
+    if (full.data.empty() || full.width != W || full.height != H)
+      return false;
+    out = std::move(full.data);
   } else {
     // Pass 2: inflate the decode so the kept region scales up to exactly W x H,
     // then take that region out of it. Rounding up keeps the crop inside the
@@ -215,7 +244,8 @@ bool Book::write_sleep_cover_bin(const char* cover_path, int W, int H,
 
     DecodedImage full;
     if (decode_image_from_entry(file_, entry, static_cast<uint16_t>(dec_w), static_cast<uint16_t>(dec_h), full,
-                                work_buf, work_buf_size, /*scale_to_fill=*/true) != ImageError::Ok)
+                                work_buf, work_buf_size, /*scale_to_fill=*/true, /*sink=*/nullptr,
+                                /*pixel_sink=*/nullptr, tone) != ImageError::Ok)
       return false;
     if (full.data.empty() || full.width < W || full.height < H)
       return false;

@@ -529,12 +529,13 @@ void QuickmenuScreen::on_select(int index) {
       // device the two do not fit at once — a connect used to fail with the
       // host task unable to start (11 KB free), or succeed and then abort the
       // reader on its next page layout.
-      if (app_) {
-        if (runtime_->clicker_state() != ClickerState::Connected)
-          app_->release_ram_for_radio();
-        else
-          app_->restore_ram_after_radio();  // toggling off; the heap is ours again
-      }
+      // Synchronously, and only on the way up: bringup allocates the moment
+      // toggle_clicker() spawns its worker, so Application::update's own check
+      // a frame later is too late. The *restore* is left to that check, which
+      // keys on whether the stack still holds memory rather than on the
+      // connection state — a disconnect does not give the heap back.
+      if (app_ && runtime_->clicker_state() != ClickerState::Connected)
+        app_->release_ram_for_radio();
       // Returns immediately: connecting takes seconds. The row redraws as
       // "Connecting", and update() below repaints it when the outcome lands.
       runtime_->toggle_clicker();

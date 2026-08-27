@@ -165,11 +165,6 @@ class MainMenu final : public ListMenuScreen {
 
   // Last sync state painted, so the Sync row repaints when it changes.
   SyncState sync_shown_ = SyncState::Unavailable;
-  // TEMPORARY bring-up diagnostics shown on the Sync row; remove with
-  // wg_sync::FailStage once the sync is confirmed working.
-  uint8_t sync_fail_stage_ = 0;
-  uint32_t sync_fail_heap_kb_ = 0;
-  mutable char sync_label_buf_[32] = {};
   // Cached in update(): on_select() gets no runtime and the base class keeps
   // its own pointer private.
   IRuntime* sync_runtime_ = nullptr;

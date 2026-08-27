@@ -446,9 +446,54 @@ ImageError decode_image(const uint8_t* /*data*/, size_t /*size*/, uint16_t /*max
 // decode_image_from_entry — streaming decode from a ZIP entry (all platforms)
 // ---------------------------------------------------------------------------
 
+// Contrast stretch. A 1-bit panel in sunlight has no usable mid-tones: an image
+// whose samples all sit between (say) 0.3 and 0.6 dithers to a uniform speckle
+// with no true black or paper white to anchor contrast against, and reads as
+// flat gray. Mapping the source range onto the full 0..255 gives the ditherer
+// real extremes to work with.
+//
+// clip_frac is discarded at each end before measuring, so a handful of stray
+// pixels cannot pin the range wide open.
+bool build_stretch_lut(const uint32_t hist[256], double clip_frac, uint8_t lut[256]) {
+  uint64_t total = 0;
+  for (int i = 0; i < 256; ++i)
+    total += hist[i];
+  if (total == 0)
+    return false;
+
+  const uint64_t clip = static_cast<uint64_t>(static_cast<double>(total) * clip_frac);
+  int lo = 0, hi = 255;
+  uint64_t acc = 0;
+  for (int i = 0; i < 256; ++i) {
+    acc += hist[i];
+    if (acc > clip) { lo = i; break; }
+  }
+  acc = 0;
+  for (int i = 255; i >= 0; --i) {
+    acc += hist[i];
+    if (acc > clip) { hi = i; break; }
+  }
+  if (hi <= lo)
+    return false;
+
+  // Already spanning most of the range: stretching would only amplify noise.
+  if (lo < 16 && hi > 239)
+    return false;
+
+  const int span = hi - lo;
+  for (int i = 0; i < 256; ++i) {
+    int v = ((i - lo) * 255 + span / 2) / span;
+    if (v < 0) v = 0;
+    if (v > 255) v = 255;
+    lut[i] = static_cast<uint8_t>(v);
+  }
+  return true;
+}
+
 ImageError decode_image_from_entry(IZipFile& file, const ZipEntry& entry, uint16_t max_w, uint16_t max_h,
                                    DecodedImage& out, uint8_t* work_buf, size_t work_buf_size, bool scale_to_fill,
-                                   ImageRowSink* sink, ImagePixelSink* pixel_sink) {
+                                   ImageRowSink* sink, ImagePixelSink* pixel_sink,
+                                   ToneLut tone_lut, ToneHistogram* tone_hist) {
   // Detect format from the entry filename extension (fast, no I/O).
   auto fmt = guess_format(std::string(entry.name).c_str());
   if (fmt == ImageFormat::Unknown) {
@@ -462,11 +507,12 @@ ImageError decode_image_from_entry(IZipFile& file, const ZipEntry& entry, uint16
       tmp_buf = std::unique_ptr<uint8_t[]>(new (std::nothrow) uint8_t[ZipEntryInput::kMinWorkBufSize]);
       if (!tmp_buf) {
         // Last resort: try JPEG (most common image format in EPUBs).
-        auto err = decode_jpeg_from_entry(file, entry, max_w, max_h, out, work_buf, work_buf_size, scale_to_fill, sink);
+        auto err = decode_jpeg_from_entry(file, entry, max_w, max_h, out, work_buf, work_buf_size, scale_to_fill, sink,
+                                          tone_lut, tone_hist);
         if (err == ImageError::Ok)
           return err;
         return decode_png_from_entry(file, entry, max_w, max_h, out, work_buf, work_buf_size, scale_to_fill, sink,
-                                     pixel_sink);
+                                     pixel_sink, tone_lut, tone_hist);
       }
       peek_buf = tmp_buf.get();
       peek_buf_size = ZipEntryInput::kMinWorkBufSize;
@@ -488,10 +534,11 @@ ImageError decode_image_from_entry(IZipFile& file, const ZipEntry& entry, uint16
   }
 
   if (fmt == ImageFormat::Jpeg)
-    return decode_jpeg_from_entry(file, entry, max_w, max_h, out, work_buf, work_buf_size, scale_to_fill, sink);
+    return decode_jpeg_from_entry(file, entry, max_w, max_h, out, work_buf, work_buf_size, scale_to_fill, sink,
+                                  tone_lut, tone_hist);
   if (fmt == ImageFormat::Png)
     return decode_png_from_entry(file, entry, max_w, max_h, out, work_buf, work_buf_size, scale_to_fill, sink,
-                                 pixel_sink);
+                                 pixel_sink, tone_lut, tone_hist);
 
   return ImageError::UnsupportedFormat;
 }

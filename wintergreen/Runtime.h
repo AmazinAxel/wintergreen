@@ -72,6 +72,37 @@ class IRuntime {
   // the UI — so the caller watches clicker_state() for the outcome.
   virtual void toggle_clicker() {}
 
+  // Whether the BLE stack is currently holding heap. **Not the same as being
+  // connected**: the NimBLE host and esp_hidh are initialised once per boot and
+  // never deinitialised (deinit panics on this IDF), so they keep their
+  // allocation across a disconnect. The reader sizes its caches off this, so
+  // that a disconnect does not restore a full working set on top of a stack
+  // that still owns its memory.
+  virtual bool clicker_holds_ram() const {
+    return false;
+  }
+
+  // Free heap, for callers deciding whether to do optional work. The reader
+  // uses it to skip its speculative next-page layout when the margin is too
+  // thin — that layout is what tips a long-paragraph book into an abort.
+  // UINT32_MAX on a host build, where the question does not arise.
+  virtual uint32_t free_memory_bytes() const {
+    return UINT32_MAX;
+  }
+
+  // Largest single allocation the heap can currently satisfy.
+  //
+  // **This, not free_memory_bytes(), is what a guard before allocating must
+  // use.** IDF's own header says so: total free size says nothing about whether
+  // one block of that size exists, because the heap fragments. Guarding on the
+  // total let a page layout through with 24 KB "free" and then abort on a
+  // 1,416-byte request — reproducibly, on an ordinary forward page turn.
+  //
+  // UINT32_MAX on a host build.
+  virtual uint32_t largest_free_block_bytes() const {
+    return UINT32_MAX;
+  }
+
   // Clicker battery percentage, 0 when it has not reported one. Sampled once on
   // connect and then held: a number that drifts while you read is worse than a
   // slightly stale one.
@@ -90,16 +121,5 @@ class IRuntime {
   // Returns immediately; a sync takes seconds and runs on its own task. The
   // caller watches sync_state() for the outcome.
   virtual void start_sync() {}
-
-  // TEMPORARY bring-up diagnostics: stage of the last sync failure and the free
-  // internal RAM at that moment, shown on the Sync row. Remove both once the
-  // sync is confirmed working on hardware — the row is a switch, not a status
-  // console, exactly as with the clicker.
-  virtual uint8_t sync_fail_stage() const {
-    return 0;
-  }
-  virtual uint32_t sync_fail_heap_kb() const {
-    return 0;
-  }
 };
 }  // namespace wintergreen

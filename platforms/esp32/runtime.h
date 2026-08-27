@@ -1,6 +1,8 @@
 #pragma once
 
 #include <cstdint>
+
+#include "esp_heap_caps.h"
 #include <optional>
 
 #include "esp_adc/adc_cali.h"
@@ -129,6 +131,15 @@ class Esp32Runtime final : public wintergreen::IRuntime {
   void toggle_clicker() override {
     wg_clicker::toggle();
   }
+  bool clicker_holds_ram() const override {
+    return wg_clicker::holds_ram();
+  }
+  uint32_t free_memory_bytes() const override {
+    return static_cast<uint32_t>(heap_caps_get_free_size(MALLOC_CAP_INTERNAL));
+  }
+  uint32_t largest_free_block_bytes() const override {
+    return static_cast<uint32_t>(heap_caps_get_largest_free_block(MALLOC_CAP_INTERNAL));
+  }
   uint8_t clicker_battery_pct() const override {
     return wg_clicker::battery_pct();
   }
@@ -140,13 +151,6 @@ class Esp32Runtime final : public wintergreen::IRuntime {
   }
   void start_sync() override {
     wg_sync::start();
-  }
-  // TEMPORARY — remove with wg_sync::FailStage.
-  uint8_t sync_fail_stage() const override {
-    return wg_sync::fail_stage();
-  }
-  uint32_t sync_fail_heap_kb() const override {
-    return wg_sync::fail_heap_kb();
   }
 
  private:

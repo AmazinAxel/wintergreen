@@ -416,6 +416,18 @@ void HomeScreen::update(const ButtonState& buttons, DrawBuffer& buf, IRuntime& r
     return;
   }
 
+  // A rising edge with the button not down is an injected press (the BLE
+  // clicker sets only pressed_latch, never current), so there is no release to
+  // wait for and no hold to distinguish. Open the plain list at once.
+  if (!back_down && buttons.is_pressed(Button::Button0) && !back_was_down_) {
+    back_hold_ms_ = 0;
+    if (app_) {
+      app_->main_menu()->set_show_hidden(false);
+      app_->push_screen(ScreenId::MainMenu);
+    }
+    return;
+  }
+
   if (back_down) {
     back_was_down_ = true;
     if (!back_consumed_) {
@@ -458,14 +470,19 @@ void HomeScreen::draw_all_(DrawBuffer& buf, std::optional<uint8_t> battery_pct) 
   static constexpr int kHeroGap    = 24; // header rule → cover box
   static constexpr int kTitleGap   = 26; // cover box → title baseline block
   static constexpr int kAuthorGap  = 6;
-  static constexpr int kDotsGap    = 26;
+  // 24, not 26: kDotRing grew by 1 (2 px of dots_h), and kHomeCoverH mirrors
+  // this layout. Absorbing it here keeps box_h — and so the cover — unchanged.
+  static constexpr int kDotsGap    = 24;
   static constexpr int kBottomPad  = 28;
   static constexpr int kDotR       = 5;   // filled diamond, selected
-  static constexpr int kDotRing    = 9;   // outline diamond around the selected one
+  // Outline diamond around the selected one: 2 px thick, held 3 px clear of the
+  // filled dot. Inner edge is kDotRing - kDotRingW, so this is kDotR + 3 + 2.
+  static constexpr int kDotRing    = 10;
+  static constexpr int kDotRingW   = 2;
   static constexpr int kDotRSmall  = 3;   // unselected: a step down from the filled one
   static constexpr int kDotStep    = 28;
-  static constexpr int kFrameGap   = 10;  // white gap between cover and its frame
-  static constexpr int kFrameW     = 2;   // frame thickness
+  static constexpr int kFrameGap   = 6;  // white gap between cover and its frame
+  static constexpr int kFrameW     = 4;  // frame thickness
 
   const BitmapFont& tf = ui_font_;                                         // title
   const BitmapFont& af = author_font_.valid() ? author_font_ : ui_font_;   // author
@@ -566,7 +583,7 @@ void HomeScreen::draw_all_(DrawBuffer& buf, std::optional<uint8_t> battery_pct) 
     const int dx = dots_x0 + i * kDotStep;
     if (i == sel) {
       draw_diamond(buf, dx, dots_cy, kDotR);
-      draw_diamond_outline(buf, dx, dots_cy, kDotRing, kFrameW);
+      draw_diamond_outline(buf, dx, dots_cy, kDotRing, kDotRingW);
     } else {
       draw_diamond(buf, dx, dots_cy, kDotRSmall);
     }

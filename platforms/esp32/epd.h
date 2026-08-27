@@ -207,32 +207,6 @@ class EInkDisplay : public wintergreen::IDisplay {
     refreshDisplay(EPD_FAST_REFRESH, /*turnOffScreen=*/false, /*wait=*/false);
   }
 
-  void write_ram_bw(const uint8_t* data) override {
-    wakeIfNeeded();
-    waitWhileBusy();
-    setRamArea(0, 0, DISPLAY_WIDTH, DISPLAY_HEIGHT);
-    writeRamBuffer(CMD_WRITE_RAM_BW, data, BUFFER_SIZE);
-  }
-
-  void write_ram_red(const uint8_t* data) override {
-    wakeIfNeeded();
-    waitWhileBusy();
-    setRamArea(0, 0, DISPLAY_WIDTH, DISPLAY_HEIGHT);
-    writeRamBuffer(CMD_WRITE_RAM_RED, data, BUFFER_SIZE);
-  }
-
-  // The only grayscale path left. kLutFactoryQuality drives each pixel to an
-  // absolute level with no dependence on its prior state, so the sleep image
-  // lands in one update. The multi-pass kLutGrayscale/kLutGrayscaleRevert pair
-  // is gone: it was unreachable once antialiased reader text was removed, and
-  // the serial LUT-upload commands that tuned it went with the debug console.
-  void grayscale_refresh_1pass(bool turnOffScreen = false) override {
-    setCustomLUT_(kLutFactoryQuality);
-    refreshDisplay(EPD_FAST_REFRESH, turnOffScreen);
-    setCustomLUT_(nullptr);
-  }
-
-
   // ---------------------------------------------------------------------------
   // There is deliberately NO idle rails-off here. Do not add one back.
   //

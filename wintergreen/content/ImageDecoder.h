@@ -129,6 +129,25 @@ struct ImagePixelSink {
   void* ctx = nullptr;
 };
 
+// Optional 256-entry tone map applied to each grayscale sample before it is
+// dithered. nullptr = identity. Used by the sleep cover to contrast-stretch a
+// low-contrast cover into the panel's 1-bit range; see build_stretch_lut.
+using ToneLut = const uint8_t*;
+
+// Build a contrast-stretch LUT from a grayscale histogram.
+// hist: 256 bin counts. clip_frac: fraction of pixels allowed to saturate at
+// each end (e.g. 0.005 = 0.5%). Returns false when the image already spans a
+// usable range, in which case lut is left untouched and should not be applied.
+bool build_stretch_lut(const uint32_t hist[256], double clip_frac, uint8_t lut[256]);
+
+// Accumulates a grayscale histogram of the samples a decode passes to the
+// ditherer. Non-null = collect; the decode is otherwise unaffected. This is how
+// the sleep cover's probe pass learns the source tone range without a separate
+// grayscale decode path.
+struct ToneHistogram {
+  uint32_t bins[256] = {};
+};
+
 // Decode an image to 1-bit dithered bitmap.
 // Input: raw image data (JPEG or PNG).
 // Output: DecodedImage with packed 1-bit pixels.
@@ -145,7 +164,8 @@ ImageError decode_image(const uint8_t* data, size_t size, uint16_t max_w, uint16
 // being stored in out.data. out.width/height are still set.
 ImageError decode_jpeg_from_entry(IZipFile& file, const ZipEntry& entry, uint16_t max_w, uint16_t max_h,
                                   DecodedImage& out, uint8_t* work_buf = nullptr, size_t work_buf_size = 0,
-                                  bool scale_to_fill = false, ImageRowSink* sink = nullptr);
+                                  bool scale_to_fill = false, ImageRowSink* sink = nullptr,
+                                  ToneLut tone_lut = nullptr, ToneHistogram* tone_hist = nullptr);
 
 // Decode a PNG image by streaming directly from a ZIP entry.
 // Same work_buf, scale_to_fill, and sink semantics as decode_jpeg_from_entry.
@@ -154,7 +174,8 @@ ImageError decode_jpeg_from_entry(IZipFile& file, const ZipEntry& entry, uint16_
 ImageError decode_png_from_entry(IZipFile& file, const ZipEntry& entry, uint16_t max_w, uint16_t max_h,
                                  DecodedImage& out, uint8_t* work_buf = nullptr, size_t work_buf_size = 0,
                                  bool scale_to_fill = false, ImageRowSink* sink = nullptr,
-                                 ImagePixelSink* pixel_sink = nullptr);
+                                 ImagePixelSink* pixel_sink = nullptr,
+                                 ToneLut tone_lut = nullptr, ToneHistogram* tone_hist = nullptr);
 
 // Decode a JPEG or PNG image by streaming from a ZIP entry.
 // Detects format from the first bytes of the entry.
@@ -165,7 +186,8 @@ ImageError decode_png_from_entry(IZipFile& file, const ZipEntry& entry, uint16_t
 ImageError decode_image_from_entry(IZipFile& file, const ZipEntry& entry, uint16_t max_w, uint16_t max_h,
                                    DecodedImage& out, uint8_t* work_buf = nullptr, size_t work_buf_size = 0,
                                    bool scale_to_fill = false, ImageRowSink* sink = nullptr,
-                                   ImagePixelSink* pixel_sink = nullptr);
+                                   ImagePixelSink* pixel_sink = nullptr,
+                                   ToneLut tone_lut = nullptr, ToneHistogram* tone_hist = nullptr);
 
 // Floyd-Steinberg dither a grayscale buffer to 1-bit packed bitmap.
 // grayscale: width*height bytes, 0=black, 255=white.

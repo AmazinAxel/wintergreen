@@ -99,10 +99,9 @@ void MainMenu::on_start() {
 }
 
 void MainMenu::update(const ButtonState& buttons, DrawBuffer& buf, IRuntime& runtime) {
-  // Detect external mutations (serial upload/delete/rename) while this screen
-  // is visible. The generation counter is bumped by BookIndex on every
-  // mutation that changes the logical contents.
-  // todo we can get rid of this
+  // A sync that downloaded books bumps the generation (wifi_sync.h) while this
+  // screen is visible; without this they don't appear until you navigate away
+  // and back.
   if (cached_generation_ != BookIndex::instance().generation()) {
     cached_generation_ = BookIndex::instance().generation();
     populate_list_();
@@ -118,9 +117,6 @@ void MainMenu::update(const ButtonState& buttons, DrawBuffer& buf, IRuntime& run
   const SyncState sync_now = runtime.sync_state();
   if (sync_now != sync_shown_) {
     sync_shown_ = sync_now;
-    // TEMPORARY, with the failure label in get_item_label.
-    sync_fail_stage_ = runtime.sync_fail_stage();
-    sync_fail_heap_kb_ = runtime.sync_fail_heap_kb();
     draw_all_(buf, runtime.battery_percentage());
     buf.refresh();
   }
@@ -309,16 +305,6 @@ std::string_view MainMenu::get_item_label(int index) const {
     switch (sync_shown_) {
       case SyncState::Working: return "Syncing";
       case SyncState::Done:    return "Synced";
-      // TEMPORARY: show why it failed while the feature is being brought up.
-      // Remove this case (and sync_fail_*) once sync is confirmed on hardware.
-      case SyncState::Failed:
-        if (sync_fail_stage_ != 0) {
-          std::snprintf(sync_label_buf_, sizeof(sync_label_buf_), "Sync (fail %u, %uk)",
-                        static_cast<unsigned>(sync_fail_stage_),
-                        static_cast<unsigned>(sync_fail_heap_kb_));
-          return sync_label_buf_;
-        }
-        return "Sync";
       default: return "Sync";
     }
   }

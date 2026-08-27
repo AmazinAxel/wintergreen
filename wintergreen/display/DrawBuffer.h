@@ -55,18 +55,6 @@ class IDisplay {
   // Partial refresh: new_pixels -> BW RAM, then fire the waveform without waiting.
   virtual void partial_refresh(const uint8_t* new_pixels) = 0;
 
-  // Write data to BW / RED RAM only (no refresh). The two planes of a sleep image.
-  virtual void write_ram_bw(const uint8_t* data) {
-    (void)data;
-  }
-  virtual void write_ram_red(const uint8_t* data) {
-    (void)data;
-  }
-
-  // Trigger a one-pass grayscale refresh using kLutFactoryQuality.
-  // RAM encoding: state = (red_bit << 1) | bw_bit; 0=white, 1=light, 2=dark, 3=black.
-  virtual void grayscale_refresh_1pass(bool turnOffScreen = false) {}
-
   // Put the display controller into deep sleep (low-power mode).
   virtual void deep_sleep() {}
 
@@ -583,9 +571,6 @@ class DrawBuffer {
     return true;
   }
 
-  void invalidate_spare() {
-    spare_use_ = Spare::None;
-  }
   // Block until the panel has finished any outstanding refresh. Call before SD
   // access: the card shares SPI2 with the display and concurrent traffic corrupts
   // an update in flight.
@@ -598,13 +583,6 @@ class DrawBuffer {
     display_.deep_sleep();
   }
 
-
-  // Write the displayed frame to BW RAM. The panel drives the whole screen from
-  // BW RAM, so this is how a caller guarantees the controller agrees with what is
-  // on the glass before doing something that reads it back.
-  void sync_bw_ram() {
-    display_.write_ram_bw(active_());
-  }
 
   // Point at the MGR2 sleep image. On device this is the mmapped `sleep`
   // partition (see font_partition.h) — no copy, no decompression, no file I/O
@@ -840,7 +818,7 @@ class DrawBuffer {
   uint8_t* draw_target_ = nullptr;
   int active_idx_ = 0;
   Rotation rotation_ = Rotation::Deg90;
-  bool sunlight_fading_fix_ = false;
+  bool sunlight_fading_fix_ = true;
 
   // MGR2 sleep image, pointing into memory-mapped flash (set_sleep_image).
   const uint8_t* sleep_img_ = nullptr;
@@ -896,80 +874,54 @@ class DrawBuffer {
     }
   };
 
-  // Decode MGR2 into both RAM planes in one pass over the source.
+  // Decode MGR2 into the inactive buffer and paint it with RefreshMode::Half.
   //
-  // Both planes are bits of the same 2-bit value, so the previous two passes
-  // read (and bit-twiddled) every pixel twice — ~377k iterations each, with a
-  // divide and a variable shift per pixel — to produce data already in hand.
-  // One pass builds both bytes together, 8 pixels at a time: 4 pixels per source
-  // byte means one output byte is exactly two source bytes, so the inner loop is
-  // a fixed unroll with no per-pixel indexing.
+  // This used to build both RAM planes and fire grayscale_refresh_1pass. That
+  // was dropped for two reasons, and the first is the reason it looked wrong:
   //
-  // BW goes to the inactive buffer as before; RED needs its own kBufSize, which
-  // is what the spare is for. Without the spare (Wi-Fi sync released it) fall
-  // back to decoding RED in a second pass.
+  // kLutFactoryQuality staggers its phases by level. Over G0's 24 frames LUT0
+  // (black) is idle (VS 0x00) while LUT3 (white) oscillates (0xA8), so the
+  // wordmark settled almost immediately and the background churned around it
+  // for the bulk of the update — read on the glass as "wordmark first, then the
+  // screen flashes". That ordering is baked into the LUT, not into anything
+  // sequenced here, so the only fix is a different waveform.
+  //
+  // Half is the same waveform the sleep *cover* has always used
+  // (Application.cpp's show_book_cover_sleep_), which does not have the symptom.
+  //
+  // Second, it costs nothing to give up: resources/sleep.mgr holds only levels
+  // 0 and 3 — 360,074 white and 23,926 black pixels, no gray anywhere — so the
+  // grayscale path had no intermediate tones to render. A 4-level MGR2 would now
+  // quantise to black/white at the 50% point; if one is ever shipped, that is the
+  // line to revisit.
+  //
+  // Half sends CTRL1_BYPASS_RED, so RED is ignored: no second plane, and hence
+  // no need for the spare buffer or its without-the-spare fallback. Note the
+  // polarity flip — the grayscale decode set a bit for *ink*, while ordinary
+  // drawing (see fill()/blit_1bit_row) uses set = white, which is what
+  // full_refresh consumes.
   void show_mgr2_sleep_(Mgr2Source_& src) {
     const int rows = std::min<int>(src.h, DisplayFrame::kPhysicalHeight);
-    const int full_bytes = std::min<int>(src.w / 8, DisplayFrame::kStride);
 
-    auto decode_row = [&](const uint8_t* sr, uint8_t* bw, uint8_t* red) {
-      for (int b = 0; b < full_bytes; ++b) {
-        const uint8_t s0 = sr[b * 2], s1 = sr[b * 2 + 1];
-        uint8_t bw_byte = 0, red_byte = 0;
-        // s0 holds pixels 0-3, s1 pixels 4-7, each 2 bits, MSB-first.
-        for (int i = 0; i < 4; ++i) {
-          const uint8_t v = (s0 >> (6 - i * 2)) & 0x3;
-          bw_byte |= static_cast<uint8_t>((v & 1) << (7 - i));
-          red_byte |= static_cast<uint8_t>((v >> 1) << (7 - i));
-        }
-        for (int i = 0; i < 4; ++i) {
-          const uint8_t v = (s1 >> (6 - i * 2)) & 0x3;
-          bw_byte |= static_cast<uint8_t>((v & 1) << (3 - i));
-          red_byte |= static_cast<uint8_t>((v >> 1) << (3 - i));
-        }
-        bw[b] = bw_byte;
-        red[b] = red_byte;
+    // Anything the image does not cover stays white, as the old fill(false)
+    // + per-plane decode left it.
+    memset(inactive_(), 0xFF, kBufSize);
+    const int cols = std::min<int>(src.w, DisplayFrame::kPanelWidth);
+    for (int y = 0; y < rows; ++y) {
+      const uint8_t* src_row = src.get_row(static_cast<uint16_t>(y));
+      uint8_t* dst = inactive_() + static_cast<size_t>(y) * DisplayFrame::kStride;
+      for (int x = 0; x < cols; ++x) {
+        // 0 = white, 1 = light, 2 = dark, 3 = black; threshold at the midpoint.
+        const uint8_t v = (src_row[x / 4] >> (6 - (x % 4) * 2)) & 0x3;
+        if (v >= 2)
+          dst[x / 8] &= static_cast<uint8_t>(~(0x80u >> (x % 8)));
       }
-      // Tail pixels beyond the last whole byte, if the image is not 8-aligned.
-      for (int x = full_bytes * 8; x < static_cast<int>(src.w) && x < DisplayFrame::kPanelWidth; ++x) {
-        const uint8_t v = (sr[x / 4] >> (6 - (x % 4) * 2)) & 0x3;
-        const uint8_t mask = static_cast<uint8_t>(0x80 >> (x % 8));
-        if (v & 1) bw[x / 8] |= mask;
-        if (v >> 1) red[x / 8] |= mask;
-      }
-    };
-
-    uint8_t* red_buf = spare_;
-    if (red_buf) {
-      memset(inactive_(), 0x00, kBufSize);
-      memset(red_buf, 0x00, kBufSize);
-      spare_use_ = Spare::None;  // contents destroyed; nothing survives sleep anyway
-      for (int y = 0; y < rows; ++y)
-        decode_row(src.get_row(static_cast<uint16_t>(y)),
-                   inactive_() + static_cast<size_t>(y) * DisplayFrame::kStride,
-                   red_buf + static_cast<size_t>(y) * DisplayFrame::kStride);
-      display_.write_ram_bw(inactive_());
-      display_.write_ram_red(red_buf);
-    } else {
-      auto decode_pass = [&](bool red_bit) {
-        fill(false);
-        for (int y = 0; y < rows; ++y) {
-          const uint8_t* src_row = src.get_row(static_cast<uint16_t>(y));
-          uint8_t* dst = inactive_() + static_cast<size_t>(y) * DisplayFrame::kStride;
-          for (int x = 0; x < static_cast<int>(src.w); x++) {
-            int state = (src_row[x / 4] >> (6 - (x % 4) * 2)) & 0x3;
-            if (red_bit ? (state >> 1) : (state & 1))
-              dst[x / 8] |= static_cast<uint8_t>(0x80 >> (x % 8));
-          }
-        }
-      };
-      decode_pass(false);
-      display_.write_ram_bw(inactive_());
-      decode_pass(true);
-      display_.write_ram_red(inactive_());
     }
 
-    display_.grayscale_refresh_1pass(/*turnOffScreen=*/true);
+    // Blitted in physical panel coordinates with no offset, matching the format
+    // note in CLAUDE.md: the image is native-size, not scaled or centred.
+    display_.full_refresh(inactive_(), active_(), RefreshMode::Half,
+                          /*turnOffScreen=*/true);
     display_.deep_sleep();
   }
 

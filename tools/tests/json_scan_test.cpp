@@ -3,10 +3,10 @@
 // server, but it runs on a device with no way to report a crash, so the
 // truncation loop at the bottom matters more than the happy path.
 //
-// It cannot include wifi_sync.h (that pulls in ESP-IDF), so the three functions
+// It cannot include wifi_sync.h (that pulls in ESP-IDF), so the two functions
 // are extracted by line range. Re-extract if they move:
 //
-//   sed -n '187,262p' platforms/esp32/wifi_sync.h > frag.inc
+//   sed -n '187,219p' platforms/esp32/wifi_sync.h > frag.inc
 //
 // Run:
 //   nix-shell -p gcc --run \
@@ -22,8 +22,7 @@
 int main() {
   // A realistic server reply.
   const std::string r =
-    R"({"get":["Snow Crash","The Hobbit"],"delete":["Dune"],)"
-    R"("pos":{"Neuromancer":[9,3,0,41002],"Alice":[0,1,2,3]}})";
+    R"({"get":["Snow Crash","The Hobbit"],"delete":["Dune"]})";
 
   auto get = parse_string_array_(r, find_key_(r, "get"));
   assert(get.size() == 2);
@@ -33,22 +32,14 @@ int main() {
   auto del = parse_string_array_(r, find_key_(r, "delete"));
   assert(del.size() == 1 && del[0] == "Dune");
 
-  auto pos = parse_pos_object_(r, find_key_(r, "pos"));
-  assert(pos.size() == 2);
-  assert(pos[0].dir == "Neuromancer");
-  assert(pos[0].v[0]==9 && pos[0].v[1]==3 && pos[0].v[2]==0 && pos[0].v[3]==41002);
-  assert(pos[1].dir == "Alice");
-  assert(pos[1].v[3] == 3);
-
   // Empty everything — the no-op sync response.
-  const std::string e = R"({"get":[],"delete":[],"pos":{}})";
+  const std::string e = R"({"get":[],"delete":[]})";
   assert(parse_string_array_(e, find_key_(e, "get")).empty());
-  assert(parse_pos_object_(e, find_key_(e, "pos")).empty());
+  assert(parse_string_array_(e, find_key_(e, "delete")).empty());
 
   // Missing keys must not crash or invent entries.
   const std::string m = R"({})";
   assert(parse_string_array_(m, find_key_(m, "get")).empty());
-  assert(parse_pos_object_(m, find_key_(m, "pos")).empty());
 
   // Escapes in a book name.
   const std::string esc = R"({"get":["A \"quoted\" book","back\\slash"]})";
@@ -61,7 +52,7 @@ int main() {
   for (size_t n = 0; n < r.size(); ++n) {
     const std::string cut = r.substr(0, n);
     parse_string_array_(cut, find_key_(cut, "get"));
-    parse_pos_object_(cut, find_key_(cut, "pos"));
+    parse_string_array_(cut, find_key_(cut, "delete"));
   }
   std::printf("json ok\n");
 }

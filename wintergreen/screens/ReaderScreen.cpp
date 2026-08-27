@@ -129,6 +129,7 @@ void ReaderScreen::sample_battery_(IRuntime& runtime) {
 void ReaderScreen::start(DrawBuffer& buf, IRuntime& runtime) {
   sample_battery_(runtime);
   buf_ = &buf;
+  runtime_ = &runtime;
   snapshot_ok_ = false;  // a fresh book must never resume into a previous one's pixels
   predrawn_.valid = false;
   pos_written_valid_ = false;
@@ -177,6 +178,11 @@ void ReaderScreen::start(DrawBuffer& buf, IRuntime& runtime) {
   layout_engine_.set_source(*chapter_src_);
   layout_engine_.set_image_size_fn(image_size_fn_);
   layout_engine_.set_hyphenation_lang(detect_language(wgb_.metadata().language));
+  // Not done here: the step-back needs a laid-out engine, and set_font/
+  // set_options happen inside render_page_. Doing it at this point laid out
+  // with font_ still null and took a load fault. render_page_ consumes the
+  // flag once, after the engine is fully configured.
+  resume_back_pending_ = config::kResumeOnePageBack;
   render_page_(buf);
   return;
 
@@ -203,6 +209,7 @@ void ReaderScreen::pause() {
 void ReaderScreen::resume(DrawBuffer& buf, IRuntime& runtime) {
   sample_battery_(runtime);
   buf_ = &buf;
+  runtime_ = &runtime;
   if (app_)
     buf.set_rotation(rotation_from_setting(app_->rotate_reader()));
   if (!open_ok_)
@@ -369,7 +376,7 @@ void ReaderScreen::update(const ButtonState& buttons, DrawBuffer& buf, IRuntime&
     // overwhelmingly likely to go forward again. A backward turn already leaves
     // prev_page_()'s layout in page_cache_.
     if (page_delta > 0)
-      prerender_next_page_(buf);
+      prerender_next_page_(buf, runtime);
   }
 }
 
@@ -387,7 +394,7 @@ void ReaderScreen::update(const ButtonState& buttons, DrawBuffer& buf, IRuntime&
 // LayoutWord::text pointers into WgbChapterSource's 32-slot paragraph window are
 // dead the moment the window slides, which is exactly what laying out the next
 // page does. See "Page-turn latency" in CLAUDE.md.
-void ReaderScreen::prerender_next_page_(DrawBuffer& buf) {
+void ReaderScreen::prerender_next_page_(DrawBuffer& buf, IRuntime& runtime) {
   predrawn_.valid = false;
   if (!open_ok_ || !chapter_src_ || page_.at_chapter_end)
     return;  // a chapter crossing needs load_chapter_(); not worth doing speculatively
@@ -416,6 +423,19 @@ void ReaderScreen::prerender_next_page_(DrawBuffer& buf) {
   // that has none to spare, and it is where split_words' reserve threw
   // std::bad_alloc (an abort, with exceptions off).
   if (!buf.can_offscreen())
+    return;
+
+  // **Skip the speculative page when the heap is low.** This whole function is
+  // an optimisation — it lays out and draws the *next* page so a forward turn
+  // is a memcpy — but it doubles the layout memory live at once, and on a book
+  // with long paragraphs (the Odyssey) that is what tips the device over:
+  // free heap fell 51 KB -> 14 KB within three page turns and the next
+  // allocation aborted, with this function on the stack every time.
+  //
+  // Skipping costs a slower page turn. Not skipping costs a reboot mid-book,
+  // so the trade is not close. The threshold is well above one page's layout
+  // so that the *real* page after this one still has room.
+  if (runtime.largest_free_block_bytes() < kPrerenderMinBlockBytes)
     return;
 
   const PagePosition cur_pos = page_pos_;
@@ -450,8 +470,24 @@ void ReaderScreen::prerender_next_page_(DrawBuffer& buf) {
   // layout above is still cached, so the turn is a normal render rather than a
   // memcpy. Must not fall through: begin_offscreen would otherwise leave
   // draw_target_ pointing at the live buffer.
+  // **Re-check before drawing.** The layout above is itself the largest
+  // allocation this function makes, so the guard at the top of the function was
+  // testing the heap as it stood *before* the speculative page existed. Drawing
+  // now runs render_page_, which allocates again — and if its own guard fires it
+  // drops the page cache this function just filled, so the draw re-lays the same
+  // page out with even less room. Bail instead: the layout stays cached, so the
+  // next turn is a normal render rather than a memcpy.
+  if (runtime.largest_free_block_bytes() < kLayoutMinBlockBytes) {
+    page_ = cur_meta;
+    page_pos_ = cur_pos;
+    layout_engine_.set_position(cur_pos);
+    return;
+  }
+
   if (!has_image && buf.begin_offscreen()) {
+    in_prerender_draw_ = true;
     render_page_(buf);  // consumes the cached layout and draws into the spare buffer
+    in_prerender_draw_ = false;
     buf.end_offscreen();
 
     predrawn_.valid = true;
@@ -523,11 +559,6 @@ void ReaderScreen::load_chapter_(size_t idx) {
   if (idx < wgb_.chapter_count()) {
     chapter_src_ = std::make_unique<WgbChapterSource>(wgb_, static_cast<uint16_t>(idx));
     chapter_idx_ = idx;
-    // A fresh source starts with the full 32-slot window; re-apply the cap when
-    // a radio is up, or changing chapter while connected undoes release_caches()
-    // and the heap goes straight back to where it was crashing.
-    if (radio_ram_hold_)
-      chapter_src_->set_window_limit(4);
     layout_engine_.set_source(*chapter_src_);
   }
 }
@@ -551,14 +582,59 @@ void ReaderScreen::render_page_(DrawBuffer& buf) {
   layout_engine_.set_font(font);
   layout_engine_.set_options(opts);
   last_opts_ = opts;
+  // Step back one page on a fresh open (config::kResumeOnePageBack). It has to
+  // land here rather than in start(): prev_page_() runs a backward layout, and
+  // the engine has no font or options until the two calls above.
+  if (resume_back_pending_) {
+    resume_back_pending_ = false;
+    resume_one_page_back_();
+  }
   // resolve_stable_position can move page_pos_, so the cache is keyed on the
   // resolved value — checking before this point would match the wrong page.
   page_pos_ = layout_engine_.resolve_stable_position(page_pos_);
   layout_engine_.set_position(page_pos_);
 
   const bool cached = take_cached_page_(page_pos_, opts);
-  if (!cached)
+  if (!cached) {
+    // **Last line of defence before laying out.** Exceptions are off, so a
+    // std::bad_alloc inside layout is an abort() — the device reboots mid-book
+    // with no message, which is what reading with the clicker connected did.
+    // There is no way to recover after the fact, so the only option is to check
+    // before allocating.
+    //
+    // Everything dropped here is a cache that rebuilds on demand, so the cost is
+    // a slower page turn. The page still renders.
+    // Not while drawing a speculative page: prerender_next_page_ has already
+    // made this check and put the layout it wants in page_cache_, so dropping
+    // the cache here would make it lay the same page out again with less room
+    // than the check was made against — the opposite of what the guard is for.
+    if (!in_prerender_draw_ && runtime_) {
+      const uint32_t block = runtime_->largest_free_block_bytes();
+      // **Two stages, because one threshold kept being not quite enough.** The
+      // failures have all been small allocations (192, 256, 1212, 1416 bytes) on
+      // a fragmented heap, which means the margin was thinner than any single
+      // number predicted. Shedding early and cheaply is better than shedding
+      // late and completely.
+      if (block < kLayoutShedBlockBytes) {
+        // Mild pressure: give back the speculative page and the one-page cache.
+        // Both are pure latency optimisations and cost nothing to rebuild.
+        page_cache_ = LaidOutPageCache{};
+        predrawn_.valid = false;
+      }
+      if (block < kLayoutMinBlockBytes) {
+        // Real pressure: also hand back the paragraph cache and stop it
+        // refilling. This is the state the reader runs in with a radio up.
+        layout_engine_.release_cache_memory();
+        layout_engine_.set_cache_limit(1);
+        // The spare framebuffer is deliberately *not* released here. It is 48 KB
+        // and tempting, but render_page_ can be reached from inside an offscreen
+        // draw, and freeing the buffer being drawn into is worse than the abort
+        // this is preventing. Application::release_ram_for_radio() is where the
+        // spare is given back, on a path that owns the whole frame.
+      }
+    }
     page_ = layout_engine_.layout();
+  }
 
   // ─────────────────────────────────
   struct ImageToDraw {
@@ -719,6 +795,7 @@ bool ReaderScreen::next_page_() {
   return true;
 }
 
+
 bool ReaderScreen::prev_page_() {
   if (page_pos_ == PagePosition{0, 0}) {
     if (chapter_idx_ > 0) {
@@ -737,14 +814,107 @@ bool ReaderScreen::prev_page_() {
   // If the current page starts mid-image, snap end to the bottom of that image
   // so layout_backward produces the page ending at the image bottom — which
   // naturally includes the full image (rows 0..end) plus whatever text fits above.
+  const PagePosition cur_start = page_pos_;
+
+  // **Same pre-check render_page_ makes, for the same reason.** A backward turn
+  // lays out at least one page and the resync below can lay out three more, and
+  // none of that was guarded — a `std::bad_alloc` here is an abort() and a reboot
+  // mid-book, which is exactly what scrolling back through a book with the
+  // clicker connected produced. The caches dropped are rebuilt on demand.
+  const bool heap_tight = runtime_ && runtime_->largest_free_block_bytes() < kLayoutMinBlockBytes;
+  if (heap_tight) {
+    page_cache_ = LaidOutPageCache{};
+    predrawn_.valid = false;
+    layout_engine_.release_cache_memory();
+    layout_engine_.set_cache_limit(1);
+  }
+
   PagePosition end = layout_engine_.snap_to_image_end(page_pos_);
   layout_engine_.set_position(end);
   auto pc = layout_engine_.layout_backward();
+
+  // Forward and backward now share one line-fitting rule (see
+  // require_full_height in TextLayout), which removed the systematic
+  // disagreement. What is left is structural: a page ending at a PageBreak, or
+  // at the end of a chapter's content, can legitimately be reached from several
+  // starts, and backward picks the fullest rather than the one the reader came
+  // from. Left alone that still *skips text* — measured at 1-2 places per book.
+  //
+  // Resolve it by stepping back one further page for an anchor, then walking
+  // forward and keeping the last page that ends at or before cur_start. Forward
+  // is deterministic, so from a start that precedes the true predecessor it
+  // lands on it exactly.
+  //
+  // **Bounded on purpose.** Anchoring at the chapter start instead also works
+  // and gives perfect agreement, but walking the chapter drags
+  // WgbChapterSource's 32-slot paragraph window across it and peaked around
+  // 31 KB — with the clicker resident that reintroduced the heap abort, and it
+  // put a per-chapter walk on the book-open path. One extra step back costs one
+  // layout_backward and at most three forward boundary collections, and removes
+  // every skip across all four test books.
+  //
+  // **Skipped entirely when the heap is tight.** It is a refinement — backward's
+  // own answer is a real page, just occasionally not the one the reader came
+  // from — and it is the most allocation-hungry part of a backward turn.
+  if (!heap_tight) {
+    PagePosition anchor = pc.start;
+    if (!(anchor == PagePosition{0, 0})) {
+      layout_engine_.set_position(anchor);
+      PageContent back2 = layout_engine_.layout_backward();
+      if (back2.start < anchor)
+        anchor = back2.start;
+    }
+
+    PagePosition probe = anchor;
+    PagePosition best = pc.start;
+    for (int guard = 0; guard < kPrevPageProbeLimit; ++guard) {
+      const PagePosition probe_end = layout_engine_.layout_end(probe);
+      if (!(probe < probe_end))
+        break;  // no forward progress: malformed chapter, keep backward's answer
+      if (!(probe_end < cur_start)) {
+        // Ends at or past where we started. Ending exactly there makes it the
+        // predecessor; overshooting means cur_start is not on this chain (a
+        // chapter jump or a restored bookmark), so backward's answer stands.
+        if (probe_end == cur_start)
+          best = probe;
+        break;
+      }
+      probe = probe_end;
+    }
+    if (!(best == pc.start)) {
+      layout_engine_.set_position(best);
+      pc = layout_engine_.layout();
+    }
+  }
+
   page_pos_ = pc.start;
   // The page we just navigated to is fully laid out right here. Keep it instead of
   // making render_page_ lay out the identical page a second time.
   cache_page_(std::move(pc));
   return true;
+}
+
+// Step back one page on a fresh open so the last page read is shown again.
+// Driven by resume_back_pending_, which start() sets and render_page_ consumes
+// once the layout engine has a font and options. Every wake reaches this —
+// deep-sleep wake is a full boot.
+//
+// prev_page_() is reused rather than reimplemented: it already handles the
+// chapter crossing, the mid-image snap, and caching the laid-out page so
+// render_page_() does not lay the same page out twice. Its own guard covers the
+// very start of the book (page_pos_ {0,0} in chapter 0 → false, no move).
+void ReaderScreen::resume_one_page_back_() {
+  if (!open_ok_ || !chapter_src_)
+    return;
+  // Note `page_` is not populated yet — render_page_() runs after this — so the
+  // end-of-book test cannot use page_.at_chapter_end. The saved position being
+  // at the very start is handled by prev_page_() itself, which returns false
+  // without moving. The end of the book needs no guard either: a saved position
+  // is the *start* of the last page, so there is always a page behind it.
+  prev_page_();
+  // Keep the .pos dedup key matching the file, not the page now shown, so this
+  // does not walk the bookmark backwards one page per wake when nothing is read.
+  // save_position_() writes only if the position moves past it.
 }
 
 // ---------------------------------------------------------------------------

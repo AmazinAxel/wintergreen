@@ -63,3 +63,5 @@ This is a VERY opinionated custom firmware! I want people to flash this firmware
 | Just chapter control | There is no link support. It keeps book builds faster and this is a mostly unused feature for many books. Chapters get first class support! |
 | Bluetooth & networking stack | I personally use a 2 key clicker and want syncing, so these are a must for me. |
 | Very minimal reader settings | I only keep the stuff that actually matters for changing while reading, not the things that you set once and forget. It is global, so you can connect a bluetooth turner and change the orientation for it to affect all books! |
+
+The main ideas of this firmware is to keep things as easy

@@ -65,7 +65,17 @@ class StringPool {
   }
 
  private:
-  static constexpr size_t kChunkSize = 8192;
+  // **Deliberately not a power of two.** std::string::reserve(n) allocates
+  // n + 1 bytes for the NUL terminator, so a chunk size of 8192 asks the
+  // allocator for 8193 — one byte past the block it would otherwise fit in
+  // exactly. On a fragmented heap that fails with plenty free: opening the
+  // Odyssey aborted in StringPool::add with 30,828 bytes free and a largest
+  // block of exactly 8,192.
+  //
+  // Backing off by 64 leaves room for the terminator and the allocator's own
+  // per-block header, so a chunk lands inside one block instead of straddling
+  // two. Any size whose +1 crosses a boundary reintroduces this.
+  static constexpr size_t kChunkSize = 8192 - 64;
   std::vector<std::string> chunks_;
   size_t total_size_ = 0;
 };
