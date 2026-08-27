@@ -22,6 +22,13 @@ Some goals:
 
 ## Media
 
+<img alt="wintergreen" src="https://github.com/user-attachments/assets/7c8fbd3b-71ae-4996-803c-ef8ccab5c184"/>
+
+<img alt="home-menu" src="https://github.com/user-attachments/assets/046d05b8-a048-4c46-ab09-ae8223e9bd27"/>
+
+<img alt="homelab" src="https://github.com/user-attachments/assets/d38311b1-2a7b-42bc-a297-400a00fc4df7"/>
+
+<img alt="quick-menu" src="https://github.com/user-attachments/assets/16840878-ff7c-4108-b73c-ba5b7d13cd04"/>
 
 
 ## Flashing this
