@@ -44,16 +44,17 @@ Paste and fill the following settings into the `WintergreenConfig.h` file in you
 
 #include <cstdint>
 #define WG_BLUETOOTH_PAGE_TURNER "7B:70:25:80:D8:27" // you need a mac address like this one!
-#define WG_WIFI_SYNC
+//#define WG_WIFI_SYNC // if you want wifi sync you need to uncomment this!
 
 namespace wintergreen::config {
   inline constexpr const char* kWifiName = "";
   inline constexpr const char* kWifiPassword = "";
-  inline constexpr const char* syncServer = "10.0.0.194";
+  inline constexpr const char* syncServer = "";
 
   inline constexpr bool kSunlightFadingFix = false;
   inline constexpr uint8_t kAutoSleepMinutes = 2;
 
+  inline constexpr bool kResumeOnePageBack = true;
   inline constexpr uint32_t kHoldDelayMs = 300;
   inline constexpr uint32_t kHoldRepeatMs = 200;
   inline constexpr int kHoldAccelStep = 0;
@@ -64,7 +65,25 @@ If you use a white Xteink in the sun, I recommend enabling the fading fix, but i
 
 The button timing should also be modified to your liking! Especially to scroll through a large library of books or chapters, I suggest lower values for repeating and hold. Be warned that below 200ms repeat, it can get a little disorientating since the e-ink panel can only refresh so fast! The defaults are very sensible.
 
-The prebuilt binaries ship with the default config from above! If you want to modify those values, you'd have to build it from scratch.
+<!-- pio run first!!
+
+nix-shell -p 'python3.withPackages(ps: [ps.pyserial])' --run '
+python3 ~/.platformio/packages/tool-esptoolpy/esptool.py --chip esp32c3 merge_bin -o wintergreen.bin --flash_mode dio --flash_freq 80m --flash_size 16MB \
+0x0      .pio/build/esp32c3/bootloader.bin \
+0x8000   .pio/build/esp32c3/partitions.bin \
+0x10000  .pio/build/esp32c3/firmware.bin \
+0xc90000 .pio/build/esp32c3/font_partition.bin \
+0xd10000 .pio/build/esp32c3/sleep_partition.bin'
+-->
+
+The prebuilt binaries ship with the default config from above! If you want to modify those values, you'd have to build it from scratch. If you choose to use the prebuilt binary, flash it with esptool (you cant use the crosspoint flasher):
+
+```bash
+pip install esptool
+esptool.py --chip esp32c3 -p /dev/ttyACM0 write_flash 0x0 wintergreen.bin
+```
+
+The `wintergreen.bin` in this repository is from the latest git changes. You should use that over a release binary since it might have changes that you'd want!
 
 ## Some design choices
 
