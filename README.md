@@ -1,6 +1,8 @@
 # Wintergreen
 
-A highly focused lightweight e-book reader for the Xteink X4, whose goal is to optimize the reading experience and be as usable as possible
+A highly focused and lightweight epub reader for the Xteink X4 whose goal is to optimize the reading experience and be as usable as possible
+
+Wintergreen offers first-class support for bluetooth page turners and a wireless book syncing
 
 A fork of [Nous](https://github.com/unitreign/nous), which is a fork of [Microreader](https://github.com/CidVonHighwind/wintergreen)
 
