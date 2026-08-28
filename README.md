@@ -15,7 +15,7 @@ Some goals:
   - Highly optimized, works great (NOT a beta feature!) and supports back/select keys with page caching!
 - Nix-first building!!
   - A Homelab setup works best with NixOS so you can convert your books and sync them locally
-- NO settings menu!! Everything is hardcoded for performance with very sane defaults so you don't have to think twice. Just flash and start reading!
+- NO settings menu!! Everything is hardcoded for performance with very sensible defaults so you don't have to think twice. Just flash and start reading!
   - If you want syncing or bluetooth support, you will HAVE to build from scratch
 - No unnecessary UI, stat tracking or other extra features. It's meant for very fast and productive reading for quick moments, and nothing else to distract you from that.
   - The use cases here optimize for in-bed reading with a Bluetooth clicker and reading out-and-about with the built-in keys!
@@ -86,18 +86,3 @@ esptool.py --chip esp32c3 -p /dev/ttyACM0 write_flash 0x0 wintergreen.bin
 ```
 
 The `wintergreen.bin` in this repository is from the latest git changes. You should use that over a release binary since it might have changes that you'd want!
-
-## Some design choices
-
-This is a VERY opinionated custom firmware! I want people to flash this firmware and start reading without a second thought and without any sort of setup needed. That being said, I have made some very sensible design choices and I'm listing them and their reasons here:
-
-| What | Why |
-| ---- | --- |
-| No progress bar/battery when reading! | It's distracting. You should focus on the book, not things about the book or the device. If you want to see this information, it's just a short button press away. |
-| Iosevka & Atkinson Hyperlegible ONLY | Both are compiled to bitmaps at fixed sizes and baked into the build. There is no font picker and no sideloading — a font is a build artifact here, not a setting. |
-| English only | This cfw is made only for English and some special characters. This firmware will not be internationalized or support other languages. |
-| No stats | You don't *really* need stats. It's a nice-to-have but also unnecessary and distracting. There is no other menus than the homescreen and book menu, and I want to keep it that way! |
-| Just chapter control | There is no link support. It keeps book builds faster and this is a mostly unused feature for many books. Chapters get first class support! |
-| Bluetooth & networking stack | I personally use a 2 key clicker and want syncing, so these are a must for me. |
-| Very minimal reader settings | I only keep the stuff that actually matters for changing while reading, not the things that you set once and forget. It is global, so you can connect a bluetooth turner and change the orientation for it to affect all books! |
-| Battery low bar | A small bar along the bottom screen indicates that you're <=15% on battery! It's not distracting yet visible enough to remind you to charge. No battery indicator or icon when reading books! |
