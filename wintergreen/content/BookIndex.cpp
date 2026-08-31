@@ -171,8 +171,11 @@ bool BookIndex::load(const std::string& index_file) {
   }
 
   std::fclose(f);
+
   if (needs_rebuild)
-    return false;
+      return false;
+
+  dirty_ = false;
   return true;
 }
 
