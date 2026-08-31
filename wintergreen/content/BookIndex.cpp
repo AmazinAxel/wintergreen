@@ -92,7 +92,6 @@ bool BookIndex::load(const std::string& index_file) {
 
   entries_.clear();
   pool_.reset();
-  dirty_ = false;  // freshly parsed from disk; nothing to write back
 
   // Reserve before growing anything sized by file content. Without this the
   // entry vector reallocates its way up as it parses while the string pool is
@@ -171,6 +170,7 @@ bool BookIndex::load(const std::string& index_file) {
   }
 
   std::fclose(f);
+  dirty_ = false;
   if (needs_rebuild)
     return false;
   return true;
@@ -285,14 +285,13 @@ void BookIndex::remove_entry(std::string_view path) {
 }
 
 void BookIndex::mark_opened(std::string_view path) {
-  uint32_t next = 0;
+  uint32_t max_order = 0;
   for (const auto& entry : entries_)
-    next = std::max(next, entry.last_open_order);
-  ++next;
+    max_order = std::max(max_order, entry.last_open_order);
   for (auto& entry : entries_) {
     if (entry.path.view(pool_) == path) {
-      if (entry.last_open_order != next) {
-        entry.last_open_order = next;
+      if (entry.last_open_order != max_order || max_order == 0) {
+        entry.last_open_order = max_order + 1;
         dirty_ = true;
       }
       return;
@@ -329,6 +328,7 @@ void BookIndex::build_index(const std::string& root_dir) {
 
   entries_.clear();
   pool_.reset();
+  dirty_ = false;
   // Same reasoning as load(): the scan pushes an entry per book found while
   // WgbReader is holding its own chapter-table buffer, so let the vector settle
   // its allocation up front. The previous entry count is the best estimate

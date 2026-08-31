@@ -9,7 +9,7 @@ A fork of [Nous](https://github.com/unitreign/nous), which is a fork of [Microre
 Some goals:
 
 - Syncs to a scripted NAS server
-  - Because all books have to be converted to a binary format, the NAS server runs a script to convert all of them locally so that the Xteink can pull just the binary files and not the unconverted epubs. This saves space and makes syncing *much* faster.
+  - Because all books have to be converted to a binary format, the NAS server runs a script to convert all of them locally so that the Xteink can pull just the binary files and not the unconverted epubs. This saves space and makes syncing _much_ faster.
   - When a book is finished, a Sync deletes it and saves it to a different JSON file with all your finshed books!
 - Bluetooth clicker support (only supports reprogammable clickers with left/right arrow for page navigation)
   - Highly optimized, works great (NOT a beta feature!) and supports back/select keys with page caching!
@@ -32,10 +32,9 @@ Some goals:
 
 <img alt="quick-menu" src="https://github.com/user-attachments/assets/16840878-ff7c-4108-b73c-ba5b7d13cd04"/>
 
-
 ## Flashing this
 
-**DISCLAIMER: You should not flash this on an locked device!! This firmware does *not* offer network or SD card flashing, so you will be softlocked on this firmware if you flash it. No support is provided for flashng on a locked device, so please use a developer model!**
+**DISCLAIMER: You should not flash this on an locked device!! This firmware does _not_ offer network or SD card flashing, so you will be softlocked on this firmware if you flash it. No support is provided for flashng on a locked device, so please use a developer model!**
 
 This project uses Platformio, so you can simply run `pio run -t upload` to build and upload the firmware to the device over USB!
 
