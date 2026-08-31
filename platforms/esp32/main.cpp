@@ -361,6 +361,13 @@ extern "C" void app_main(void) {
     // internal pool the BT controller needs a contiguous block from, so taking it
     // back mid-session would starve the stack that is already up — and taking it
     // at all is what stopped the clicker connecting in the first place.
+    //
+    // The re-claim is gated on the reserve being spent: in the steady state —
+    // every frame of an ordinary reading session — that is one pointer test
+    // instead of a heap free-list walk 40 times a second. The re-arm is *not*
+    // gated on it, because the handler disarms itself on any rescue and its
+    // other two levers (the spare framebuffer, the book index) can fire while
+    // the reserve is still held.
     if (!g_oom_reserve && !runtime.clicker_holds_ram() &&
         heap_caps_get_largest_free_block(MALLOC_CAP_INTERNAL) > kOomReserveBytes + 16 * 1024)
       g_oom_reserve = heap_caps_malloc(kOomReserveBytes, MALLOC_CAP_INTERNAL);

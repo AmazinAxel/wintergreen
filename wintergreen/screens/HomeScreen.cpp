@@ -46,16 +46,10 @@ static void draw_diamond_outline(DrawBuffer& buf, int cx, int cy, int r, int t) 
 // one is available. Returns the byte count to draw; *next is where the following
 // line starts (leading space skipped).
 static size_t fit_line(const BitmapFont& f, const char* text, size_t len, int max_w, size_t* next) {
-  size_t fit = 0, last_space = 0;
-  const char* p = text;
-  while (fit < len) {
-    const uint8_t b = static_cast<uint8_t>(*p);
-    const size_t cb = b < 0x80 ? 1u : b < 0xE0 ? 2u : b < 0xF0 ? 3u : 4u;
-    if (f.word_width(text, fit + cb, FontStyle::Regular) > max_w) break;
-    if (b == ' ') last_space = fit;
-    fit += cb;
-    p += cb;
-  }
+  const size_t fit = fit_prefix(f, text, len, max_w);
+  size_t last_space = 0;
+  for (size_t i = 0; i < fit; ++i)
+    if (text[i] == ' ') last_space = i;
   if (fit >= len) { *next = len; return len; }
   if (last_space > 0) { *next = last_space + 1; return last_space; }
   *next = fit;
@@ -73,15 +67,7 @@ static void draw_centred(DrawBuffer& buf, int cx, int baseline, const char* text
     return;
   }
   const int budget = max_w - f.word_width(kEll, 3, FontStyle::Regular);
-  size_t fit = 0;
-  const char* p = text;
-  while (fit < len) {
-    const uint8_t b = static_cast<uint8_t>(*p);
-    const size_t cb = b < 0x80 ? 1u : b < 0xE0 ? 2u : b < 0xF0 ? 3u : 4u;
-    if (f.word_width(text, fit + cb, FontStyle::Regular) > budget) break;
-    fit += cb;
-    p += cb;
-  }
+  const size_t fit = fit_prefix(f, text, len, budget);
   char trunc[260];
   const size_t cp = std::min<size_t>(fit, 256);
   std::memcpy(trunc, text, cp);
@@ -481,8 +467,8 @@ void HomeScreen::draw_all_(DrawBuffer& buf, std::optional<uint8_t> battery_pct) 
   static constexpr int kDotRingW   = 2;
   static constexpr int kDotRSmall  = 3;   // unselected: a step down from the filled one
   static constexpr int kDotStep    = 28;
-  static constexpr int kFrameGap   = 6;  // white gap between cover and its frame
-  static constexpr int kFrameW     = 4;  // frame thickness
+  static constexpr int kFrameGap   = 8;  // white gap between cover and its frame
+  static constexpr int kFrameW     = 2;  // frame thickness
 
   const BitmapFont& tf = ui_font_;                                         // title
   const BitmapFont& af = author_font_.valid() ? author_font_ : ui_font_;   // author

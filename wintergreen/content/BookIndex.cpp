@@ -286,16 +286,17 @@ void BookIndex::remove_entry(std::string_view path) {
 
 void BookIndex::mark_opened(std::string_view path) {
   uint32_t max_order = 0;
-  for (const auto& entry : entries_)
-    max_order = std::max(max_order, entry.last_open_order);
+  BookIndexEntry* found = nullptr;
   for (auto& entry : entries_) {
-    if (entry.path.view(pool_) == path) {
-      if (entry.last_open_order != max_order || max_order == 0) {
-        entry.last_open_order = max_order + 1;
-        dirty_ = true;
-      }
-      return;
-    }
+    max_order = std::max(max_order, entry.last_open_order);
+    if (!found && entry.path.view(pool_) == path) found = &entry;
+  }
+  if (!found) return;
+  // Already the most-recently-opened book: leave it alone so re-reading the
+  // book you are already on does not dirty the index and force a save.
+  if (found->last_open_order != max_order || max_order == 0) {
+    found->last_open_order = max_order + 1;
+    dirty_ = true;
   }
 }
 void BookIndex::set_progress(std::string_view path, int pct) {

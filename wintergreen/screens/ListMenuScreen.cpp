@@ -374,15 +374,7 @@ void ListMenuScreen::draw_list_(DrawBuffer& buf, int W, int H, int header_h, int
       const int title_y = y + kPadT + ui_font_.baseline();
       int dlw = ui_font_.word_width(display_label.data(), display_label.size(), FontStyle::Regular);
       if (dlw > max_lw) {
-        const int budget = max_lw - ell_w;
-        size_t fit = 0;
-        const char* p = display_label.data();
-        while (*p) {
-          const uint8_t b = static_cast<uint8_t>(*p);
-          const size_t cb = b < 0x80 ? 1u : b < 0xE0 ? 2u : b < 0xF0 ? 3u : 4u;
-          if (ui_font_.word_width(display_label.data(), fit + cb, FontStyle::Regular) > budget) break;
-          fit += cb; p += cb;
-        }
+        const size_t fit = fit_prefix(ui_font_, display_label.data(), display_label.size(), max_lw - ell_w);
         const size_t cp = fit < 256 ? fit : 256;
         std::memcpy(trunc_buf, display_label.data(), cp);
         std::memcpy(trunc_buf + cp, kEll, 3);
@@ -407,15 +399,7 @@ void ListMenuScreen::draw_list_(DrawBuffer& buf, int W, int H, int header_h, int
         int sw = sub_font.word_width(sub.data(), sub.size(), FontStyle::Regular);
         if (sw > max_sw) {
           const int sel_ell_w = sub_font.word_width(kEll, 3, FontStyle::Regular);
-          const int budget = max_sw - sel_ell_w;
-          size_t fit = 0;
-          const char* p = sub.data();
-          while (*p) {
-            const uint8_t b = static_cast<uint8_t>(*p);
-            const size_t cb = b < 0x80 ? 1u : b < 0xE0 ? 2u : b < 0xF0 ? 3u : 4u;
-            if (sub_font.word_width(sub.data(), fit + cb, FontStyle::Regular) > budget) break;
-            fit += cb; p += cb;
-          }
+          const size_t fit = fit_prefix(sub_font, sub.data(), sub.size(), max_sw - sel_ell_w);
           const size_t cp = fit < 256 ? fit : 256;
           std::memcpy(trunc_buf, sub.data(), cp);
           std::memcpy(trunc_buf + cp, kEll, 3);
@@ -499,15 +483,7 @@ void ListMenuScreen::draw_list_(DrawBuffer& buf, int W, int H, int header_h, int
         const int title_y = y + kPadT + ui_font_.baseline();
         if (lw > max_lw) {
           const int ell_w = ui_font_.word_width(kEll, 3, FontStyle::Regular);
-          const int budget = max_lw - ell_w;
-          size_t fit = 0;
-          const char* p = display_label.data();
-          while (*p) {
-            const uint8_t b = static_cast<uint8_t>(*p);
-            const size_t cb = b < 0x80 ? 1u : b < 0xE0 ? 2u : b < 0xF0 ? 3u : 4u;
-            if (ui_font_.word_width(display_label.data(), fit + cb, FontStyle::Regular) > budget) break;
-            fit += cb; p += cb;
-          }
+          const size_t fit = fit_prefix(ui_font_, display_label.data(), display_label.size(), max_lw - ell_w);
           const size_t cp = fit < 256 ? fit : 256;
           std::memcpy(trunc_buf, display_label.data(), cp);
           std::memcpy(trunc_buf + cp, kEll, 3);
@@ -526,15 +502,7 @@ void ListMenuScreen::draw_list_(DrawBuffer& buf, int W, int H, int header_h, int
         const int sub_y = y + kPadT + title_h + kGap + subtitle_font_.baseline();
         if (sw > max_sw) {
           const int ell_w = subtitle_font_.word_width(kEll, 3, FontStyle::Regular);
-          const int budget = max_sw - ell_w;
-          size_t fit = 0;
-          const char* p = sub.data();
-          while (*p) {
-            const uint8_t b = static_cast<uint8_t>(*p);
-            const size_t cb = b < 0x80 ? 1u : b < 0xE0 ? 2u : b < 0xF0 ? 3u : 4u;
-            if (subtitle_font_.word_width(sub.data(), fit + cb, FontStyle::Regular) > budget) break;
-            fit += cb; p += cb;
-          }
+          const size_t fit = fit_prefix(subtitle_font_, sub.data(), sub.size(), max_sw - ell_w);
           const size_t cp = fit < 256 ? fit : 256;
           std::memcpy(trunc_buf, sub.data(), cp);
           std::memcpy(trunc_buf + cp, kEll, 3);
@@ -637,17 +605,7 @@ void ListMenuScreen::draw_list_(DrawBuffer& buf, int W, int H, int header_h, int
     const int max_item_w = W - 48;
 
     if (iw > max_item_w) {
-      const int budget = max_item_w - ellipsis_w;
-      size_t fit = 0;
-      const char* p = label;
-      while (*p) {
-        const uint8_t b = static_cast<uint8_t>(*p);
-        const size_t cb = b < 0x80 ? 1u : b < 0xE0 ? 2u : b < 0xF0 ? 3u : 4u;
-        if (ui_font_.word_width(label, fit + cb, FontStyle::Regular) > budget)
-          break;
-        fit += cb;
-        p += cb;
-      }
+      const size_t fit = fit_prefix(ui_font_, label, len, max_item_w - ellipsis_w);
       const size_t copy = fit < 256 ? fit : 256;
       std::memcpy(trunc_buf, label, copy);
       std::memcpy(trunc_buf + copy, kEllipsis, 3);

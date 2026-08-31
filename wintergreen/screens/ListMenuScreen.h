@@ -11,6 +11,42 @@
 
 namespace wintergreen {
 
+// Longest prefix of `text` whose width fits `budget`, cut on a codepoint
+// boundary. Returns a byte count.
+//
+// Accumulates per-character widths instead of re-measuring the prefix from the
+// start each step: the obvious form calls word_width(text, fit + cb) inside the
+// loop, which re-scans every preceding character and makes truncating one label
+// O(n^2). Book titles are long enough for that to be the bulk of a list repaint.
+//
+// The per-character sum is a hair wider than word_width() over the same bytes,
+// because word_width() applies class kerning between adjacent glyphs. Kerning is
+// negative far more often than not, so this cuts at most a character early and
+// never overruns the budget — the safe direction for a truncation.
+//
+// Bounded by `len`: the sources here are string_views into StringPool chunks,
+// which are packed back to back and are *not* NUL-terminated, so a loop testing
+// `*p` runs off the end of the string into the next one.
+inline size_t fit_prefix(const IFont& f, const char* text, size_t len, int budget) {
+  if (budget <= 0) return 0;
+  size_t fit = 0;
+  int w = 0;
+  while (fit < len) {
+    const uint8_t b = static_cast<uint8_t>(text[fit]);
+    const size_t cb = b < 0x80 ? 1u : b < 0xE0 ? 2u : b < 0xF0 ? 3u : 4u;
+    if (fit + cb > len) break;
+    const char* p = text + fit;
+    char32_t cp = static_cast<char32_t>(b);
+    if (cb == 2) cp = ((b & 0x1F) << 6) | (p[1] & 0x3F);
+    else if (cb == 3) cp = ((b & 0x0F) << 12) | ((p[1] & 0x3F) << 6) | (p[2] & 0x3F);
+    else if (cb == 4) cp = ((b & 0x07) << 18) | ((p[1] & 0x3F) << 12) | ((p[2] & 0x3F) << 6) | (p[3] & 0x3F);
+    w += f.char_width(cp, FontStyle::Regular);
+    if (w > budget) break;
+    fit += cb;
+  }
+  return fit;
+}
+
 // Base class for screens that show a titled list of selectable items.
 // Handles drawing (header font for title, UI font for items with selection bar),
 // up/down navigation with wrapping, scrolling for long lists, and font

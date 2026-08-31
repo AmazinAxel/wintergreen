@@ -66,14 +66,7 @@ static void draw_text_ellipsised(DrawBuffer& buf, int x, int baseline, const cha
 
   static const char kEll[] = "...";
   const int budget = max_w - f.word_width(kEll, 3, FontStyle::Regular);
-  size_t fit = 0;
-  while (fit < len) {
-    const uint8_t b = static_cast<uint8_t>(text[fit]);
-    const size_t cb = b < 0x80 ? 1u : b < 0xE0 ? 2u : b < 0xF0 ? 3u : 4u;
-    if (fit + cb > len) break;
-    if (f.word_width(text, fit + cb, FontStyle::Regular) > budget) break;
-    fit += cb;
-  }
+  const size_t fit = fit_prefix(f, text, len, budget);
 
   // Not even one character fits beside the ellipsis: draw the ellipsis alone
   // rather than nothing, so the row still reads as "there is text here".
