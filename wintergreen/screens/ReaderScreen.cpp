@@ -317,8 +317,8 @@ void ReaderScreen::update(const ButtonState& buttons, DrawBuffer& buf, IRuntime&
   const Rotation rot = buf.rotation();
   const bool landscape_hold = (rot == Rotation::Deg0 || rot == Rotation::Deg180);
   // Front row is fixed to the panel and does not rotate with the hold.
-  constexpr Button logical_next_front = Button::Button2;
-  constexpr Button logical_prev_front = Button::Button3;
+  constexpr Button logical_next_front = Button::Button3;
+  constexpr Button logical_prev_front = Button::Button2;
   const Button logical_next_side = landscape_hold ? Button::Down : Button::Up;
   const Button logical_prev_side = landscape_hold ? Button::Up : Button::Down;
 
