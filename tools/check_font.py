@@ -4,7 +4,7 @@
 Catches layout mistakes that would silently render blank on device. Also draws
 a sample string so the rasterization can be eyeballed without a flash.
 
-  python3 tools/check_font.py resources/AtkinsonHyperlegible.bin [text]
+  python3 tools/check_font.py resources/Libron.bin [text]
 """
 
 import struct

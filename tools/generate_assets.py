@@ -27,8 +27,8 @@ BUILD_DIR = env.subst("$BUILD_DIR")
 
 # Must match platforms/esp32/default_16MB.csv.
 PARTITIONS = {
-    "font": (0xC90000, 0x080000),
-    "sleep": (0xD10000, 0x020000),
+    "font": (0xC90000, 0x100000),
+    "sleep": (0xD90000, 0x020000),
 }
 
 
@@ -57,7 +57,7 @@ def _check_fits(name, data):
 
 
 # --- font: inflate the WGFS bundle on the host ------------------------------
-src = os.path.join(PROJECT_DIR, "resources", "AtkinsonHyperlegible.bin")
+src = os.path.join(PROJECT_DIR, "resources", "Libron.bin")
 with open(src, "rb") as f:
     blob = f.read()
 if len(blob) < 8:

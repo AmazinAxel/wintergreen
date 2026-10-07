@@ -7,6 +7,6 @@ app1,     app,  ota_1,   0x650000, 0x640000,
 # (tools/generate_assets.py registers them as FLASH_EXTRA_IMAGES) and read at
 # runtime with esp_partition_mmap, so neither costs a byte of the app image and
 # neither is ever copied or decompressed on the device.
-font,     data, spiffs,  0xc90000, 0x080000,
-sleep,    data, spiffs,  0xd10000, 0x020000,
+font,     data, spiffs,  0xc90000, 0x100000,
+sleep,    data, spiffs,  0xd90000, 0x020000,
 coredump, data, coredump,0xFF0000, 0x10000,

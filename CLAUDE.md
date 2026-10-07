@@ -552,7 +552,7 @@ reintroduce that indirection:
 - battery is a header percentage, never an icon. The converted-book marker is gone —
   every book is a WGB, so the trailing dot marked every row and said nothing.
 - images always render: the `images_enabled` global is gone, not defaulted
-- single reader font (Atkinson Hyperlegible, in the `font` partition), no picker
+- single reader font (Libron, in the `font` partition), no picker
 - book list is title-only, sorted most-recently-opened first with a hairline before
   never-opened books
 - fixed page geometry: margins at `ReaderSettings::h_padding()` / `v_padding()`, and
@@ -574,7 +574,7 @@ WintergreenConfig.h        the only tunables (gitignored — see Configuration)
 CMakeLists.txt             IDF project stub; the real source list is platforms/esp32/
 platformio.ini             one env, esp32c3; pre-build hook tools/generate_assets.py
 sdkconfig.defaults         checked-in IDF config; sdkconfig.esp32c3 is generated
-resources/                 AtkinsonHyperlegible.bin (reader font), sleep.mgr (wordmark)
+resources/                 Libron.bin (reader font), sleep.mgr (wordmark)
 
 platforms/esp32/           firmware entry point + every hardware driver, header-only
   main.cpp                 app_main: boot gate, init order, the while() loop
@@ -1633,10 +1633,10 @@ declared in `platforms/esp32/default_16MB.csv`:
 
 | Partition | Offset | Size | Holds |
 |---|---|---|---|
-| `font` | `0xC90000` | 512 KB | the inflated WGFS v2 bundle, 428,289 B |
-| `sleep` | `0xD10000` | 128 KB | `resources/sleep.mgr` verbatim, 96,008 B |
+| `font` | `0xC90000` | 1 MB | the inflated WGFS v2 bundle, 729,526 B |
+| `sleep` | `0xD90000` | 128 KB | `resources/sleep.mgr` verbatim, 96,008 B |
 
-`tools/generate_assets.py` runs pre-build. It inflates `resources/AtkinsonHyperlegible.bin`
+`tools/generate_assets.py` runs pre-build. It inflates `resources/Libron.bin`
 (which is `[uint32 raw size][zlib]`) **on the build machine**, copies `sleep.mgr` unchanged,
 writes both to `$BUILD_DIR`, checks each against its partition size, and appends them to
 `FLASH_EXTRA_IMAGES` so `pio run -t upload` writes all four images in one esptool
@@ -1655,7 +1655,7 @@ erase-and-write behind an "Installing fonts..." progress bar, with the font stor
 `generate_assets.py`, and the `map()` call site. The Python asserts the image fits, so a
 mismatch fails the build rather than the device.
 
-The font partition holds the **inflated** bundle: 428 KB, not the 122 KB compressed form.
+The font partition holds the **inflated** bundle: 730 KB, not the 220 KB compressed form.
 Flash is not scarce and the device does no work — that trade is the point.
 
 ## Measured size budget
@@ -1865,7 +1865,7 @@ file produced before it must be re-converted:
   there is one reader font, found by *partition*, not by name — so `--name` is a diagnostic
   label only.
 
-`resources/AtkinsonHyperlegible.bin` is a `WGFS` bundle behind a `[uint32 uncompressed
+`resources/Libron.bin` is a `WGFS` bundle behind a `[uint32 uncompressed
 size][zlib stream]` wrapper. The three `display/ui_font_*.h` headers are bare `WGF1` blobs
 emitted as C arrays (`kFontData_ui_*_wgf`).
 
@@ -1947,7 +1947,7 @@ Two fonts, both compiled from TTF by `tools/make_font.py`, and **no way to add a
 serial `FONT` partition upload and `SDFN` (`/sdcard/fonts/`) sideload paths were deliberately
 removed.
 
-- **Reader: Atkinson Hyperlegible**, 5 sizes (20/24/28/32/36 px), all four styles, built
+- **Reader: Libron** (v0.25, github.com/nicoverbruggen/libron), 5 sizes (20/24/28/32/36 px), all four styles, built
   `--mono`. Lives in the `font` flash partition, written by esptool at upload time and mmapped
   at boot. A font change takes effect on the next upload.
 - **UI: Iosevka Slab Medium**, built `--mono`, one size per header in `display/ui_font_*.h`
@@ -2000,7 +2000,7 @@ Glyph coverage is per-font and sparse. A font that parses fine can still be miss
 for a given string, in which case it renders blank rather than falling back — check
 `glyph_data(cp).bits != nullptr` before assuming a font can render text. (This bit the old
 brand wordmark font: it contained only `n`, `o`, `u`, `s`.) Both fonts cover the same 527
-codepoints, but Atkinson genuinely lacks 224 of them (most of Latin Ext-A and General
+codepoints, but Libron genuinely lacks 167 of them (most of Latin Ext-A and General
 Punctuation). `make_font.py`'s `SUBSTITUTES` table maps the ones that would actually hurt onto
 near-equivalents (U+2010 hyphen → ASCII `-`, and so on); the rest are blank. Extend that table
 rather than accepting a blank glyph. There is **no wintergreen logotype font** — the wordmark
@@ -2014,11 +2014,11 @@ nix-shell):
 
 ```
 nix-shell -p 'python3.withPackages(ps: [ps.freetype-py ps.fonttools])' --run '
-  python3 tools/make_font.py bundle --name AtkinsonHyperlegible --mono \
+  python3 tools/make_font.py bundle --name Libron --mono \
     --sizes 20,24,28,32,36 --line-height 150 \
-    --regular …-Regular.ttf --bold …-Bold.ttf \
-    --italic …-Italic.ttf --bold-italic …-BoldItalic.ttf \
-    --out resources/AtkinsonHyperlegible.bin'
+    --regular Libron-Regular.ttf --bold Libron-Bold.ttf \
+    --italic Libron-Italic.ttf --bold-italic Libron-BoldItalic.ttf \
+    --out resources/Libron.bin'
 ```
 
 `--line-height` matters: the reader multiplies `y_advance` by the user's setting, so a font's
@@ -2040,7 +2040,7 @@ The TTC face index matters: face **0** is Iosevka Slab, and the rest are the Ext
 Oblique cuts.
 
 There is no asset name to keep in sync: `generate_assets.py` reads
-`resources/AtkinsonHyperlegible.bin` by path, and `FontManager` finds that partition by name
+`resources/Libron.bin` by path, and `FontManager` finds that partition by name
 (`"font"`, matching `default_16MB.csv`).
 
 ## Persistence
