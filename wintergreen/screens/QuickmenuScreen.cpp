@@ -500,7 +500,7 @@ void QuickmenuScreen::on_select(int index) {
     uint8_t max_idx = ReaderSettings::kNumFontSizePresets;
     if (app_ && app_->font_manager() && app_->font_manager()->valid()) {
       auto* fonts = app_->font_manager()->font_set();
-      if (fonts && fonts->num_fonts() > 0)
+      if (fonts && fonts->num_fonts() > 0 && fonts->num_fonts() < max_idx)
         max_idx = static_cast<uint8_t>(fonts->num_fonts());
     }
     settings_->font_size_idx = static_cast<uint8_t>((settings_->font_size_idx + 1) % max_idx);

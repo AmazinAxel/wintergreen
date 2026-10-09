@@ -1947,7 +1947,7 @@ Two fonts, both compiled from TTF by `tools/make_font.py`, and **no way to add a
 serial `FONT` partition upload and `SDFN` (`/sdcard/fonts/`) sideload paths were deliberately
 removed.
 
-- **Reader: Libron** (v0.25, github.com/nicoverbruggen/libron), 5 sizes (20/24/28/32/36 px), all four styles, built
+- **Reader: Libron** (v0.25, github.com/nicoverbruggen/libron), 2 sizes (32/36 px), all four styles, built
   `--mono`. Lives in the `font` flash partition, written by esptool at upload time and mmapped
   at boot. A font change takes effect on the next upload.
 - **UI: Iosevka Slab Medium**, built `--mono`, one size per header in `display/ui_font_*.h`
@@ -2015,7 +2015,7 @@ nix-shell):
 ```
 nix-shell -p 'python3.withPackages(ps: [ps.freetype-py ps.fonttools])' --run '
   python3 tools/make_font.py bundle --name Libron --mono \
-    --sizes 20,24,28,32,36 --line-height 150 \
+    --sizes 32,36 --line-height 150 \
     --regular Libron-Regular.ttf --bold Libron-Bold.ttf \
     --italic Libron-Italic.ttf --bold-italic Libron-BoldItalic.ttf \
     --out resources/Libron.bin'

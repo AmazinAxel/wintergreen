@@ -57,7 +57,7 @@ namespace wintergreen::config {
 
   inline constexpr bool kResumeOnePageBack = true;
   inline constexpr uint32_t kHoldDelayMs = 300;
-  inline constexpr uint32_t kHoldRepeatMs = 200;
+  inline constexpr uint32_t kHoldRepeatMs = 100;
   inline constexpr int kHoldAccelStep = 0;
 }
 ```
