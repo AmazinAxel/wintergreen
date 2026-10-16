@@ -120,6 +120,9 @@ class Application {
   bool is_reader_active() const {
     return screen_mgr_.top() == &reader_;
   }
+  bool confirm_from_power() const {
+    return power_confirm_;
+  }
   QuickmenuScreen* quickmenu() {
     return &quickmenu_;
   }
@@ -213,6 +216,9 @@ class Application {
   // Open a book by path, bypassing the menu: the boot resume path and the
   // serial 'O' command.
   void auto_open_book(const char* epub_path, DrawBuffer& buf, IRuntime& runtime);
+  // Write what persist_pending_ says is owed (index, settings) now rather than at
+  // the next quiet moment. For anything about to reload the index from disk.
+  void flush_persist();
   void update(const ButtonState& buttons, uint32_t dt_ms, DrawBuffer& buf, IRuntime& runtime);
   bool running() const;
 
@@ -237,6 +243,22 @@ class Application {
   // deep sleep (cleared by main.cpp) can never register as an action.
   bool power_armed_ = false;
   uint32_t power_hold_ms_ = 0;
+
+  // True for the frame whose Confirm is a power-button tap rather than the front
+  // select key. The reader opens its quick menu on the top setting for the one
+  // and on the current chapter for the other.
+  bool power_confirm_ = false;
+
+  // Set by start() when it resumes straight into a book: the home screen sits
+  // underneath unstarted and the book index is not read until something needs
+  // it. See record_book_progress().
+  bool index_deferred_ = false;
+
+  // Index and settings writes owed by a reader close or a pop from the reader
+  // stack, held back so the next screen draws first. See the end of update().
+  bool persist_pending_ = false;
+  static constexpr uint32_t kPersistQuietMs = 400;
+  uint32_t persist_quiet_ms_ = 0;
 
   uint8_t rotate_reader_ = 0;   // independent reader rotation, same encoding
 

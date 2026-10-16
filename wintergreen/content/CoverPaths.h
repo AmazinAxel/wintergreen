@@ -14,9 +14,9 @@ namespace wintergreen {
 // ever indexes .wgb, so the branch selecting it was unreachable. The host
 // converter never called these at all — it string-replaces "book.wgb" in its
 // own output path (WgbConverter.cpp).
-std::string cover_bin_path(const char* book_path);
 std::string cover_sleep_bin_path(const char* book_path);
 std::string cover_home_bin_path(const char* book_path);
+std::string cover_list_bin_path(const char* book_path);
 
 // Reading position, written beside the book as <book dir>/book.pos.
 //
@@ -28,15 +28,14 @@ std::string cover_home_bin_path(const char* book_path);
 std::string book_pos_path(const char* book_path);
 
 // The home carousel's cover box, in panel pixels. The converter renders
-// cover_home.bin to fit exactly this, so HomeScreen can blit it 1:1 instead of
-// box-filtering and re-dithering an already-dithered cover — a second dither
-// pass at a near-1:1 ratio is what made the home cover look coarse.
+// cover_home.bin to fit exactly this, and HomeScreen reads it 1:1 — the device
+// has no scaler, so a cover is a header and one fread.
 //
 // Derived from HomeScreen::draw_all_'s layout. Note the panel's app-space
 // height is **793**, not 800: DisplayFrame::kPhysicalWidth excludes the 7
 // hidden columns at the leading edge of the glass. Getting that wrong is what
-// made these too tall, which quietly put every home cover through the
-// downscale path it exists to avoid.
+// made these too tall, which quietly put every home cover on a path it was
+// never meant to take.
 //
 //   battery_row_h_ = kBatteryPadY(10) + ui_large.y_advance(31)          =  41
 //   box_y          = battery_row_h_ + kHeroGap(24)                      =  65
@@ -45,10 +44,25 @@ std::string book_pos_path(const char* book_path);
 //   width  = 480 - 2*kPad(16) - 2*(kFrameGap(10) + kFrameW(2))          = 424
 //   height = 793 - box_y - below_h - 2*(kFrameGap + kFrameW)            = 486
 //
-// If the layout moves these drift, the fallback path takes over and quality
-// quietly regresses until the library is re-converted. Nothing breaks.
+// If the layout moves these drift and the screen shows its placeholder (the
+// device will not scale a cover) until the library is re-converted.
 inline constexpr int kHomeCoverW = 424;
 inline constexpr int kHomeCoverH = 486;
+
+// The book list's thumbnail box. The converter renders cover_list.bin to fit
+// inside it, so MainMenu reads it straight into its cache with no scaling;
+// a book without the file draws an empty frame. Derived from ListMenuScreen's
+// two-title-line detail row:
+//
+//   slot   = kPadT(5) + 2*ui_header.y_advance(41) + kGap(3)
+//            + ui_large.y_advance(31) + kPadB(6) + divider(1)              = 128
+//   height = slot - divider(1) - 2*kThumbPad(6)                             = 115
+//   width  = height * 2 / 3                                                 =  76
+//
+// Same drift rule as the home box: if the row moves, rows draw empty frames
+// until the library is re-converted.
+inline constexpr int kListCoverW = 76;
+inline constexpr int kListCoverH = 115;
 
 // The sleep screen, in panel pixels (portrait) — the whole visible panel.
 // The converter composes cover_sleep.bin at exactly this size, artwork scaled

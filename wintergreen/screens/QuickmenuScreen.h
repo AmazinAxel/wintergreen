@@ -103,6 +103,12 @@ class QuickmenuScreen final : public ListMenuScreen {
     has_pending_ = false;
   }
 
+  // Where the next opening puts the cursor: the chapter being read (the front
+  // select key) or the top setting (a power-button tap). Set before the push.
+  void set_open_on_chapter(bool v) {
+    open_on_chapter_ = v;
+  }
+
   void stop() override {
     toc_ = nullptr;
   }
@@ -161,6 +167,12 @@ class QuickmenuScreen final : public ListMenuScreen {
   int idx_reader_rotate_display_ = -1;
   int idx_clicker_ = -1;
   int first_chapter_ = -1;
+  // List index of the chapter holding the reading position, or -1. Derived in
+  // on_start() from current_chapter_offset_, which populate() sets: a TOC entry
+  // index, or a spine index when the book has no TOC.
+  int current_chapter_item_ = -1;
+  int current_chapter_offset_ = -1;
+  bool open_on_chapter_ = false;
 
   uint16_t pending_chapter_ = 0;
   uint16_t pending_para_index_ = 0;

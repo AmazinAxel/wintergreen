@@ -437,8 +437,9 @@ inline bool run_sync_() {
       continue;  // leave the rest of the sync running; retried next time
 
     // Covers are optional — an EPUB without one produces no cover files at all,
-    // and every consumer already falls back.
-    for (const char* cover : {"cover.bin", "cover_home.bin", "cover_sleep.bin"})
+    // and a missing one draws a placeholder. cover.bin is no longer made; the
+    // removal lists below still name it, so older books clean up fully.
+    for (const char* cover : {"cover_list.bin", "cover_home.bin", "cover_sleep.bin"})
       http_get_file_("/booksync/" + url_dir + "/" + cover, book_dir + "/" + cover);
 
     // Index it in memory only. index_file() would save the whole ~30 KB index
@@ -464,7 +465,7 @@ inline bool run_sync_() {
     }
     if (!readable) {
       std::remove(wgb.c_str());
-      for (const char* cover : {"cover.bin", "cover_home.bin", "cover_sleep.bin"})
+      for (const char* cover : {"cover.bin", "cover_list.bin", "cover_home.bin", "cover_sleep.bin"})
         std::remove((book_dir + "/" + cover).c_str());
       ::rmdir(book_dir.c_str());
       continue;
@@ -481,7 +482,7 @@ inline bool run_sync_() {
     const std::string book_dir = std::string(books_dir) + "/" + dir;
     if (g_buf)
       g_buf->wait_panel_idle();
-    for (const char* f : {"book.wgb", "book.pos", "cover.bin", "cover_home.bin", "cover_sleep.bin"})
+    for (const char* f : {"book.wgb", "book.pos", "cover.bin", "cover_list.bin", "cover_home.bin", "cover_sleep.bin"})
       std::remove((book_dir + "/" + f).c_str());
     ::rmdir(book_dir.c_str());
     index.remove_entry(book_dir + "/book.wgb");

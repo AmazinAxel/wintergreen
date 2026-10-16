@@ -18,6 +18,7 @@
 
 #include "bluetooth_clicker.h"
 #include "wifi_sync.h"
+#include "ui_wake.h"
 
 // Battery sense sits on GPIO0 = ADC1 channel 0, behind a 2:1 divider.
 #define BATTERY_ADC_CHANNEL ADC_CHANNEL_0
@@ -47,10 +48,16 @@ class Esp32Runtime final : public wintergreen::IRuntime {
     const uint32_t now = millis();
     if (frame_start_ms_ != 0) {
       const uint32_t elapsed = now - frame_start_ms_;
-      if (elapsed < target_frame_ms_)
-        vTaskDelay(pdMS_TO_TICKS(target_frame_ms_ - elapsed));
-      else
+      if (elapsed < target_frame_ms_) {
+        // Ends early on input; see ui_wake.h.
+        const TickType_t wait = pdMS_TO_TICKS(target_frame_ms_ - elapsed);
+        if (g_ui_wake)
+          xSemaphoreTake(g_ui_wake, wait);
+        else
+          vTaskDelay(wait);
+      } else {
         vTaskDelay(1);  // 1 tick; pdMS_TO_TICKS(1) rounds to 0 and only yields
+      }
     }
     const uint32_t frame_end = millis();
     if (frame_start_ms_ != 0)

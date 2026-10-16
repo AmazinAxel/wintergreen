@@ -28,6 +28,7 @@
 #include <cstdio>
 
 #include "esp_timer.h"
+#include "ui_wake.h"
 
 #include "WintergreenConfig.h"
 #include "wintergreen/Input.h"
@@ -65,6 +66,7 @@ inline void queue_press(uint8_t btn) {
     return;  // full: drop, never overwrite an unread press
   g_press_queue[g_pq_tail] = btn;
   g_pq_tail = next;
+  ui_wake();
 }
 
 // HID keyboard usage IDs (HID Usage Table, keyboard page 0x07). In menus left

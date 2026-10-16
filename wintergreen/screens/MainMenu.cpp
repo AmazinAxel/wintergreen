@@ -3,11 +3,13 @@
 #include <algorithm>
 #include <cctype>
 #include <cstdio>
+#include <cstdlib>
 #include <cstring>
 #include <queue>
 
 #include "../Application.h"
 #include "../content/BookIndex.h"
+#include "../content/CoverPaths.h"
 #include "../content/wgb/WgbReader.h"
 
 #ifdef ESP_PLATFORM
@@ -104,6 +106,7 @@ void MainMenu::update(const ButtonState& buttons, DrawBuffer& buf, IRuntime& run
   // and back.
   if (cached_generation_ != BookIndex::instance().generation()) {
     cached_generation_ = BookIndex::instance().generation();
+    forget_thumbs_();  // a sync or upload may have replaced a book in place
     populate_list_();
     draw_all_(buf, runtime.battery_percentage());
     buf.full_refresh();
@@ -132,6 +135,11 @@ void MainMenu::run_sync_() {
   //
   // The runtime is cached by update() because on_select() does not receive one
   // and the base class keeps its own pointer private.
+  // The sync reloads the index from disk first; a reader close may still owe it
+  // a write (Application::flush_persist), and that progress would be lost.
+  if (buf_)
+    buf_->wait_panel_idle();  // the card shares SPI2 with the panel
+  app_->flush_persist();
   if (sync_runtime_)
     sync_runtime_->start_sync();
 }
@@ -367,6 +375,7 @@ void MainMenu::populate_list_() {
 
   const StringPool& bpool = BookIndex::instance().pool();
   detail_list_ = true;
+  detail_title_lines_ = 2;
   for (const auto& idx : BookIndex::instance().entries()) {
     BookEntry e;
     e.path = idx.path.to_string(bpool);
@@ -431,5 +440,113 @@ void MainMenu::populate_list_() {
   }
 }
 
+
+// ── Cover thumbnails ────────────────────────────────────────────────────────
+
+uint32_t MainMenu::thumb_key_(const std::string& path) {
+  uint32_t key = 2166136261u;
+  for (const char c : path)
+    key = (key ^ static_cast<uint8_t>(c)) * 16777619u;
+  return key;
+}
+
+bool MainMenu::thumb_cache_ready_(int w, int h) const {
+  if (!buf_ || w <= 0 || h <= 0 || w > kThumbMaxW || h > 255)
+    return false;
+  if (thumb_bits_ && buf_->spare_cache_valid(thumb_gen_) && w == thumb_w_ && h == thumb_h_)
+    return true;
+  // The spare went to something else since (or never held covers), or the box
+  // changed: whatever it holds now is not ours. Null while a radio has it.
+  thumb_bits_ = buf_->claim_spare_cache();
+  thumb_gen_ = buf_->spare_cache_gen();
+  thumb_w_ = w;
+  thumb_h_ = h;
+  thumb_slots_n_ = thumb_bits_ ? static_cast<int>(std::min<size_t>(DrawBuffer::kBufSize / thumb_slot_bytes_(), kThumbSlotsMax)) : 0;
+  forget_thumbs_();
+  return thumb_slots_n_ > 0;
+}
+
+int MainMenu::prepare_thumbs(int box_h) const {
+  // Covers are 2:3, so the column is two thirds of the box — kListCoverW for the
+  // two-title-line row, which is what the converter renders cover_list.bin to.
+  const int w = std::min(box_h * 2 / 3, kThumbMaxW);
+  return thumb_cache_ready_(w, box_h) ? w : 0;
+}
+
+MainMenu::ThumbSlot* MainMenu::find_thumb_(uint32_t key) const {
+  for (int i = 0; i < thumb_slots_n_; ++i)
+    if (thumb_slots_[i].valid && thumb_slots_[i].key == key)
+      return &thumb_slots_[i];
+  return nullptr;
+}
+
+bool MainMenu::get_item_thumb(int index, Thumb& out) const {
+  // spare_cache_valid() and not just thumb_bits_: the OOM handler can release
+  // the spare from inside any allocation, this draw's included.
+  if (!thumb_bits_ || thumb_slots_n_ == 0 || !buf_ || !buf_->spare_cache_valid(thumb_gen_) ||
+      is_separator(index) || is_action_row_(index))
+    return false;
+  const int real = entries_index_for(index);
+  if (real < 0 || real >= static_cast<int>(entries_.size()))
+    return false;
+
+  // Keyed by path, not by entries_ index: entries_ is rebuilt on every visit
+  // and its order moves whenever a book is opened.
+  const uint32_t key = thumb_key_(entries_[real].path);
+  ThumbSlot* slot = find_thumb_(key);
+  if (!slot) {
+    // Least recently drawn slot; empty ones carry stamp 0 and go first. Rows
+    // drawn earlier in this pass carry newer stamps, so a page never evicts its
+    // own covers.
+    slot = &thumb_slots_[0];
+    for (int i = 1; i < thumb_slots_n_; ++i)
+      if (thumb_slots_[i].used < slot->used)
+        slot = &thumb_slots_[i];
+    slot->key = key;
+    slot->valid = true;
+    load_thumb_(entries_[real].path, thumb_slot_bits_(*slot), *slot);
+  }
+  slot->used = ++thumb_clock_;
+  if (slot->w == 0 || !buf_->spare_cache_valid(thumb_gen_))
+    return false;
+  out.bits = thumb_slot_bits_(*slot);
+  out.w = slot->w;
+  out.h = slot->h;
+  return true;
+}
+
+// cover_list.bin: w, h, then 1 bpp rows (bit clear = ink), already fitted to the
+// row's box. Read straight into the slot — a header and one fread. Leaves
+// slot.w == 0 when there is no usable file, which is cached like any other
+// answer so a coverless book is not looked up again on every redraw.
+void MainMenu::load_thumb_(const std::string& book_path, uint8_t* dst, ThumbSlot& slot) const {
+  slot.w = slot.h = 0;
+  if (buf_)
+    buf_->wait_panel_idle();  // the card shares SPI2 with the panel
+  const std::string path = cover_list_bin_path(book_path.c_str());
+  FILE* f = std::fopen(path.c_str(), "rb");
+  if (!f)
+    return;
+  uint16_t hdr[2] = {};
+  bool ok = std::fread(hdr, 2, 2, f) == 2 && hdr[0] > 0 && hdr[1] > 0 && hdr[0] <= thumb_w_ && hdr[1] <= thumb_h_;
+  // After the last allocation (newlib takes the FILE buffer on the first fread):
+  // if the OOM handler ran, the spare and dst are gone.
+  ok = ok && buf_ && buf_->spare_cache_valid(thumb_gen_);
+  const size_t body = ok ? static_cast<size_t>((hdr[0] + 7) / 8) * hdr[1] : 0;
+  // Exactly the declared size and not a byte more: anything else is not a
+  // cover (a truncated download, or an HTML error page saved under the name).
+  ok = ok && std::fread(dst, 1, body, f) == body && std::fgetc(f) == EOF;
+  std::fclose(f);
+  if (!ok)
+    return;
+  slot.w = static_cast<uint8_t>(hdr[0]);
+  slot.h = static_cast<uint8_t>(hdr[1]);
+}
+
+void MainMenu::forget_thumbs_() const {
+  for (ThumbSlot& s : thumb_slots_)
+    s = ThumbSlot{};
+  thumb_clock_ = 0;
+}
 
 }  // namespace wintergreen

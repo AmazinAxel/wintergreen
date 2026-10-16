@@ -184,6 +184,7 @@ void ReaderScreen::start(DrawBuffer& buf, IRuntime& runtime) {
   // flag once, after the engine is fully configured.
   resume_back_pending_ = config::kResumeOnePageBack;
   render_page_(buf);
+  prerender_pending_ = true;
   return;
 
 show_error:
@@ -225,6 +226,7 @@ void ReaderScreen::resume(DrawBuffer& buf, IRuntime& runtime) {
       (app_ ? app_->rotate_reader() : 0) == snapshot_rotation_ && buf.has_snapshot() &&
       buf.restore_snapshot()) {
     snapshot_ok_ = false;
+    prerender_pending_ = true;  // the snapshot claimed the spare the pre-drawn page was in
     return;
   }
   snapshot_ok_ = false;
@@ -250,6 +252,7 @@ void ReaderScreen::resume(DrawBuffer& buf, IRuntime& runtime) {
     layout_engine_.set_source(*chapter_src_);
 
   render_page_(buf);
+  prerender_pending_ = true;
 }
 
 void ReaderScreen::stop() {
@@ -337,6 +340,8 @@ void ReaderScreen::update(const ButtonState& buttons, DrawBuffer& buf, IRuntime&
           saved_chapter_idx_ = chapter_idx_;
           saved_page_pos_ = page_pos_;
           app_->quickmenu()->set_settings(&reader_settings_);
+          // Power tap → the top setting; front select → the chapter being read.
+          app_->quickmenu()->set_open_on_chapter(!app_->confirm_from_power());
           app_->quickmenu()->populate(wgb_.toc(), static_cast<uint16_t>(chapter_idx_), page_pos_.paragraph,
                                            display_title_(), progress_pct(), chapter_progress_pct(),
                                            wgb_.chapter_count());
@@ -373,10 +378,14 @@ void ReaderScreen::update(const ButtonState& buttons, DrawBuffer& buf, IRuntime&
       render_page_(buf);
     buf.refresh();
     // The panel is now busy for a few hundred ms and the reader is
-    // overwhelmingly likely to go forward again. A backward turn already leaves
-    // prev_page_()'s layout in page_cache_.
-    if (page_delta > 0)
-      prerender_next_page_(buf, runtime);
+    // overwhelmingly likely to go forward next — after a backward turn too,
+    // where "forward" is the page just left. The CPU would only be waiting out
+    // the waveform otherwise.
+    prerender_next_page_(buf, runtime);
+    prerender_pending_ = false;
+  } else if (prerender_pending_) {
+    prerender_pending_ = false;
+    prerender_next_page_(buf, runtime);
   }
 }
 

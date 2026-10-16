@@ -306,10 +306,11 @@ bool convert_epub_to_wgb_streaming(Book& book, const char* output_path, uint8_t*
   bool ok = writer.finish(book.metadata(), toc_work);
   writer.close();  // explicit close so fclose() happens before we return
 
-  // Extract the covers alongside the WGB if the EPUB has one. The device
+  // Extract the covers alongside the WGB if the EPUB has one, each already at
+  // the size its screen draws it: the device never scales a cover. The device
   // cannot generate these itself for a converted book — there is no EPUB on the
   // card — so anything not written here is simply absent.
-  //   cover.bin        160x240, book list
+  //   cover_list.bin   kListCoverW x kListCoverH, book list rows — read 1:1
   //   cover_home.bin   kHomeCoverW x kHomeCoverH, home carousel — sized to the
   //                    box so the device blits it 1:1 and dithers only once
   //   cover_sleep.bin  kSleepCoverW x kSleepCoverH, composed exactly as the
@@ -320,8 +321,8 @@ bool convert_epub_to_wgb_streaming(Book& book, const char* output_path, uint8_t*
     if (pos != std::string::npos) {
       const size_t work_sz = work_buf ? (ZipEntryInput::kDecompSize + ZipEntryInput::kDictSize + 1024) : 0;
       std::string p = base;
-      p.replace(pos, 8, "cover.bin");
-      book.write_cover_bin(p.c_str(), 160, 240, work_buf, work_sz);
+      p.replace(pos, 8, "cover_list.bin");
+      book.write_cover_bin(p.c_str(), kListCoverW, kListCoverH, work_buf, work_sz);
       p = base;
       p.replace(pos, 8, "cover_home.bin");
       book.write_cover_bin(p.c_str(), kHomeCoverW, kHomeCoverH, work_buf, work_sz);

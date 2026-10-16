@@ -86,161 +86,43 @@ static void draw_outline(DrawBuffer& buf, int x, int y, int w, int h, int t = 1)
   buf.fill_rect(x + w - t, y,         t, h, false);
 }
 
-// 4x4 ordered dither, used when an oversized cover is area-averaged down: the
-// average is a coverage fraction, and a hard 50% threshold would throw away
-// every tone between paper and ink.
-static constexpr uint8_t kBayer4[4][4] = {
-  { 0,  8,  2, 10},
-  {12,  4, 14,  6},
-  { 3, 11,  1,  9},
-  {15,  7, 13,  5},
-};
-
 void HomeScreen::load_cover_(int i, int box_w, int box_h) const {
-  cover_data_.clear();
-  cover_w_ = cover_h_ = 0;
   cover_slot_ = i;
-  if (i < 0 || i >= num_books_) return;
-
-  // cover_home.bin first: the converter renders it to fit this box exactly
-  // (kHomeCoverW × kHomeCoverH), dithering once from the original grayscale, so
-  // the scaler below reduces to a 1:1 copy. The 160x240 list thumbnail is the
-  // only fallback and can only be pixel-doubled; cover_sleep.bin is no use here
-  // since it is composed with letterbox bars for the panel.
-  // Both files are the same format — w,h then 1bpp rows, bit clear = ink.
-  FILE* f = nullptr;
-  if (!slots_[i].home_path.empty())
-    f = std::fopen(slots_[i].home_path.c_str(), "rb");
-  if (!f && !slots_[i].bin_path.empty())
-    f = std::fopen(slots_[i].bin_path.c_str(), "rb");
-  if (!f) return;
+  cover_w_ = cover_h_ = 0;
+  cover_data_.clear();
+  if (i < 0 || i >= num_books_ || slots_[i].home_path.empty())
+    return;
+  FILE* f = std::fopen(slots_[i].home_path.c_str(), "rb");
+  if (!f)
+    return;
   uint16_t hdr[2] = {};
-  if (std::fread(hdr, 2, 2, f) != 2) { std::fclose(f); return; }
-  const int src_w = hdr[0], src_h = hdr[1];
-  if (src_w <= 0 || src_h <= 0) { std::fclose(f); return; }
-
-  int dst_w, dst_h;
-  const bool downscale = src_w > box_w || src_h > box_h;
-  if (!downscale) {
-    // Upscale by a whole number only — pixel-doubling keeps the 1-bit dither
-    // intact where a fractional nearest-neighbour scale would moiré it.
-    const int k = std::max(1, std::min(box_w / src_w, box_h / src_h));
-    dst_w = src_w * k;
-    dst_h = src_h * k;
-  } else {
-    dst_w = box_w;
-    dst_h = src_h * box_w / src_w;
-    if (dst_h > box_h) { dst_h = box_h; dst_w = src_w * box_h / src_h; }
+  if (std::fread(hdr, 2, 2, f) != 2 || hdr[0] == 0 || hdr[1] == 0 || hdr[0] > box_w || hdr[1] > box_h) {
+    std::fclose(f);
+    return;
   }
-  if (dst_w <= 0 || dst_h <= 0) { std::fclose(f); return; }
-
-  const int src_stride = (src_w + 7) / 8;
-  const int dst_stride = (dst_w + 7) / 8;
-  // **Reserve to the largest cover once; never reallocate.** `assign` on a
-  // vector whose size differs reallocates, holding the old and new blocks at
-  // the same time — ~25 KB each here. With the clicker's ~40 KB of BLE also
-  // resident that spike is what throws std::bad_alloc, and with exceptions off
-  // that is an abort(): the device reboots mid-session, in load_cover_, with
-  // no BLE frame anywhere in the backtrace.
-  //
-  // Reserving the maximum makes the capacity constant for the life of the
-  // screen, so every later cover is a fill into memory already held.
-  const size_t need = static_cast<size_t>(dst_stride) * dst_h;
+  const size_t need = static_cast<size_t>((hdr[0] + 7) / 8) * hdr[1];
+  // **Reserve to the largest cover once; never reallocate.** A vector whose size
+  // changes reallocates, holding the old and new blocks at once — ~25 KB each
+  // here, and with the clicker's BLE resident that spike was a bad_alloc, i.e. an
+  // abort() and a reboot mid-session. With the capacity fixed for the life of
+  // the screen, every later cover is a fill into memory already held.
   if (cover_data_.capacity() < kCoverBytesMax)
     cover_data_.reserve(kCoverBytesMax);
-  cover_data_.clear();
-  cover_data_.resize(need, 0xFF);
-  std::vector<uint8_t> src_row(src_stride);
-
-  auto set_ink = [&](int dx, int dy) {
-    cover_data_[static_cast<size_t>(dy) * dst_stride + (dx >> 3)] &=
-        static_cast<uint8_t>(~(1u << (7 - (dx & 7))));
-  };
-
-  if (!downscale) {
-    int prev_sy = -1;
-    for (int dy = 0; dy < dst_h; ++dy) {
-      const int sy = dy * src_h / dst_h;
-      if (sy != prev_sy) {
-        std::fseek(f, 4 + static_cast<long>(sy) * src_stride, SEEK_SET);
-        if (std::fread(src_row.data(), 1, src_stride, f) != static_cast<size_t>(src_stride))
-          { cover_data_.clear(); break; }
-        prev_sy = sy;
-      }
-      for (int dx = 0; dx < dst_w; ++dx) {
-        const int sx = dx * src_w / dst_w;
-        if (!((src_row[sx >> 3] >> (7 - (sx & 7))) & 1))
-          set_ink(dx, dy);
-      }
-    }
-  } else {
-    // Box filter: every source pixel lands in exactly one destination cell, so
-    // the whole image is read once, sequentially, with a row of counters as the
-    // only extra state.
-    std::vector<uint16_t> col_cnt(dst_w, 0);
-    for (int sx = 0; sx < src_w; ++sx)
-      ++col_cnt[sx * dst_w / src_w];
-    std::vector<uint32_t> acc(dst_w, 0);
-    int cur_dy = 0, rows_in = 0;
-
-    auto flush = [&](int dy) {
-      if (rows_in == 0 || dy >= dst_h) return;
-      for (int dx = 0; dx < dst_w; ++dx) {
-        const uint32_t total = static_cast<uint32_t>(col_cnt[dx]) * rows_in;
-        if (total == 0) continue;
-        const uint32_t thr = 2u * kBayer4[dy & 3][dx & 3] + 1u;
-        if (acc[dx] * 32u > total * thr)
-          set_ink(dx, dy);
-      }
-    };
-
-    for (int sy = 0; sy < src_h; ++sy) {
-      if (std::fread(src_row.data(), 1, src_stride, f) != static_cast<size_t>(src_stride))
-        { cover_data_.clear(); break; }
-      const int dy = sy * dst_h / src_h;
-      if (dy != cur_dy) {
-        flush(cur_dy);
-        cur_dy = dy;
-        rows_in = 0;
-        std::fill(acc.begin(), acc.end(), 0u);
-      }
-      for (int sx = 0; sx < src_w; ++sx)
-        if (!((src_row[sx >> 3] >> (7 - (sx & 7))) & 1))
-          ++acc[sx * dst_w / src_w];
-      ++rows_in;
-    }
-    if (!cover_data_.empty())
-      flush(cur_dy);
+  if (need > cover_data_.capacity()) {
+    std::fclose(f);
+    return;
   }
-
-  // Trim all-white rows off the top and bottom. Plenty of covers carry a white
-  // band above and below the artwork, and with a frame drawn a fixed distance
-  // from the bitmap those bands read as lopsided padding. Columns are left
-  // alone: the cover is fitted to the box width, so side bands are rare.
-  if (!cover_data_.empty()) {
-    auto row_blank = [&](int row) {
-      const uint8_t* r = cover_data_.data() + static_cast<size_t>(row) * dst_stride;
-      for (int b = 0; b < dst_stride; ++b)
-        if (r[b] != 0xFF) return false;  // tail bits past dst_w are never written
-      return true;
-    };
-    int top = 0, bot = dst_h - 1;
-    while (top <= bot && row_blank(top)) ++top;
-    while (bot > top && row_blank(bot)) --bot;
-    if (top <= bot && (top > 0 || bot < dst_h - 1)) {
-      const size_t off = static_cast<size_t>(top) * dst_stride;
-      const size_t keep = static_cast<size_t>(bot - top + 1) * dst_stride;
-      std::memmove(cover_data_.data(), cover_data_.data() + off, keep);
-      cover_data_.resize(keep);
-      dst_h = bot - top + 1;
-    }
-  }
-
-  if (!cover_data_.empty()) {
-    cover_w_ = static_cast<uint16_t>(dst_w);
-    cover_h_ = static_cast<uint16_t>(dst_h);
-  }
+  cover_data_.resize(need);
+  // Exactly the declared size: anything else is not a cover (a truncated
+  // download, or an HTML error page saved under the name).
+  const bool ok = std::fread(cover_data_.data(), 1, need, f) == need && std::fgetc(f) == EOF;
   std::fclose(f);
+  if (!ok) {
+    cover_data_.clear();
+    return;
+  }
+  cover_w_ = hdr[0];
+  cover_h_ = hdr[1];
 }
 
 void HomeScreen::on_start() {
@@ -341,7 +223,6 @@ void HomeScreen::on_start() {
     slots_[i].path = e.path.to_string(pool);
     slots_[i].title.assign(e.title.view(pool));
     slots_[i].author.assign(e.author.view(pool));
-    slots_[i].bin_path = cover_bin_path(slots_[i].path.c_str());
     slots_[i].home_path = cover_home_bin_path(slots_[i].path.c_str());
     add_item(slots_[i].title);
   }
@@ -507,8 +388,7 @@ void HomeScreen::draw_all_(DrawBuffer& buf, std::optional<uint8_t> battery_pct) 
   const int cover_boxw = std::max(0, box_w - 2 * inset);
   const int cover_boxh = std::max(0, box_h - 2 * inset);
   if (cover_slot_ != sel) {
-    // The card shares SPI2 with the panel, and the full-res cover is a much
-    // longer read than the old thumbnail — never overlap it with a refresh.
+    // The card shares SPI2 with the panel; never overlap the read with a refresh.
     buf.wait_panel_idle();
     load_cover_(sel, cover_boxw, cover_boxh);
   }

@@ -56,6 +56,9 @@ class EInkDisplay : public wintergreen::IDisplay {
 
   bool isScreenOn = false;
   bool inDeepSleep_ = false;
+  // When begin() let go of RST; finish_begin() waits out the rest of the settle.
+  static constexpr uint32_t kResetSettleMs = 20;
+  uint32_t reset_released_ms_ = 0;
   // millis() at MASTER_ACTIVATION of a refresh that was fired without waiting;
   // 0 = nothing outstanding. Collected by waitWhileBusy().
   uint32_t pending_refresh_start_ = 0;
@@ -108,8 +111,28 @@ class EInkDisplay : public wintergreen::IDisplay {
     dev.queue_size = 2;  // one in flight + one queued for the async bulk path
     spi_bus_add_device(SPI2_HOST, &dev, &spi_);
 
-    resetDisplay();
-    initDisplayController(true);
+    // Reset pulse only. The panel needs ~20 ms after RST rises before it takes
+    // commands, and main.cpp spends that mounting the SD card (same bus, but
+    // the panel ignores SPI with CS high) instead of sleeping through it. Every
+    // wake is a boot, so this is on the path of every wake.
+    gpio_set_level(EPD_RST, 1);
+    delay(20);
+    gpio_set_level(EPD_RST, 0);
+    delay(2);
+    gpio_set_level(EPD_RST, 1);
+    reset_released_ms_ = millis();
+  }
+
+  // Second half of begin(): wait out whatever is left of the post-reset settle,
+  // then configure the controller. No RAM clear: the first thing drawn is
+  // Application::start()'s full_refresh(), which writes both planes over the
+  // whole panel, so the two auto-write fills (and their busy waits) were paid
+  // for and then overwritten on every boot.
+  void finish_begin() {
+    const uint32_t since = millis() - reset_released_ms_;
+    if (since < kResetSettleMs)
+      delay(kResetSettleMs - since);
+    initDisplayController();
   }
 
   // ---- wintergreen::IDisplay ----
@@ -211,7 +234,7 @@ class EInkDisplay : public wintergreen::IDisplay {
     gpio_set_level(EPD_RST, 1);
     delay(200);
     waitWhileBusy("post-HWRESET");
-    initDisplayController(false);
+    initDisplayController();
     inDeepSleep_ = false;
   }
 
@@ -290,15 +313,6 @@ class EInkDisplay : public wintergreen::IDisplay {
     }
     if (comment) {
     }
-  }
-
-  void resetDisplay() {
-    gpio_set_level(EPD_RST, 1);
-    delay(20);
-    gpio_set_level(EPD_RST, 0);
-    delay(2);
-    gpio_set_level(EPD_RST, 1);
-    delay(20);
   }
 
   // wait=false fires the waveform and returns immediately, leaving the panel busy.
@@ -427,7 +441,7 @@ class EInkDisplay : public wintergreen::IDisplay {
     waitWhileBusy();
   }
 
-  void initDisplayController(bool clearBuffer) {
+  void initDisplayController() {
     sendCommand(CMD_SOFT_RESET);
     waitWhileBusy("CMD_SOFT_RESET");
 
@@ -449,20 +463,6 @@ class EInkDisplay : public wintergreen::IDisplay {
     sendCommand(CMD_BORDER_WAVEFORM);
     sendData(0x01);
 
-    if (clearBuffer) {
-      clearDisplay();
-    }
-
-  }
-
-  void clearDisplay() {
-    sendCommand(CMD_AUTO_WRITE_BW_RAM);
-    sendData(0x77);
-    waitWhileBusy("CMD_AUTO_WRITE_BW_RAM");
-
-    sendCommand(CMD_AUTO_WRITE_RED_RAM);
-    sendData(0x77);
-    waitWhileBusy("CMD_AUTO_WRITE_RED_RAM");
   }
 
   void setRamArea(uint16_t x, uint16_t y, uint16_t w, uint16_t h) {

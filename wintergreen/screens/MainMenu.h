@@ -7,6 +7,7 @@
 #include "../Input.h"
 #include "../content/StringPool.h"
 #include "../display/DrawBuffer.h"
+#include "../content/CoverPaths.h"
 #include "ListMenuScreen.h"
 
 namespace wintergreen {
@@ -70,9 +71,12 @@ class MainMenu final : public ListMenuScreen {
   // The Sync action never has an author line under it.
   bool is_single_line_row(int index) const override { return is_action_row_(index); }
   int count() const override;
+  int prepare_thumbs(int box_h) const override;
+  bool get_item_thumb(int index, Thumb& out) const override;
 
   void start(DrawBuffer& buf, IRuntime& runtime) override {
     buf_ = &buf;
+    sync_runtime_ = &runtime;  // the first draw happens inside start(), before update()
     ListMenuScreen::start(buf, runtime);
   }
 
@@ -162,6 +166,43 @@ class MainMenu final : public ListMenuScreen {
 
   std::vector<BookEntry> hidden_;
   bool show_hidden_ = false;
+
+  // ── Cover thumbnails ──────────────────────────────────────────────────────
+  // cover_list.bin, which the converter renders to fit the row's box
+  // (kListCoverW x kListCoverH): a load is a header and one fread straight into
+  // the slot, no scaling. Loaded the first time a row is drawn, during that draw,
+  // so a page and its covers arrive in one refresh; nothing is read ahead. A
+  // book without the file (no cover, or converted before it existed) draws an
+  // empty frame.
+  //
+  // Slots live in DrawBuffer's spare framebuffer (claim_spare_cache): no
+  // allocation, keyed by path, surviving list visits until the reader, the sleep
+  // path or a radio claims the spare.
+  static constexpr int kThumbSlotsMax = 40;
+  static constexpr int kThumbMaxW = 96;
+  struct ThumbSlot {
+    uint32_t key = 0;     // FNV-1a of the book path
+    bool valid = false;
+    uint32_t used = 0;    // last-use stamp, for eviction
+    uint8_t w = 0, h = 0; // 0 = the book has no usable cover
+  };
+  mutable uint8_t* thumb_bits_ = nullptr;  // trust only while spare_cache_valid(thumb_gen_)
+  mutable uint32_t thumb_gen_ = 0;
+  mutable int thumb_w_ = kListCoverW, thumb_h_ = kListCoverH;  // the box every slot is sized for
+  mutable int thumb_slots_n_ = 0;
+  mutable ThumbSlot thumb_slots_[kThumbSlotsMax];
+  mutable uint32_t thumb_clock_ = 0;
+  size_t thumb_slot_bytes_() const { return static_cast<size_t>((thumb_w_ + 7) / 8) * thumb_h_; }
+  static uint32_t thumb_key_(const std::string& path);
+  // Claims (or re-validates) the cache for a w x h box; false when the spare is
+  // unavailable. Changing the box empties every slot.
+  bool thumb_cache_ready_(int w, int h) const;
+  ThumbSlot* find_thumb_(uint32_t key) const;
+  uint8_t* thumb_slot_bits_(const ThumbSlot& s) const {
+    return thumb_bits_ + static_cast<size_t>(&s - thumb_slots_) * thumb_slot_bytes_();
+  }
+  void load_thumb_(const std::string& book_path, uint8_t* dst, ThumbSlot& slot) const;
+  void forget_thumbs_() const;  // a book may have changed under its path
 
   // Last sync state painted, so the Sync row repaints when it changes.
   SyncState sync_shown_ = SyncState::Unavailable;

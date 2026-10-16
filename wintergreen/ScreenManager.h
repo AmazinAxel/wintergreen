@@ -25,6 +25,17 @@ class ScreenManager {
     screen->start(buf, runtime);
   }
 
+  // Put a screen on the stack without starting it. Only valid as the root,
+  // immediately followed by a push on top: the next thing it receives is pause()
+  // (a no-op for a never-started list screen), then resume() — start() by
+  // default — when whatever is above it pops. Boot uses it to resume a book
+  // without first building and drawing a home screen nobody will see.
+  void push_inactive(IScreen* screen) {
+    if (!screen || depth_ != 0)
+      return;
+    stack_[depth_++] = screen;
+  }
+
   // Swap the top screen for another, leaving the rest of the stack untouched.
   //
   // Not pop()+push(): pop() resumes whatever is underneath, which for

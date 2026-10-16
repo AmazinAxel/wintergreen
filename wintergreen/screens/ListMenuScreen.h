@@ -79,6 +79,10 @@ class ListMenuScreen : public IScreen {
   // Two-line rows (title + subtitle, full-width divider, right-hand column) instead of
   // the default centred single-line rows. Set by book-list style screens.
   bool detail_list_ = false;
+  // Title lines a detail row reserves. With 2 the title word-wraps onto a second
+  // line and the row keeps that height even for a one-line title, so every book
+  // row is the same size and its cover gets the room. Set by MainMenu.
+  int detail_title_lines_ = 1;
 
   // Plain chrome: centred title header and the battery/nav-glyph footer, instead of the
   // standard "wintergreen" status bar and labelled nav boxes. Used by overlay-style
@@ -166,6 +170,21 @@ class ListMenuScreen : public IScreen {
   // detail_list_ rows: right-aligned text on the title line (e.g. read time, "–").
   // Default returns empty (no right column). Override per screen.
   virtual std::string_view get_item_right(int index) const { return {}; }
+
+  // detail_list_ rows: a 1 bpp image at the right-hand end (MainMenu's covers).
+  // MSB first, bit clear = ink, rows (w + 7) / 8 bytes apart.
+  struct Thumb {
+    const uint8_t* bits = nullptr;
+    int w = 0, h = 0;
+  };
+  // Called once per draw with the height every two-line row offers the image.
+  // Returns the width of the column to reserve, 0 for none — which is also what
+  // a screen returns when it cannot hold thumbnails right now, so the rows fall
+  // back to the full width rather than showing a column of empty frames.
+  virtual int prepare_thumbs(int box_h) const { return 0; }
+  // The image for row `index`, already fitted to the box. False draws an empty
+  // frame in its place.
+  virtual bool get_item_thumb(int index, Thumb& out) const { return false; }
 
   // left side of the top bar header (e.g. "X books", "Settings").
   // Default returns title_ if set. Override per screen.

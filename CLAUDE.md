@@ -84,6 +84,22 @@ validates), `BOOTLOADER_LOG_LEVEL_NONE` (~78 ms of UART per boot), and
 `RTC_CLK_CAL_CYCLES=256` (precision only matters for *timer* wake; this device wakes
 on GPIO).
 
+More wake-path rules, each worth a measurable slice of every wake: **the boot holds
+the 160 MHz PM lock** from `main.cpp` (the runtime's constructor configures DFS, so
+without it the whole boot ran at 80 MHz); **`verify_battery()` does not sleep** between
+its eight samples (it used to spend 175 ms); **the ROM banner is suppressed** —
+`deep_sleep_now_()` calls `esp_deep_sleep_disable_rom_logging()` on every entry, a
+few hundred UART characters per wake; **the panel's post-reset settle overlaps the
+card mount** (`EInkDisplay::begin()` / `finish_begin()`), and its boot-time RAM clear
+is gone because `start()`'s `full_refresh()` writes both planes anyway; and
+**resuming into a book does not build the home screen** — `ScreenManager::push_inactive`
+puts it under the reader unstarted, and the index is read by `record_book_progress()`
+(or the home screen's own resume) only when something needs it. The reader then
+pre-draws the next page on its first frame (`prerender_pending_`, also set on book open
+and quick-menu return), so the first turn after waking is a memcpy. Going to sleep,
+`do_sleep_()` puts the sleep screen up **before** stopping the reader and saving, so
+those SD writes are not latency; the panel's `deep_sleep()` is sent last.
+
 **The CPU never sleeps between frames.** `wait_next_frame()` `vTaskDelay`s to a 25 ms
 cadence, so the core wakes 40×/s at ~15 mA. With no light sleep available the only
 lever is reaching deep sleep sooner. A longer frame period saves a fraction of a
@@ -106,7 +122,7 @@ Three invariants; breaking any one undoes it or worse:
   lock a page turn would run at the idle clock — up to 2× slower, a net regression.
   `IRuntime::set_performance_hold` wraps an `ESP_PM_CPU_FREQ_MAX` lock;
   `Application::update` raises it on button activity or a pending screen transition and
-  drops it after `kPerfHoldMs` (750 ms) of quiet. Acquire/release are skipped when
+  drops it after `kPerfHoldMs` (300 ms) of quiet. Acquire/release are skipped when
   unchanged.
 
 ### Input and holds
@@ -130,9 +146,21 @@ layout padding and is fixed. The reversed orientations are no longer reachable
 (`rotate_reader` is 0 or 1, and both setter and loader clamp), but the `Rotation` enum
 keeps all four values for the panel driver, so the hazard applies to any new check.
 
-5 ms button sampling (`input.h`) under a 25 ms UI frame (`main.cpp`), so a press lands
-on the next frame. Screens repaint only on state changes, so frame rate does not drive
+5 ms button sampling (`input.h`) under a 25 ms UI frame (`main.cpp`). **An input edge
+ends the frame wait early** (`ui_wake.h`: the sampler and the clicker give a binary
+semaphore that `wait_next_frame()` takes with the frame timeout), so a press is handled
+within a sample or two instead of waiting out the rest of the frame — free in power,
+since the loop wakes no more often than before when nothing is pressed. A semaphore,
+not a task notification, because IDF drivers the UI task calls may block on its
+notification slot. Screens repaint only on state changes, so frame rate does not drive
 panel traffic.
+
+**Card writes are kept off transitions.** A reader close (`record_book_progress`) and a
+pop from the reader stack set `persist_pending_` instead of writing the index and
+settings; `Application::update` flushes them once input has been still for
+`kPersistQuietMs` (400) and the panel is idle, and `do_sleep_()` flushes whatever is
+left. Anything that reloads the index from disk must call `flush_persist()` first —
+`MainMenu::run_sync_` does.
 
 **Never measure a hold in frames.** Frame duration swings with how much a screen
 rendered and whether the panel was mid-refresh. Use `runtime.frame_time_ms()` (the
@@ -167,7 +195,11 @@ only yields, so any wait loop using it spins the CPU flat out. `epd.h`'s
 GPIO3, the only non-ADC key, handled entirely in `Application::update`, not by any
 screen. Held for `kPowerHoldSleepMs` it sleeps; released sooner it is forwarded to the
 top screen as a synthetic `Button1` (Confirm), so "select" and "open the quick menu"
-come for free. Three load-bearing details:
+come for free. `power_confirm_` marks that frame's Confirm as the power key so the
+reader can open its quick menu on the top setting for it and on the current chapter
+for the front select key. **There is no double tap anywhere** — one was built here and
+removed as unintuitive; don't add one (it also forces a wait on every single tap).
+Three load-bearing details:
 
 - It arms only on a **rising edge**. The press that wakes the device is cleared by
   `input.clear_button(Button::Power)` in `main.cpp`, so a wake hold can never read as
@@ -346,7 +378,7 @@ survived sleep anyway, and every session is bracketed by two full-panel waveform
 
 | When | What runs |
 |---|---|
-| going to sleep | the sleep image — `full_refresh(RefreshMode::Full)` for a book cover, `Half` for the wordmark |
+| going to sleep | the sleep image — `full_refresh(RefreshMode::Half)`, cover or wordmark |
 | waking | `Application::start()`'s `full_refresh()` (Half) |
 
 With `kAutoSleepMinutes = 1` that is a full-panel waveform every time the device is put
@@ -699,29 +731,21 @@ item/selection/navigation machinery; every pixel comes from its own `draw_all_`.
 - The selected cover is loaded on demand **from inside `draw_all_`** (hence the `mutable`
   cover members). Loading from `update()` would draw one frame with the previous cover
   and then redraw — two e-ink refreshes per press.
-- **There is exactly one cover cached, and a second one crashes the device** — see
-  "Investigated and rejected". `cover_slot_` is what stops the card being re-read every
+- **There is exactly one cover on the heap, and a second one crashes the device** — see
+  "Investigated and rejected".
+  `cover_slot_` is what stops the card being re-read every
   frame, including for a book with no cover file: empty `cover_data_` with a valid
   `cover_slot_` is a real state, not a miss.
 - `on_start()` clears `cover_slot_` because it rebuilds `slots_` from the index — a sync,
   a serial upload or a delete repoints every index without necessarily changing one.
-- The cover comes from **`cover_home.bin`**, rendered by the converter to fit the box
-  exactly (`kHomeCoverW` × `kHomeCoverH` = 424x479 in `content/CoverPaths.h`), so the
-  scaler collapses to a 1:1 copy and the image is dithered exactly once. `cover.bin`
-  (160x240) is the only fallback and can only be pixel-doubled. **`cover_sleep.bin` is
-  not a fallback here** — it is composed for the panel with letterbox bars baked in.
-  Those two constants mirror `draw_all_`'s layout maths; if the layout moves they drift,
-  the fallback takes over and quality quietly regresses until the library is
-  re-converted.
-- Two scaling paths. **Upscaling is whole-number only**: pixel-doubling keeps the 1-bit
-  dither intact where a fractional nearest-neighbour scale moirés it. **Downscaling is a
-  box filter plus a 4x4 ordered dither** — the average of a cell is a coverage fraction,
-  and a hard 50% threshold would throw away every tone between paper and ink. Nothing the
-  converter writes reaches the downscale path any more; it is kept for the case where the
-  layout box shrinks below `kHomeCoverW`/`kHomeCoverH` before a re-conversion.
-- All-white rows are **trimmed off the top and bottom**. Covers often carry a white band
-  above and below the artwork, and with the frame at a fixed distance those read as
-  lopsided padding. Columns are left alone.
+- The cover is **`cover_home.bin`**, rendered by the converter to fit the box
+  (`kHomeCoverW` × `kHomeCoverH` = 424x486 in `content/CoverPaths.h`) with its blank top
+  and bottom rows already trimmed (`Book::write_cover_bin`), so a load is a header and
+  one `fread` into `cover_data_`. **There is no scaler on the device** and no fallback
+  file: a missing or oversized cover draws the placeholder frame. `cover_sleep.bin` is
+  not a substitute — it is composed for the panel with bars baked in. The two constants
+  mirror `draw_all_`'s layout maths; if the layout moves they drift and every cover
+  shows the placeholder until the library is re-converted.
 - The cover read calls `wait_panel_idle()` first: the card shares SPI2 with the panel.
 
 ### QuickmenuScreen
@@ -732,8 +756,11 @@ selecting a chapter sets `pending_chapter()` / `pending_para_index()` and pops o
 `ReaderScreen::resume()` consumes them.
 
 **Item 0 *is* the header block** — book title, chapter and their two percentages.
-Selecting it pops back to the book, and it is the default selection, so opening the menu
-and pressing Confirm is a no-op round trip. It is a real list item rather than a special
+Selecting it pops back to the book. It is **not** the default selection: a power-button
+tap opens on the first setting row (the Page Turner when a clicker is configured), the
+front select key on the chapter being read (`set_open_on_chapter()`, from
+`Application::confirm_from_power()`). `refresh_items_()` bypasses `start()` and keeps the
+cursor. It is a real list item rather than a special
 case, so navigation, wrap-around and `on_select` dispatch work without changes. What it
 is *not* is a row: `draw_all_` paints it at the top and inverts the whole block when
 `selected() == kIdxBack`, and the list loop starts at `kIdxBack + 1`. Two places must
@@ -836,6 +863,22 @@ gone. Two per-instance booleans select the remaining variations:
   **subtitle** baseline, bottom right beside the author, so the title gets the full row
   width. The **last** row draws no divider, and neither does a row whose next row is a
   section hairline, or the two rules land a few pixels apart and read as a double line.
+  MainMenu adds a **cover thumbnail** at the far right of each book row (`prepare_thumbs`
+  / `get_item_thumb`) and book rows reserve **two title lines** (`detail_title_lines_`;
+  the title wraps at a word, a one-line title leaves the second blank) so the cover gets
+  a 76x115 box. The file is `cover_list.bin`, rendered by the converter to fit
+  `kListCoverW`x`kListCoverH`, so a load is a header and one `fread` straight into the
+  slot. **The device has no cover scaler** — a book without the file draws an empty
+  frame. Covers load **during the draw that first shows the row**, so a page and its
+  covers arrive in one refresh; nothing is read ahead (a prefetch of rows that might
+  never be shown was built and removed as wasted card reads and CPU). The cache lives
+  in the spare framebuffer (`DrawBuffer::claim_spare_cache`, validity by
+  `spare_cache_gen()`): no allocation, up to 40 slots, keyed by path, surviving list
+  visits until the reader, the sleep path or a radio claims the spare — with a radio up
+  the column is absent. The first version used its own `malloc` gated on 40 KB of
+  contiguous heap and showed nothing on hardware: the heap is too fragmented for that
+  gate. A load re-checks the spare after its last allocation, because the OOM handler
+  releases it from inside any allocation.
 - `plain_list_` — centred-title header instead of the battery status bar.
 
 Both false = standard header + centred single-line rows. A non-empty `subtitle_` switches
@@ -1769,7 +1812,7 @@ Output is one folder per book:
 
 ```
 <out>/<book name>/book.wgb
-<out>/<book name>/cover.bin        # 160x240, book list
+<out>/<book name>/cover_list.bin   # fitted to 76x115, book list rows
 <out>/<book name>/cover_home.bin   # fitted to 424x479, home carousel
 <out>/<book name>/cover_sleep.bin  # 480x786, composed for the panel (bars included)
 ```
@@ -2202,6 +2245,11 @@ nix-shell -p gcc --run 'g++ -std=c++17 -fsanitize=address,undefined -I. \
   (`reserve` at construction, never reallocated) rather than a second `std::vector` — and even
   then the win is a prefetch, not waveform overlap: `wait_panel_idle()` *drains* the waveform
   before an SD read rather than running alongside it.
+
+  A heap-free version (the neighbour pre-read into the spare framebuffer) was built
+  and **removed by choice**: it read a 25 KB cover the user might never move to, on
+  every pause. With the device doing no scaling a cover is one `fread`, so the
+  speculation bought little. Don't re-add read-ahead of any cover.
 - **Precomputing hyphenation into the WGB.** `find_hyphen_break` is called only when a word
   overflows a line end — roughly once per *line*, so about 30 Liang trie walks per page.
   Microseconds. Baking break points into the format would save the 27 KB trie and nothing

@@ -276,6 +276,11 @@ class ReaderScreen final : public IScreen {
   bool in_prerender_draw_ = false;
 
   void prerender_next_page_(DrawBuffer& buf, IRuntime& runtime);
+  // Set wherever a page goes up without a turn — opening the book, waking into
+  // it, returning from the quick menu — so the next update() pre-draws the page
+  // after it. Otherwise the first forward turn after any of those (the most
+  // common next action) paid for a full layout and draw.
+  bool prerender_pending_ = false;
   // Commit the pre-drawn page if it still matches; false = render normally.
   bool take_predrawn_(DrawBuffer& buf);
 

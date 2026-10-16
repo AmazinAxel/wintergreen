@@ -99,6 +99,8 @@ void QuickmenuScreen::populate(const TableOfContents& toc, uint16_t current_chap
     const std::string full = toc_->entries[best_match].label.to_string(toc_->pool);
     chapter_title_ = std::string(strip_chapter_prefix(full));
   }
+  // Before the first TOC entry (front matter) the nearest chapter is the first.
+  current_chapter_offset_ = toc_->entries.empty() ? current_chapter : std::max(best_match, 0);
 
   book_progress_pct_ = book_progress_pct;
   chapter_progress_pct_ = chapter_progress_pct;
@@ -192,9 +194,12 @@ std::string QuickmenuScreen::wintergreen_header_left() const {
 void QuickmenuScreen::start(DrawBuffer& buf, IRuntime& runtime) {
   buf_ = &buf;
   runtime_ = &runtime;
-  // Capture current selection before the base class calls on_start(), which
-  // rebuilds the list.
-  prev_selected_ = selected_index();
+  // Every opening starts afresh rather than where the cursor was last time: on
+  // the top setting (the Page Turner when a clicker is configured) for a power
+  // tap, on the current chapter for the front select key — on_start() applies
+  // that once the list exists. refresh_items_() bypasses start(), so an in-place
+  // rebuild keeps the cursor.
+  prev_selected_ = kIdxBack + 1;
   ListMenuScreen::start(buf, runtime);
 }
 
@@ -321,7 +326,13 @@ void QuickmenuScreen::on_start() {
       add_item(cbuf);
     }
   }
+  current_chapter_item_ = -1;
+  if (first_chapter_ >= 0 && current_chapter_offset_ >= 0 && first_chapter_ + current_chapter_offset_ < count())
+    current_chapter_item_ = first_chapter_ + current_chapter_offset_;
 
+  if (open_on_chapter_ && current_chapter_item_ >= 0)
+    prev_selected_ = current_chapter_item_;
+  open_on_chapter_ = false;
   // Restore selection. The item list is now fixed for a given book, so no
   // shift correction is needed.
   int sel = prev_selected_;

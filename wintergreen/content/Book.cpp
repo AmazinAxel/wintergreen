@@ -113,6 +113,29 @@ bool Book::write_cover_bin(const char* cover_path, int max_w, int max_h,
   auto err = decode_image_from_entry(file_, entry, max_w, max_h, img, work_buf, work_buf_size, /*scale_to_fill=*/false);
   if (err != ImageError::Ok || img.data.empty())
     return false;
+  // Trim all-white rows off the top and bottom. Plenty of covers carry a white
+  // band above and below the artwork, and the home carousel draws its frame a
+  // fixed distance from the bitmap, so those bands read as lopsided padding.
+  // Done here so the device never has to: it reads these files 1:1. Columns are
+  // left alone — the cover is fitted to the box width, so side bands are rare.
+  {
+    const size_t stride = img.stride();
+    auto row_blank = [&](int row) {
+      const uint8_t* r = img.data.data() + static_cast<size_t>(row) * stride;
+      for (int x = 0; x < img.width; ++x)
+        if (!((r[x >> 3] >> (7 - (x & 7))) & 1))
+          return false;
+      return true;
+    };
+    int top = 0, bot = img.height - 1;
+    while (top <= bot && row_blank(top)) ++top;
+    while (bot > top && row_blank(bot)) --bot;
+    if (top <= bot && (top > 0 || bot < img.height - 1)) {
+      img.data.erase(img.data.begin() + static_cast<long>(bot + 1) * stride, img.data.end());
+      img.data.erase(img.data.begin(), img.data.begin() + static_cast<long>(top) * stride);
+      img.height = static_cast<uint16_t>(bot - top + 1);
+    }
+  }
   FILE* f = std::fopen(cover_path, "wb");
   if (!f)
     return false;

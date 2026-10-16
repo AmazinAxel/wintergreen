@@ -10,6 +10,7 @@
 #include "wintergreen/Input.h"
 
 #include "bluetooth_clicker.h"
+#include "ui_wake.h"
 
 // Defined in serial_communication.h — serial command button injection.
 extern volatile uint8_t g_serial_buttons;
@@ -54,6 +55,8 @@ class Esp32InputSource final : public wintergreen::IInputSource {
     ch_cfg.bitwidth = ADC_BITWIDTH_DEFAULT;
     adc_oneshot_config_channel(adc_handle_, ADC_CHANNEL_1, &ch_cfg);  // GPIO1
     adc_oneshot_config_channel(adc_handle_, ADC_CHANNEL_2, &ch_cfg);  // GPIO2
+
+    ui_wake_init();  // before the sampler can fire
 
     // Start the periodic sampler. Without this nothing ever calls sample(), so
     // debounced_ stays 0 and no button — including power — can register.
@@ -214,6 +217,9 @@ class Esp32InputSource final : public wintergreen::IInputSource {
       portEXIT_CRITICAL(&lock_);
     }
 
+    // A press *or* a release: the power button acts on release.
+    if (debounced_ != prev_debounced_)
+      ui_wake();
     prev_debounced_ = debounced_;
   }
 

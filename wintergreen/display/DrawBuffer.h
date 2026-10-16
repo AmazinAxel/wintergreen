@@ -464,7 +464,7 @@ class DrawBuffer {
   //
   // The framebuffers are never loaned out as scratch, so nothing else can
   // clobber this.
-  enum class Spare : uint8_t { None, Snapshot, Offscreen };
+  enum class Spare : uint8_t { None, Snapshot, Offscreen, Cache };
 
   // Hand the spare framebuffer back to the heap, and take it again afterwards.
   //
@@ -507,6 +507,35 @@ class DrawBuffer {
   uint8_t* borrow_spare_scratch() {
     spare_use_ = Spare::None;
     return spare_;
+  }
+
+  // Lend the spare as a cache that may outlive the screen using it: the book
+  // list keeps its cover thumbnails here. Nothing draws into it while the list
+  // is up, so the reader's two uses never overlap it. Like them it is
+  // invalidated by any other claim — a snapshot, a pre-draw, the sleep path, a
+  // release.
+  //
+  // Validity is a generation, not just the enum: each time the spare *enters*
+  // cache use its contents are garbage and the generation moves, so a cache that
+  // was displaced and re-claimed cannot mistake its old slots for live ones. The
+  // owner trusts what it wrote only while
+  // spare_cache_valid(the generation it wrote under). Null when released.
+  uint8_t* claim_spare_cache() {
+    if (!spare_) {
+      spare_use_ = Spare::None;
+      return nullptr;
+    }
+    if (spare_use_ != Spare::Cache) {
+      spare_use_ = Spare::Cache;
+      ++spare_cache_gen_;
+    }
+    return spare_;
+  }
+  uint32_t spare_cache_gen() const {
+    return spare_cache_gen_;
+  }
+  bool spare_cache_valid(uint32_t gen) const {
+    return spare_use_ == Spare::Cache && gen == spare_cache_gen_;
   }
 
   void save_snapshot() {
@@ -586,7 +615,8 @@ class DrawBuffer {
     sleep_img_size_ = size;
   }
 
-  // Show the sleep image (2bpp, 4 gray levels).
+  // Show the sleep image (2bpp, 4 gray levels). Leaves the panel awake; the
+  // caller sends deep_sleep() once it is done with the card.
   // state = (RED_bit << 1) | BW_bit; 0=black, 1=dark gray, 2=light gray, 3=white.
   bool show_sleep_image_embedded() {
     if (!sleep_img_)
@@ -808,6 +838,7 @@ class DrawBuffer {
   // see release_spare().
   uint8_t* spare_ = static_cast<uint8_t*>(std::malloc(kBufSize));
   Spare spare_use_ = Spare::None;
+  uint32_t spare_cache_gen_ = 0;  // see claim_spare_cache()
   // Non-null while begin_offscreen() is in effect; see draw_().
   uint8_t* draw_target_ = nullptr;
   int active_idx_ = 0;
@@ -916,7 +947,6 @@ class DrawBuffer {
     // note in CLAUDE.md: the image is native-size, not scaled or centred.
     display_.full_refresh(inactive_(), active_(), RefreshMode::Half,
                           /*turnOffScreen=*/true);
-    display_.deep_sleep();
   }
 
   // Render target for the full inactive buffer.

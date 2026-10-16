@@ -39,7 +39,6 @@ class HomeScreen final : public ListMenuScreen {
     std::string path;
     std::string title;
     std::string author;
-    std::string bin_path;
     std::string home_path;   // exact-fit, blitted 1:1 (see kHomeCoverW in CoverPaths.h)
   };
 
@@ -78,7 +77,10 @@ class HomeScreen final : public ListMenuScreen {
   // still down; this stops the release from also opening the list.
   bool back_consumed_    = false;
 
-  // Scales the slot's cover into a box_w × box_h box, preserving aspect.
+  // Reads the slot's cover_home.bin into cover_data_. The converter renders it to
+  // fit the box (kHomeCoverW x kHomeCoverH), so this is a header and one fread —
+  // no scaling on the device. A file larger than the box, or a book without one,
+  // leaves cover_data_ empty and draws the placeholder frame.
   void load_cover_(int slot_idx, int box_w, int box_h) const;
 
   // Up↔Down and the two front nav keys, swapped: see update().

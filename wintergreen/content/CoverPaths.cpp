@@ -12,16 +12,16 @@ static std::string sibling_(const char* book_path, const char* name) {
   return (slash == std::string::npos) ? std::string(name) : p.substr(0, slash + 1) + name;
 }
 
-std::string cover_bin_path(const char* book_path) {
-  return sibling_(book_path, "cover.bin");
-}
-
 std::string cover_sleep_bin_path(const char* book_path) {
   return sibling_(book_path, "cover_sleep.bin");
 }
 
 std::string cover_home_bin_path(const char* book_path) {
   return sibling_(book_path, "cover_home.bin");
+}
+
+std::string cover_list_bin_path(const char* book_path) {
+  return sibling_(book_path, "cover_list.bin");
 }
 
 std::string book_pos_path(const char* book_path) {

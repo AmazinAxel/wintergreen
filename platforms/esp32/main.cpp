@@ -21,6 +21,17 @@
 #include "sdcard.h"
 #include "serial_communication.h"
 
+// Every deep-sleep entry goes through here. The ROM bootloader prints its banner
+// (chip, reset reason, boot mode, entry point — a few hundred characters at
+// 115200 baud) on every reset, and deep-sleep wake is a reset: tens of
+// milliseconds of each wake spent on UART output nobody reads. This suppresses
+// it for the next wake only, which is why it is set on each entry. A cold power-on
+// still prints, so a device on the bench still says what it is.
+[[noreturn]] static void deep_sleep_now_() {
+  esp_deep_sleep_disable_rom_logging();
+  esp_deep_sleep_start();
+}
+
 static void verify_ota() {
   const esp_partition_t* running = esp_ota_get_running_partition();
   esp_ota_img_states_t ota_state;
@@ -89,7 +100,7 @@ static void verify_wakeup_press() {
 
   // Short press — go back to sleep; wake again on power button press.
   esp_sleep_enable_gpio_wakeup_on_hp_periph_powerdown(1ULL << kPowerPin, ESP_GPIO_WAKEUP_GPIO_LOW);
-  esp_deep_sleep_start();
+  deep_sleep_now_();
 }
 
 
@@ -114,19 +125,21 @@ static void verify_battery(const Esp32Runtime& runtime) {
   if (wintergreen::kLowBatteryCutoffMv == 0 || usb_attached())
     return;
   static constexpr int kImplausibleMv = 2500;
-  int worst = 0;
+  // Eight back-to-back reads, averaged. These used to be 25 ms apart, keeping the
+  // worst — 175 ms of sleeping on every wake, guarding against load transients
+  // that cannot happen here: this runs before the panel or the card is powered,
+  // so the rail is as quiet as it will ever be. Averaging still flattens ADC noise.
+  int sum = 0;
   for (int i = 0; i < 8; ++i) {
     const int mv = runtime.battery_millivolts();
     if (mv < kImplausibleMv)
       return;
-    if (worst == 0 || mv < worst)
-      worst = mv;
-    vTaskDelay(pdMS_TO_TICKS(25));
+    sum += mv;
   }
-  if (worst >= wintergreen::kLowBatteryCutoffMv)
+  if (sum / 8 >= wintergreen::kLowBatteryCutoffMv)
     return;
   esp_sleep_enable_gpio_wakeup_on_hp_periph_powerdown(1ULL << kPowerPin, ESP_GPIO_WAKEUP_GPIO_LOW);
-  esp_deep_sleep_start();
+  deep_sleep_now_();
 }
 
 // Last resort before an allocation failure becomes a reboot.
@@ -214,6 +227,11 @@ extern "C" void app_main(void) {
   static EInkDisplay epd;
   // 25 ms UI frame (40 Hz) — see CLAUDE.md "Idle power" for the timing rationale.
   static Esp32Runtime runtime(25, input.get_adc_handle());
+  // The constructor configures DFS with nothing holding the clock up, so the
+  // whole boot — card mount, index, book open, layout, the first frame's SPI —
+  // ran at the 80 MHz idle clock. Every wake is a boot. Application::update
+  // drops this hold after its usual idle interval.
+  runtime.set_performance_hold(true);
   static wintergreen::Application app;
   static wintergreen::DrawBuffer buf(epd);
   g_oom_buf = &buf;  // the spare is the largest block the OOM rescue can free
@@ -232,14 +250,18 @@ extern "C" void app_main(void) {
   // Mount the SD card (shares SPI2 with the display). Without it there is no
   // library, no settings and no index — every screen would be an empty shell —
   // so refuse to boot the same way a flat battery does: wordmark, then sleep.
-  if (!sd_init()) {
+  // The panel is settling from its reset pulse meanwhile; see EInkDisplay::begin.
+  const bool sd_ok = sd_init();
+  epd.finish_begin();
+  if (!sd_ok) {
     buf.show_sleep_image_embedded();
+    buf.deep_sleep();
     // Wake is level-triggered on LOW; sleeping with the button still down would
     // wake us straight back up.
     for (uint32_t waited = 0; waited < 5000 && gpio_get_level(kPowerPin) == 0; waited += 10)
       vTaskDelay(pdMS_TO_TICKS(10));
     esp_sleep_enable_gpio_wakeup_on_hp_periph_powerdown(1ULL << kPowerPin, ESP_GPIO_WAKEUP_GPIO_LOW);
-    esp_deep_sleep_start();
+    deep_sleep_now_();
   }
   // State lives in two dotfiles at the card root — see set_state_root.
   app.set_books_dir("/sdcard");
@@ -391,5 +413,5 @@ extern "C" void app_main(void) {
 
   // Enter deep sleep; wake on power button press (active LOW, GPIO 3).
   esp_sleep_enable_gpio_wakeup_on_hp_periph_powerdown(1ULL << kPowerPin, ESP_GPIO_WAKEUP_GPIO_LOW);
-  esp_deep_sleep_start();
+  deep_sleep_now_();
 }

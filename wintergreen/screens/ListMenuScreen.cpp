@@ -61,7 +61,7 @@ int ListMenuScreen::wintergreen_slot_h_(int index) const {
   if (index >= 0 && is_single_line_row(index))
     return kPadT + ui_font_.y_advance() + kPadB + 1;
   const int sub_h = section_font_.valid() ? section_font_.y_advance() : subtitle_font_.y_advance();
-  return kPadT + ui_font_.y_advance() + kGap + sub_h + kPadB + 1;
+  return kPadT + detail_title_lines_ * ui_font_.y_advance() + kGap + sub_h + kPadB + 1;
 }
 
 int ListMenuScreen::wintergreen_visible_from_(int scroll_off, int available_h) const {
@@ -337,6 +337,12 @@ void ListMenuScreen::draw_list_(DrawBuffer& buf, int W, int H, int header_h, int
     const int ell_w = ui_font_.word_width(kEll, 3, FontStyle::Regular);
     char trunc_buf[260];
 
+    // Thumbnail column at the right-hand end of every two-line row, inset from
+    // the row's edges by kThumbPad. The divider is the slot's last pixel row.
+    static constexpr int kThumbPad = 6, kThumbGap = 12;
+    const int thumb_box_h = wintergreen_slot_h_(-1) - 1 - 2 * kThumbPad;
+    const int thumb_w = prepare_thumbs(thumb_box_h);
+
     int y = header_h;
     for (int i = scroll_offset_; i < end; ++i) {
       const bool sel = (i == selected_);
@@ -369,33 +375,63 @@ void ListMenuScreen::draw_list_(DrawBuffer& buf, int W, int H, int header_h, int
       if (!right_txt.empty())
         right_w_actual = sub_font.word_width(right_txt.data(), right_txt.size(), FontStyle::Regular);
       const int right_reserved = right_txt.empty() ? 0 : (right_w_actual + 8);
-      const int max_lw = W - kLM - kRM - sb_reserved;
+      // Text ends where the thumbnail column (if any) begins.
+      const bool row_thumb = thumb_w > 0 && !is_single_line_row(i);
+      const int text_r = W - kRM - sb_reserved - (row_thumb ? thumb_w + kThumbGap : 0);
+      const int max_lw = text_r - kLM;
 
-      const int title_y = y + kPadT + ui_font_.baseline();
-      int dlw = ui_font_.word_width(display_label.data(), display_label.size(), FontStyle::Regular);
-      if (dlw > max_lw) {
-        const size_t fit = fit_prefix(ui_font_, display_label.data(), display_label.size(), max_lw - ell_w);
-        const size_t cp = fit < 256 ? fit : 256;
-        std::memcpy(trunc_buf, display_label.data(), cp);
-        std::memcpy(trunc_buf + cp, kEll, 3);
-        trunc_buf[cp + 3] = '\0';
-        buf.draw_text_proportional(kLM, title_y, trunc_buf, cp + 3, ui_font_, sel);
-      } else {
-        buf.draw_text_proportional(kLM, title_y, display_label.data(), display_label.size(), ui_font_, sel);
+      // Title: up to detail_title_lines_ lines. Every line but the last breaks
+      // after the last whole word that fits (mid-word only for a single word
+      // wider than the column); the last takes the rest, ellipsised.
+      {
+        const char* p = display_label.data();
+        size_t left = display_label.size();
+        for (int line = 0; line < detail_title_lines_ && left > 0; ++line) {
+          const int title_y = y + kPadT + line * title_h + ui_font_.baseline();
+          const bool last = (line == detail_title_lines_ - 1);
+          if (ui_font_.word_width(p, left, FontStyle::Regular) <= max_lw) {
+            buf.draw_text_proportional(kLM, title_y, p, left, ui_font_, sel);
+            break;
+          }
+          if (last) {
+            const size_t fit = fit_prefix(ui_font_, p, left, max_lw - ell_w);
+            const size_t cp = fit < 256 ? fit : 256;
+            std::memcpy(trunc_buf, p, cp);
+            std::memcpy(trunc_buf + cp, kEll, 3);
+            trunc_buf[cp + 3] = '\0';
+            buf.draw_text_proportional(kLM, title_y, trunc_buf, cp + 3, ui_font_, sel);
+            break;
+          }
+          const size_t fit = fit_prefix(ui_font_, p, left, max_lw);
+          size_t brk = fit;
+          while (brk > 0 && p[brk] != ' ')
+            --brk;
+          if (brk == 0)
+            brk = fit;  // one word wider than the column: cut it
+          if (brk == 0)
+            break;      // not even a glyph fits
+          buf.draw_text_proportional(kLM, title_y, p, brk, ui_font_, sel);
+          p += brk;
+          left -= brk;
+          while (left > 0 && *p == ' ') {
+            ++p;
+            --left;
+          }
+        }
       }
 
-      const int sub_baseline = y + kPadT + title_h + kGap + sub_font.baseline();
+      const int sub_baseline = y + kPadT + detail_title_lines_ * title_h + kGap + sub_font.baseline();
 
       // Right-aligned percentage, on the author's baseline.
       if (!right_txt.empty()) {
-        const int right_x = W - kRM - sb_reserved - right_w_actual;
+        const int right_x = text_r - right_w_actual;
         buf.draw_text_proportional(right_x, sub_baseline, right_txt.data(), right_txt.size(), sub_font, sel);
       }
 
       // Subtitle line (author, setting value)
       if (!sub.empty()) {
         const int sub_y = sub_baseline;
-        const int max_sw = W - kLM - kRM - sb_reserved - right_reserved;
+        const int max_sw = text_r - kLM - right_reserved;
         int sw = sub_font.word_width(sub.data(), sub.size(), FontStyle::Regular);
         if (sw > max_sw) {
           const int sel_ell_w = sub_font.word_width(kEll, 3, FontStyle::Regular);
@@ -407,6 +443,27 @@ void ListMenuScreen::draw_list_(DrawBuffer& buf, int W, int H, int header_h, int
           buf.draw_text_proportional(kLM, sub_y, trunc_buf, cp + 3, sub_font, sel);
         } else {
           buf.draw_text_proportional(kLM, sub_y, sub.data(), sub.size(), sub_font, sel);
+        }
+      }
+
+      // Cover thumbnail, centred in its box. The image keeps its own paper
+      // white on a selected (inverted) row, so it reads as a cover rather than
+      // a negative. A book without one gets an empty frame in the row's ink.
+      if (row_thumb) {
+        const int bx = W - kRM - sb_reserved - thumb_w;
+        const int by = y + kThumbPad;
+        Thumb t;
+        if (get_item_thumb(i, t) && t.bits && t.w > 0 && t.h > 0) {
+          const int tx = bx + (thumb_w - t.w) / 2;
+          const int ty = by + (thumb_box_h - t.h) / 2;
+          const int stride = (t.w + 7) / 8;
+          for (int r = 0; r < t.h; ++r)
+            buf.blit_1bit_row(tx, ty + r, t.bits + static_cast<size_t>(r) * stride, t.w);
+        } else {
+          buf.fill_rect(bx, by, thumb_w, 1, sel);
+          buf.fill_rect(bx, by + thumb_box_h - 1, thumb_w, 1, sel);
+          buf.fill_rect(bx, by, 1, thumb_box_h, sel);
+          buf.fill_rect(bx + thumb_w - 1, by, 1, thumb_box_h, sel);
         }
       }
 
