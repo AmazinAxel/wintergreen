@@ -66,22 +66,11 @@ If you use a white Xteink in the sun, I recommend enabling the fading fix, but i
 
 The button timing should also be modified to your liking! Especially to scroll through a large library of books or chapters, I suggest lower values for repeating and hold. Be warned that below 200ms repeat, it can get a little disorientating since the e-ink panel can only refresh so fast! The defaults are very sensible.
 
-<!-- pio run first!!
-
-nix-shell -p 'python3.withPackages(ps: [ps.pyserial])' --run '
-python3 ~/.platformio/packages/tool-esptoolpy/esptool.py --chip esp32c3 merge_bin -o wintergreen.bin --flash_mode dio --flash_freq 80m --flash_size 16MB \
-0x0      .pio/build/esp32c3/bootloader.bin \
-0x8000   .pio/build/esp32c3/partitions.bin \
-0x10000  .pio/build/esp32c3/firmware.bin \
-0xc90000 .pio/build/esp32c3/font_partition.bin \
-0xd10000 .pio/build/esp32c3/sleep_partition.bin'
--->
-
-The prebuilt binaries ship with the default config from above! If you want to modify those values, you'd have to build it from scratch. If you choose to use the prebuilt binary, flash it with esptool (you cant use the crosspoint flasher):
+The prebuilt binaries ship with the default config from above! If you want to modify those values, you'd have to build it from scratch. If you choose to use the prebuilt binary, download `wintergreen.bin` from the [latest release](https://github.com/AmazinAxel/wintergreen/releases/latest) and flash it with esptool (you cant use the crosspoint flasher):
 
 ```bash
 pip install esptool
 esptool.py --chip esp32c3 -p /dev/ttyACM0 write_flash 0x0 wintergreen.bin
 ```
 
-The `wintergreen.bin` in this repository is from the latest git changes. You should use that over a release binary since it might have changes that you'd want!
+Building it yourself always gets you the latest changes; `tools/merge-bin.sh` turns a `pio run` build into the same single image.

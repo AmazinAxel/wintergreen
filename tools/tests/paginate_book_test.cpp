@@ -1,21 +1,30 @@
 // Paginate a real .wgb with the device's own layout engine and assert the
 // invariants that matter on hardware:
 //
-//   * every page makes forward progress (no stall)
-//   * pagination terminates
-//   * forward-then-backward returns to the same page start
+//   * every page makes forward progress (no stall), and pagination terminates
 //   * no page is blank when the chapter still has text to show
+//   * paging forward then back retraces the exact pages (PageHistory)
+//   * a cold backward turn (no history: after a jump or a resume) shows a page
+//     that runs exactly up to the page it came from — nothing skipped, nothing
+//     repeated across the boundary
+//
+// Forward steps and the backward resolution call the same TextLayout functions
+// ReaderScreen does (next_page_start, predecessor_start), so this cannot drift
+// from the device. A cold backward turn may still pick a different start than
+// forward reading did — a page ending at a PageBreak or an image that did not
+// fit has several valid starts — so those are counted, not failed.
 //
 // This is the harness for the Odyssey blank-page report — it runs the same
 // TextLayout over the same file the device reads, under ASan/UBSan.
 //
-// Run:
+// Run (or use tools/tests/run.sh):
 //   nix-shell -p gcc --run \
 //     'g++ -std=c++17 -I . -I wintergreen -fsanitize=address,undefined \
 //        -o /tmp/pb tools/tests/paginate_book_test.cpp \
 //        wintergreen/content/TextLayout.cpp \
 //        wintergreen/content/wgb/WgbReader.cpp \
 //        wintergreen/content/hyphenation/Hyphenation.cpp && /tmp/pb <book.wgb>'
+#include <algorithm>
 #include <cassert>
 #include <cstdio>
 #include <cstring>
@@ -23,10 +32,14 @@
 #include <vector>
 
 #include "content/Font.h"
+#include "content/PageHistory.h"
 #include "content/TextLayout.h"
 #include "content/wgb/WgbReader.h"
 
 using namespace wintergreen;
+
+// ReaderScreen::kPrevPageProbeLimit.
+static constexpr int kProbeLimit = 64;
 
 int main(int argc, char** argv) {
   if (argc < 2) {
@@ -49,8 +62,8 @@ int main(int argc, char** argv) {
   opts.padding_top = opts.padding_bottom = 20;
   opts.para_spacing = 0;
 
-  size_t total_pages = 0, blank_pages = 0, stalls = 0, back_mismatch = 0;
-  size_t resyncs = 0, skipped_text = 0;
+  size_t total_pages = 0, blank_pages = 0, stalls = 0;
+  size_t history_misses = 0, seams = 0, line_off = 0, para_off = 0;
 
   for (uint16_t ch = 0; ch < wgb.chapter_count(); ++ch) {
     WgbChapterSource src(wgb, ch);
@@ -59,7 +72,9 @@ int main(int argc, char** argv) {
     layout.set_font(font);
     layout.set_options(opts);
 
+    // Forward, exactly as ReaderScreen::next_page_ + render_page_ do it.
     std::vector<PagePosition> starts;
+    PageHistory history;
     PagePosition pos{0, 0, 0};
     int guard = 0;
     while (true) {
@@ -67,7 +82,6 @@ int main(int argc, char** argv) {
         std::fprintf(stderr, "ch %u: pagination did not terminate\n", ch);
         return 1;
       }
-      layout.set_position(pos);
       PagePosition resolved = layout.resolve_stable_position(pos);
       layout.set_position(resolved);
       PageContent pc = layout.layout();
@@ -81,81 +95,69 @@ int main(int argc, char** argv) {
 
       if (pc.at_chapter_end)
         break;
-      if (pc.end == resolved) {
+      const PagePosition next = layout.next_page_start(resolved, pc.end);
+      if (!(resolved < next)) {
         std::fprintf(stderr, "ch %u: page stalled at para %u off %u\n", ch, resolved.paragraph, resolved.offset);
         ++stalls;
         break;
       }
-      pos = pc.end;
+      history.push(layout.epoch(), resolved, next);
+      pos = next;
     }
 
-    // Backward must retrace the forward walk exactly. This mirrors
-    // ReaderScreen::prev_page_, including the forward re-walk it does when a
-    // PageBreak makes the backward page disagree — keep the two in step.
-    for (size_t i = starts.size(); i-- > 1;) {
-      const PagePosition cur_start = starts[i];
-      layout.set_position(cur_start);
-      PageContent back = layout.layout_backward();
-      PagePosition got = back.start;
+    // Back again with the history: must retrace the forward pages exactly, for
+    // as many turns as the ring holds.
+    const size_t retrace = std::min<size_t>(PageHistory::kCapacity, starts.size() - 1);
+    for (size_t k = 1; k <= retrace; ++k) {
+      const size_t i = starts.size() - k;
+      PagePosition got;
+      if (!history.pop_to(layout.epoch(), starts[i], &got) || !(got == starts[i - 1])) {
+        if (history_misses < 8)
+          std::fprintf(stderr, "ch %u: history did not retrace (%u,%u)\n", ch, starts[i].paragraph,
+                       starts[i].offset);
+        ++history_misses;
+        break;
+      }
+    }
 
-      // Mirrors ReaderScreen::prev_page_: step back one further page for an
-      // anchor, then walk forward and keep the last page ending at cur_start.
-      // Keep the two in step — this is what stops a backward turn skipping text.
-      {
-        PagePosition anchor = got;
-        if (!(anchor == PagePosition{0, 0})) {
-          layout.set_position(anchor);
-          PageContent back2 = layout.layout_backward();
-          if (back2.start < anchor)
-            anchor = back2.start;
-        }
-        PagePosition probe = anchor;
-        PagePosition best = got;
-        for (int guard = 0; guard < 64; ++guard) {
-          ++resyncs;
-          const PagePosition probe_end = layout.layout_end(probe);
-          if (!(probe < probe_end))
-            break;
-          if (!(probe_end < cur_start)) {
-            if (probe_end == cur_start)
-              best = probe;
-            break;
-          }
-          probe = probe_end;
-        }
-        got = best;
+    // Cold backward turns from every page, as ReaderScreen::prev_page_ does
+    // without history.
+    for (size_t i = starts.size(); i-- > 1;) {
+      const PagePosition cur = starts[i];
+      const PagePosition end = layout.snap_to_image_end(cur);
+      layout.set_position(end);
+      PageContent shown = layout.layout_backward();
+      const PagePosition got = layout.predecessor_start(cur, shown.start, kProbeLimit);
+      if (!(got == shown.start)) {
+        layout.set_position(got);
+        shown = layout.layout();
+      }
+
+      // The page shown must lead straight back to the one we left.
+      const bool seamless =
+          got == shown.start && (shown.end == end || layout.next_page_start(got, shown.end) == cur);
+      if (!seamless) {
+        if (seams < 8)
+          std::fprintf(stderr, "ch %u: back from (%u,%u) shows (%u,%u)..(%u,%u), not up to it\n", ch,
+                       cur.paragraph, cur.offset, got.paragraph, got.offset, shown.end.paragraph, shown.end.offset);
+        ++seams;
       }
 
       if (!(got == starts[i - 1])) {
-        // A mismatch confined to one paragraph is the benign hanging-descender
-        // case: the page starts a line early and repeats it. A mismatch that
-        // crosses paragraphs means text the reader never saw was skipped, which
-        // is the failure this whole path exists to prevent.
-        const bool crosses_paras = got.paragraph != starts[i - 1].paragraph;
-        if (crosses_paras) {
-          if (skipped_text < 8)
-            std::fprintf(stderr, "ch %u: SKIP back from (%u,%u) -> (%u,%u), expected (%u,%u)\n", ch,
-                         cur_start.paragraph, cur_start.offset, got.paragraph, got.offset, starts[i - 1].paragraph,
-                         starts[i - 1].offset);
-          ++skipped_text;
-        }
-        ++back_mismatch;
+        if (got.paragraph == starts[i - 1].paragraph)
+          ++line_off;
+        else
+          ++para_off;
       }
     }
   }
 
-  std::printf("chapters=%u pages=%zu blank=%zu stalls=%zu line_off=%zu skipped_text=%zu resyncs=%zu\n",
-              wgb.chapter_count(), total_pages, blank_pages, stalls, back_mismatch - skipped_text, skipped_text,
-              resyncs);
-  // Hard invariants: a page must always consume input, and a backward turn must
-  // never skip text. A one-line overlap (line_off) is tolerated by design.
+  std::printf("chapters=%u pages=%zu blank=%zu stalls=%zu history_misses=%zu seams=%zu "
+              "cold_line_off=%zu cold_para_off=%zu\n",
+              wgb.chapter_count(), total_pages, blank_pages, stalls, history_misses, seams, line_off, para_off);
   assert(stalls == 0 && "a page consumed nothing");
   assert(blank_pages == 0 && "a page rendered nothing at all");
-  // The hard one: a backward turn must never land on a different *paragraph*
-  // than the forward walk, because that is text the reader never saw.
-  assert(skipped_text == 0 && "a backward turn skipped text the reader never saw");
-  // line_off (same paragraph, different line) is tolerated. Closing it needs a
-  // chapter-wide forward chain, which costs ~31 KB of paragraph-window pressure
-  // and reintroduced the heap abort with the clicker connected — see prev_page_.
-  return (stalls || skipped_text || blank_pages) ? 1 : 0;
+  assert(history_misses == 0 && "paging back did not retrace the pages read forward");
+  assert(seams == 0 && "a backward page does not run up to the page it came from");
+  return (stalls || blank_pages || history_misses || seams) ? 1 : 0;
 }

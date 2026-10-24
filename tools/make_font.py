@@ -56,7 +56,7 @@ RANGES = [(0x0020, 95), (0x00A0, 224), (0x2000, 208)]
 
 # Codepoints a font may not cover, mapped to a visually equivalent one it very
 # likely does. Without this the renderer draws nothing at all — glyph coverage
-# is sparse and there is no fallback chain (see CLAUDE.md "Fonts").
+# is sparse and there is no fallback chain (see docs/content.md "Fonts").
 SUBSTITUTES = {
     0x2010: 0x002D,  # hyphen -> hyphen-minus
     0x2011: 0x002D,  # non-breaking hyphen

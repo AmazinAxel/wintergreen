@@ -19,6 +19,7 @@
 // The receiver task is started lazily by serial_start_if_connected(), which the
 // main loop calls the first time a USB host appears.
 
+#include <atomic>
 #include <dirent.h>
 #include <sys/stat.h>
 
@@ -89,6 +90,9 @@ inline void request_index_op(SerialIndexOp op, const char* a, const char* b = nu
     strncpy(g_index_path_b, b, sizeof(g_index_path_b) - 1);
     g_index_path_b[sizeof(g_index_path_b) - 1] = '\0';
   }
+  // volatile orders only against other volatiles: without the fence the
+  // compiler may sink the path stores below the commit.
+  std::atomic_thread_fence(std::memory_order_release);
   g_index_op = op;  // commit
 }
 

@@ -402,21 +402,15 @@ void ReaderScreen::update(const ButtonState& buttons, DrawBuffer& buf, IRuntime&
 // and then put back. `page_` keeps only positional metadata either way — its
 // LayoutWord::text pointers into WgbChapterSource's 32-slot paragraph window are
 // dead the moment the window slides, which is exactly what laying out the next
-// page does. See "Page-turn latency" in CLAUDE.md.
+// page does. See "Page-turn latency" in docs/display.md.
 void ReaderScreen::prerender_next_page_(DrawBuffer& buf, IRuntime& runtime) {
   predrawn_.valid = false;
   if (!open_ok_ || !chapter_src_ || page_.at_chapter_end)
     return;  // a chapter crossing needs load_chapter_(); not worth doing speculatively
 
-  PagePosition next = page_.end;
-  // Same image snap-back as next_page_(), so the drawn page is the one the next
-  // turn will ask for. A mismatch only wastes the work, but that is the point.
-  if (next.offset > 0 && next.paragraph < chapter_src_->paragraph_count() &&
-      page_pos_.paragraph != next.paragraph) {
-    if (chapter_src_->paragraph(next.paragraph).type == ParagraphType::Image ||
-        layout_engine_.is_mid_promoted_image(next))
-      next.offset = 0;
-  }
+  // Same step as next_page_(), so the drawn page is the one the next turn will
+  // ask for.
+  PagePosition next = layout_engine_.next_page_start(page_pos_, page_.end);
   if (next == page_pos_)
     return;
 
@@ -564,6 +558,7 @@ void ReaderScreen::load_chapter_(size_t idx) {
   // Rebuilding the source frees every paragraph slot the cached page's words point
   // into. Nothing in the key can detect that, so it has to be dropped explicitly.
   page_cache_ = LaidOutPageCache{};
+  history_.clear();
   chapter_src_.reset();
   if (idx < wgb_.chapter_count()) {
     chapter_src_ = std::make_unique<WgbChapterSource>(wgb_, static_cast<uint16_t>(idx));
@@ -578,7 +573,9 @@ void ReaderScreen::render_page_(DrawBuffer& buf) {
 
 
   // Use proportional font if available, otherwise fallback to fixed.
-  FixedFont fixed_font(kGlyphW * kScale, kGlyphH * kScale + 4);
+  // Static: the layout engine keeps a pointer to its font past this call
+  // (prev_page_, prerender), so a stack font would dangle.
+  static FixedFont fixed_font(kGlyphW * kScale, kGlyphH * kScale + 4);
   const BitmapFontSet* fset = ext_font_set_ ? ext_font_set_ : (font_set_.valid() ? &font_set_ : nullptr);
   if (fset) {
     const_cast<BitmapFontSet*>(fset)->set_base_size_index(reader_settings_.font_size_idx);
@@ -787,19 +784,10 @@ bool ReaderScreen::next_page_() {
     }
     return false;
   }
-  PagePosition next = page_.end;
-  // If the page ended mid-image (offset > 0 into an image paragraph or
-  // mid-promoted-inline-image), snap back to the start of that paragraph
-  // so the next page shows the full image.
-  // We only do this if the image wasn't the first thing on the current page,
-  // to avoid infinite loops on images taller than the screen.
-  if (next.offset > 0 && chapter_src_ && next.paragraph < chapter_src_->paragraph_count()) {
-    if (page_pos_.paragraph != next.paragraph) {
-      if (chapter_src_->paragraph(next.paragraph).type == ParagraphType::Image ||
-          layout_engine_.is_mid_promoted_image(next))
-        next.offset = 0;
-    }
-  }
+  // A page ending mid-image snaps back so the next page shows the whole image
+  // (not when the image started this page — that would never advance).
+  PagePosition next = layout_engine_.next_page_start(page_pos_, page_.end);
+  history_.push(layout_engine_.epoch(), page_pos_, next);
   page_pos_ = next;
   return true;
 }
@@ -838,6 +826,16 @@ bool ReaderScreen::prev_page_() {
     layout_engine_.set_cache_limit(1);
   }
 
+  // Retracing a forward turn: the exact page the reader came from, one layout.
+  PagePosition back_to;
+  if (history_.pop_to(layout_engine_.epoch(), page_pos_, &back_to)) {
+    layout_engine_.set_position(back_to);
+    PageContent pc = layout_engine_.layout();
+    page_pos_ = pc.start;
+    cache_page_(std::move(pc));
+    return true;
+  }
+
   PagePosition end = layout_engine_.snap_to_image_end(page_pos_);
   layout_engine_.set_position(end);
   auto pc = layout_engine_.layout_backward();
@@ -866,30 +864,7 @@ bool ReaderScreen::prev_page_() {
   // own answer is a real page, just occasionally not the one the reader came
   // from — and it is the most allocation-hungry part of a backward turn.
   if (!heap_tight) {
-    PagePosition anchor = pc.start;
-    if (!(anchor == PagePosition{0, 0})) {
-      layout_engine_.set_position(anchor);
-      PageContent back2 = layout_engine_.layout_backward();
-      if (back2.start < anchor)
-        anchor = back2.start;
-    }
-
-    PagePosition probe = anchor;
-    PagePosition best = pc.start;
-    for (int guard = 0; guard < kPrevPageProbeLimit; ++guard) {
-      const PagePosition probe_end = layout_engine_.layout_end(probe);
-      if (!(probe < probe_end))
-        break;  // no forward progress: malformed chapter, keep backward's answer
-      if (!(probe_end < cur_start)) {
-        // Ends at or past where we started. Ending exactly there makes it the
-        // predecessor; overshooting means cur_start is not on this chain (a
-        // chapter jump or a restored bookmark), so backward's answer stands.
-        if (probe_end == cur_start)
-          best = probe;
-        break;
-      }
-      probe = probe_end;
-    }
+    const PagePosition best = layout_engine_.predecessor_start(cur_start, pc.start, kPrevPageProbeLimit);
     if (!(best == pc.start)) {
       layout_engine_.set_position(best);
       pc = layout_engine_.layout();

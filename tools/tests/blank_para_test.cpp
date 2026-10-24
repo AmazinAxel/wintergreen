@@ -13,7 +13,7 @@
 //
 // Run:
 //   nix-shell -p gcc --run \
-//     'g++ -std=c++17 -I wintergreen -fsanitize=address,undefined \
+//     'g++ -std=c++17 -I . -I wintergreen -fsanitize=address,undefined \
 //        -o /tmp/bp tools/tests/blank_para_test.cpp \
 //        wintergreen/content/TextLayout.cpp \
 //        wintergreen/content/hyphenation/Hyphenation.cpp && /tmp/bp'

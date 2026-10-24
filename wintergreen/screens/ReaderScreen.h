@@ -5,6 +5,7 @@
 
 #include "../Input.h"
 #include "../content/BitmapFont.h"
+#include "../content/PageHistory.h"
 #include "../content/TextLayout.h"
 #include "../content/wgb/WgbReader.h"
 #include "../display/DrawBuffer.h"
@@ -236,10 +237,9 @@ class ReaderScreen final : public IScreen {
   // pass `require_full_height`; see LaidOutParagraph::collect in TextLayout.cpp.
   //
   // What remains is structural — a page ending at a PageBreak or at the end of a
-  // chapter's content has several possible starts — and prev_page_ resolves it
-  // by anchoring one page further back and walking forward. That removes every
-  // *skip* (text the reader never saw) across all four test books and leaves a
-  // handful of one-line offsets.
+  // chapter's content has several possible starts. A backward turn that retraces
+  // a recorded forward turn (history_) is exact; otherwise prev_page_ anchors one
+  // page further back and walks forward (TextLayout::predecessor_start).
   //
   // **A chapter-wide forward chain was built to close those too, and removed.**
   // It worked — every mismatch went to zero — but walking the chapter drags
@@ -252,6 +252,9 @@ class ReaderScreen final : public IScreen {
   // the bound only matters for a malformed chapter, where a slightly wrong page
   // beats a stalled button.
   static constexpr int kPrevPageProbeLimit = 64;
+  // Recent forward turns, so a backward turn retraces them exactly instead of
+  // reconstructing the previous page. Cleared on chapter load.
+  PageHistory history_;
   bool prev_page_();
   // Step back one page on a fresh open, per config::kResumeOnePageBack.
   // Runs from render_page_, not start(): a backward layout needs the font and

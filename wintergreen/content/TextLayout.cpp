@@ -1741,4 +1741,36 @@ PagePosition TextLayout::resolve_stable_position(PagePosition pos) const {
   return {pos.paragraph, new_offset, lp.lines[found_idx].text_offset};
 }
 
+
+PagePosition TextLayout::next_page_start(PagePosition start, PagePosition end) const {
+  PagePosition next = end;
+  if (next.offset > 0 && source_ && next.paragraph < source_->paragraph_count() &&
+      start.paragraph != next.paragraph) {
+    if (source_->paragraph(next.paragraph).type == ParagraphType::Image || is_mid_promoted_image(next))
+      next.offset = 0;
+  }
+  return next;
+}
+
+PagePosition TextLayout::predecessor_start(PagePosition cur_start, PagePosition backward_start, int probe_limit) {
+  PagePosition anchor = backward_start;
+  if (!(anchor == PagePosition{0, 0})) {
+    set_position(anchor);
+    PageContent back2 = layout_backward();
+    if (back2.start < anchor)
+      anchor = back2.start;
+  }
+
+  PagePosition probe = anchor;
+  for (int guard = 0; guard < probe_limit; ++guard) {
+    const PagePosition next = next_page_start(probe, layout_end(probe));
+    if (!(probe < next))
+      break;  // no forward progress: malformed chapter, keep backward's answer
+    if (!(next < cur_start))
+      return next == cur_start ? probe : backward_start;
+    probe = next;
+  }
+  return backward_start;
+}
+
 }  // namespace wintergreen

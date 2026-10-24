@@ -217,6 +217,7 @@ class TextLayout {
   void set_source(IParagraphSource& source) {
     source_ = &source;
     cache_valid_ = false;
+    ++epoch_;
   }
 
   // Replace the font (e.g. after a proportional font becomes available).
@@ -225,6 +226,7 @@ class TextLayout {
       return;
     font_ = &font;
     cache_valid_ = false;
+    ++epoch_;
   }
 
   // Replace options (e.g. after a screen resize).
@@ -233,6 +235,7 @@ class TextLayout {
       return;
     opts_ = opts;
     cache_valid_ = false;
+    ++epoch_;
   }
 
   // Paragraph cache slots. 8 rather than 16: a page spans a handful of
@@ -287,6 +290,7 @@ class TextLayout {
   void set_image_size_fn(ImageSizeQuery fn) {
     size_fn_ = std::move(fn);
     cache_valid_ = false;
+    ++epoch_;
   }
 
   // Set the hyphenation language (detected from EPUB metadata).
@@ -295,6 +299,7 @@ class TextLayout {
       return;
     hyphenation_lang_ = lang;
     cache_valid_ = false;
+    ++epoch_;
   }
 
   // Break a single paragraph into lines using the stored font.
@@ -332,6 +337,29 @@ class TextLayout {
   // layout_backward() will produce a page containing the full image.
   // Returns `pos` unchanged if it is not mid-image.
   PagePosition snap_to_image_end(PagePosition pos) const;
+
+  // Bumped whenever something that moves page boundaries changes (source,
+  // font, options, image sizes, hyphenation). A PagePosition recorded under one
+  // epoch means nothing under another.
+  uint32_t epoch() const {
+    return epoch_;
+  }
+
+  // Where reading continues after the page [start, end): `end`, except that a
+  // page ending part-way into an image it did not start in snaps back to the
+  // image's start, so the next page shows the whole image.
+  PagePosition next_page_start(PagePosition start, PagePosition end) const;
+
+  // Start of the page before `cur_start`, given layout_backward()'s answer.
+  //
+  // Backward picks the fullest page ending at cur_start, but a page ending at a
+  // PageBreak or an image that did not fit can be reached from several starts,
+  // and forward reading took one particular one. So anchor one page further
+  // back and walk forward with the reader's own step (next_page_start) until a
+  // page ends exactly at cur_start. Falls back to `backward_start` when the
+  // walk overshoots (cur_start is not on the chain — a jump or a bookmark) or
+  // exceeds `probe_limit`. Leaves position() unspecified.
+  PagePosition predecessor_start(PagePosition cur_start, PagePosition backward_start, int probe_limit);
 
   // Uses the layout cache (with the currently configured font/options)
   // to sync `offset` (line index) based on the absolute `text_offset` of the page position.
@@ -436,6 +464,7 @@ class TextLayout {
   size_t cache_limit_ = kCacheCapacity;
   mutable size_t cache_next_ = 0;
   mutable bool cache_valid_ = false;
+  uint32_t epoch_ = 0;
 };
 
 }  // namespace wintergreen

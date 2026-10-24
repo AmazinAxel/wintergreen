@@ -53,14 +53,14 @@ class HomeScreen final : public ListMenuScreen {
   // std::vector::assign reallocates when the size differs, holding the old and
   // new blocks at once. Three live covers is ~74 KB transiently against ~165 KB
   // of free heap — the device ran out of memory and restarted while cycling the
-  // carousel. See "Investigated and rejected" in CLAUDE.md.
+  // carousel. See "Investigated and rejected" in docs/history.md.
   mutable std::vector<uint8_t> cover_data_;
   mutable uint16_t cover_w_ = 0, cover_h_ = 0;
   mutable int cover_slot_ = -1;  // slot cover_data_ belongs to; -1 = nothing loaded
 
   BitmapFont author_font_;
 
-  // Wall time, not frames — see the note in CLAUDE.md.
+  // Wall time, not frames — see "Input and holds" in docs/power-and-input.md.
   //
   // The list opens the instant this elapses, with the button still down, so the
   // number is how long the screen sits there doing nothing visible. At 3 s that

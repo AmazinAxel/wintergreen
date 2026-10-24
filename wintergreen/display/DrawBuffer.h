@@ -38,7 +38,7 @@ struct DisplayFrame {
   static constexpr std::size_t kPixelBytes = static_cast<std::size_t>(kStride) * kPhysicalHeight;  // 48000
 };
 // Display driver interface. EInkDisplay is the only implementation left now that
-// the desktop build is gone — see the note in CLAUDE.md about collapsing it.
+// the desktop build is gone — see "Investigated and rejected" in docs/history.md.
 class IDisplay {
  public:
   virtual ~IDisplay() = default;
@@ -471,7 +471,7 @@ class DrawBuffer {
   // This exists for one caller: the Wi-Fi sync. Two static framebuffers are
   // 96 KB of BSS and the spare is another 48 KB of heap, which on a 320 KB part
   // left ~20 KB free — and esp_wifi_init() needs roughly 50 KB, so it failed
-  // outright with no clue why (see "NAS book sync" in CLAUDE.md).
+  // outright with no clue why (see docs/sync.md).
   //
   // Safe because the spare is **purely an optimisation**: without it a quick
   // menu dismiss re-renders and a page turn re-draws, which is what happened

@@ -31,7 +31,7 @@ extern volatile uint8_t g_serial_buttons;
 //
 // Buttons are sampled every 5ms by an esp_timer callback. Rising edges
 // are latched so that brief presses between frame polls are never lost.
-// See CLAUDE.md "Idle power" before slowing the sample interval.
+// See docs/power-and-input.md "Idle power" before slowing the sample interval.
 
 class Esp32InputSource final : public wintergreen::IInputSource {
  public:

@@ -23,7 +23,7 @@ namespace wintergreen {
 // user every not-connected state means the same thing — press it again.
 //
 // Failure detail deliberately does not appear here. It did while the feature
-// was being brought up; see "The failure codes are gone" in CLAUDE.md.
+// was being brought up; see "The failure codes are gone" in docs/bluetooth.md.
 enum class ClickerState : uint8_t {
   Unavailable = 0,
   Disconnected,

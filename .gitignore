@@ -9,3 +9,4 @@ sdkconfig.esp32c3
 
 # DO NOT COMMIT YOUR WIFI PASSWORD!!
 WintergreenConfig.h
+wintergreen.bin

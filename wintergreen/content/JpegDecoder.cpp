@@ -682,7 +682,7 @@ static const char* decode_block(BitReader& r, const HuffTable& dc_ht, const Huff
     uint32_t bits = r.read_bits(dc_size);
     dc_pred += extend_val(bits, dc_size);
   }
-  blk[0] = (dc_pred << al) * static_cast<int32_t>(qt[0]);
+  blk[0] = dc_pred * (1 << al) * static_cast<int32_t>(qt[0]);
 
   if (se > 0) {
     int k = 1;
@@ -705,7 +705,7 @@ static const char* decode_block(BitReader& r, const HuffTable& dc_ht, const Huff
           return "jpeg: AC index overflow";
         uint32_t bits = r.read_bits(size);
         int32_t val = extend_val(bits, size);
-        blk[ZZ[k]] = (val << al) * static_cast<int32_t>(qt[k]);
+        blk[ZZ[k]] = val * (1 << al) * static_cast<int32_t>(qt[k]);
         ++k;
       }
     }
@@ -764,7 +764,7 @@ static void idct(const int32_t block[64], uint8_t out[64]) {
     int32_t d4 = block[b + 4], d5 = block[b + 5], d6 = block[b + 6], d7 = block[b + 7];
 
     if (!d1 && !d2 && !d3 && !d4 && !d5 && !d6 && !d7) {
-      int32_t dc = d0 << IDCT_P1;
+      int32_t dc = d0 * (1 << IDCT_P1);
       ws[b] = ws[b + 1] = ws[b + 2] = ws[b + 3] = ws[b + 4] = ws[b + 5] = ws[b + 6] = ws[b + 7] = dc;
       continue;
     }
@@ -772,8 +772,8 @@ static void idct(const int32_t block[64], uint8_t out[64]) {
     int32_t z1 = (d2 + d6) * F0541;
     int32_t tmp2 = z1 + d6 * (-F1847);
     int32_t tmp3 = z1 + d2 * F0765;
-    int32_t tmp0 = (d0 + d4) << IDCT_CB;
-    int32_t tmp1 = (d0 - d4) << IDCT_CB;
+    int32_t tmp0 = (d0 + d4) * (1 << IDCT_CB);
+    int32_t tmp1 = (d0 - d4) * (1 << IDCT_CB);
     int32_t t10 = tmp0 + tmp3, t13 = tmp0 - tmp3;
     int32_t t11 = tmp1 + tmp2, t12 = tmp1 - tmp2;
 
@@ -813,8 +813,8 @@ static void idct(const int32_t block[64], uint8_t out[64]) {
     int32_t z1 = (d2 + d6) * F0541;
     int32_t tmp2 = z1 + d6 * (-F1847);
     int32_t tmp3 = z1 + d2 * F0765;
-    int32_t tmp0 = (d0 + d4) << IDCT_CB;
-    int32_t tmp1 = (d0 - d4) << IDCT_CB;
+    int32_t tmp0 = (d0 + d4) * (1 << IDCT_CB);
+    int32_t tmp1 = (d0 - d4) * (1 << IDCT_CB);
     int32_t t10 = tmp0 + tmp3, t13 = tmp0 - tmp3;
     int32_t t11 = tmp1 + tmp2, t12 = tmp1 - tmp2;
 

@@ -225,7 +225,7 @@ extern "C" void app_main(void) {
 
   static Esp32InputSource input;
   static EInkDisplay epd;
-  // 25 ms UI frame (40 Hz) — see CLAUDE.md "Idle power" for the timing rationale.
+  // 25 ms UI frame (40 Hz) — see docs/power-and-input.md "Idle power" for the timing rationale.
   static Esp32Runtime runtime(25, input.get_adc_handle());
   // The constructor configures DFS with nothing holding the clock up, so the
   // whole boot — card mount, index, book open, layout, the first frame's SPI —
@@ -306,6 +306,7 @@ extern "C" void app_main(void) {
     //       contention that corrupts the display during SD card writes.
     if (g_index_op != SerialIndexOp::None) {
       const SerialIndexOp op = g_index_op;
+      std::atomic_thread_fence(std::memory_order_acquire);
       const bool needs_scratch = (op == SerialIndexOp::Add || op == SerialIndexOp::Rename);
       const bool reader_active = app.is_reader_active();
       const bool epd_busy = epd.is_busy();
@@ -323,6 +324,7 @@ extern "C" void app_main(void) {
         path_a[sizeof(path_a) - 1] = '\0';
         strncpy(path_b, g_index_path_b, sizeof(path_b) - 1);
         path_b[sizeof(path_b) - 1] = '\0';
+        std::atomic_thread_fence(std::memory_order_release);  // copies above happen first
         g_index_op = SerialIndexOp::None;  // free slot before processing
 
         const std::string& index_path = app.index_path();
