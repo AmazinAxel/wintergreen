@@ -31,8 +31,10 @@ dithers it, all on the build machine. The device seeks and blits rows. Consequen
 - There is **no image cache on the card**.
 
 Measured on The Hobbit: image bytes 2,077,395 → 423,652 (−80%), the file 2.71 MB → 1.06 MB
-(−61%), and `JpegDecoder`, `PngDecoder`, `ImageDecoder`, `ZipReader`, `stb_image` and miniz
-all left the firmware build (~24 KB of flash, plus their heap and scratch use). An image page
+(−61%), and `JpegDecoder`, `PngDecoder`, `ImageDecoder`, `ZipReader` and miniz all left the
+firmware build (~24 KB of flash, plus their heap and scratch use). `stb_image` has since left
+the repo entirely: its buffer-decode path was never called by the converter, which streams
+through its own decoders. An image page
 now turns at the speed of a text page.
 
 `WgbReader::open()` reads the chapter and image tables with **one `fread` each** and parses
@@ -133,14 +135,17 @@ still depends on font metrics and has to be re-derived by hand if the layout mov
 
 ## File formats: WGB and WGF
 
-Two binary formats, both **magic-as-version**: there is no version field in either. An
-incompatible layout change changes the four magic bytes, so a stale file is rejected by the
-existing magic check rather than misparsed by a reader trusting a version number it does not
-understand. Bump the digit when the layout changes, and re-convert.
+Fonts are **magic-as-version**: there is no version field. An incompatible layout change
+changes the four magic bytes, so a stale file is rejected by the existing magic check rather
+than misparsed. Bump the digit when the layout changes, and re-convert.
+
+WGB has no magic at all. `WgbReader::open` requires the image ref table to end exactly at
+`meta_offset`, which rejects a stale or non-WGB file (e.g. an HTML page saved by a bad sync).
+Any WGB layout change means re-converting the library.
 
 | | Magic | Holds | Defined in |
 |---|---|---|---|
-| Book | `WGB2` | one book: paragraphs, chapter/image tables, metadata, TOC, image bitmaps | `content/wgb/WgbFormat.h` |
+| Book | none | one book: paragraphs, chapter/image tables, metadata, TOC, image bitmaps | `content/wgb/WgbFormat.h` |
 | Font | `WGF1` | one font at one pixel size, up to four styles | `content/WgfFormat.h` |
 | Font set | `WGFS` | a count, a size table, and N `WGF1` blobs | `tools/make_font.py` `pack_bundle()` |
 
@@ -148,7 +153,9 @@ They were MRB/MBF4/FNTS. The rename came with three simplifications, all of whic
 file produced before it must be re-converted:
 
 - `WgbHeader` lost its `version` and `flags` fields (32 → 28 bytes) and later its
-  `anchor_offset` (28 → 24). The magic went to `WGB2` with that second change.
+  `anchor_offset` (28 → 24). The magic went to `WGB2` with that second change, and was
+  later dropped with the unused fields (24 → 20; chapter entry 16 → 10; text paragraph
+  body header 18 → 14).
 - `WgfHeader` lost its `version` byte: 50 → 49 bytes. **Every absolute offset stored in that
   header shifted down by one** — `bitmap_data_offset`, the three style offsets,
   `kerning_offset` and the two gray-plane offsets. Per-glyph `bitmap_offset` is relative to
@@ -269,11 +276,11 @@ docstring is the real reference:
 - The reader font asset is `[uint32 uncompressed size][zlib stream]` wrapping a WGFS v2
   bundle: `[WGFS][num][ver=2][pad:2][name:32][num × uint32][WGF1...]`.
 
-The gray planes are **optional** — `gray_lsb_offset` / `gray_msb_offset` of 0 mean absent,
-which is what `has_grayscale()` keys off. The reader font is built that way, via `--mono`:
-`FT_LOAD_TARGET_MONO`, no gray planes.
+The gray planes are **optional** — `gray_lsb_offset` / `gray_msb_offset` of 0 mean absent.
+The device ignores both fields (its gray-plane plumbing is gone); every font is built with
+`--mono`: `FT_LOAD_TARGET_MONO`, no gray planes.
 
-That followed from the reader drawing only `GrayPlane::BW`. The BW plane is not a 50%
+That followed from the reader drawing only the BW plane. The BW plane is not a 50%
 threshold — `LEVEL_BITS` puts level 2 (37.5% coverage) in the ink plane, so BW-only text was
 fattened by a ring of barely-covered edge pixels, and `FT_LOAD_TARGET_LIGHT` left stems
 straddling pixel boundaries, so that ring was uneven from glyph to glyph. Mono hinting snaps
@@ -325,8 +332,8 @@ A UI font is one command per header, e.g.
 nix-shell -p 'python3.withPackages(ps: [ps.freetype-py ps.fonttools])' --run '
   python3 tools/make_font.py header --mono \
     --regular …/SGr-IosevkaSlab-Medium.ttc:0 \
-    --name ui_small --size 14 --symbol ui_small \
-    --out wintergreen/display/ui_font_small.h'
+    --name ui_large --size 24 --symbol ui_large \
+    --out wintergreen/display/ui_font_large.h'
 ```
 
 The TTC face index matters: face **0** is Iosevka Slab, and the rest are the Extended and

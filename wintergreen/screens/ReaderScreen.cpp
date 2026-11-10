@@ -7,59 +7,12 @@
 #include "../Application.h"
 #include "../content/BookIndex.h"
 #include "../content/CoverPaths.h"
-#include "../display/ui_font_small.h"
-
-#ifdef ESP_PLATFORM
-#include <sys/stat.h>
-#include <unistd.h>
-
-#include "esp_system.h"
-#include "esp_timer.h"
-#else
-#include <filesystem>
-#endif
 
 namespace wintergreen {
 
-// ---------------------------------------------------------------------------
-// ReaderScreen — path helpers
-// ---------------------------------------------------------------------------
-
-std::string ReaderScreen::book_stem_() const {
-  const char* name = path_.c_str();
-  const char* sep = std::strrchr(name, '/');
-#ifdef _WIN32
-  const char* bsep = std::strrchr(name, '\\');
-  if (bsep && (!sep || bsep > sep))
-    sep = bsep;
-#endif
-  if (sep)
-    name = sep + 1;
-  const char* dot = std::strrchr(name, '.');
-  size_t len = dot ? static_cast<size_t>(dot - name) : std::strlen(name);
-  return std::string(name, len);
-}
-
 std::string ReaderScreen::display_title_() const {
-  const std::string& t = wgb_.metadata().title;
-  if (!t.empty() && t != "none")
-    return t;
-  // Same fallback BookIndex uses: the containing folder, which the converter
-  // names after the original file.
-  const size_t last = path_.find_last_of('/');
-  if (last == std::string::npos || last == 0)
-    return book_stem_();
-  const size_t prev = path_.find_last_of('/', last - 1);
-  const size_t start = prev == std::string::npos ? 0 : prev + 1;
-  return path_.substr(start, last - start);
+  return book_title_fallback(wgb_.metadata().title, path_);
 }
-
-// ---------------------------------------------------------------------------
-// ReaderScreen — image size resolution
-// ---------------------------------------------------------------------------
-
-// resolve_image_size_ removed — image size resolution is now handled by
-// make_image_size_query() (WgbReader.h), stored in image_size_fn_.
 
 // Draw a stored image, or the slice of it that lands on this page.
 //
@@ -98,13 +51,22 @@ bool ReaderScreen::draw_image_(uint32_t offset, uint32_t size, DrawBuffer& buf, 
   if (first >= last)
     return false;
 
+  if (row_bytes > DisplayFrame::kStride)
+    return false;  // wider than the panel: not something the converter produces
   if (std::fseek(f, static_cast<long>(offset) + static_cast<long>(first) * row_bytes, SEEK_SET) != 0)
     return false;
-  std::vector<uint8_t> row(row_bytes);
-  for (uint16_t r = first; r < last; ++r) {
-    if (std::fread(row.data(), 1, row_bytes, f) != row_bytes)
+  // A band of rows on the stack: no heap, one fread per band, and enough rows
+  // per blit for the portrait path to pack whole bytes.
+  static constexpr uint16_t kBandRows = 16;
+  uint8_t band[kBandRows * DisplayFrame::kStride];
+  for (uint16_t r = first; r < last;) {
+    const uint16_t n = static_cast<uint16_t>(std::min<int>(kBandRows, last - r));
+    const size_t got = std::fread(band, row_bytes, n, f);
+    if (got > 0)
+      buf.blit_1bit(dest_x, dest_y + static_cast<int>(r - first), band, width, static_cast<int>(got), row_bytes);
+    if (got != n)
       break;
-    buf.blit_1bit_row(dest_x, dest_y + static_cast<int>(r - first), row.data(), width);
+    r = static_cast<uint16_t>(r + n);
   }
   return true;
 }
@@ -144,14 +106,10 @@ void ReaderScreen::start(DrawBuffer& buf, IRuntime& runtime) {
   // could never produce.
   wgb_path_ = path_;
 
-  bool wgb_ok = wgb_.open(wgb_path_.c_str());
-
-  buf_was_touched_ = false;
-
-  if (!wgb_ok) {
-    open_ok_ = false;
-    goto show_error;
-  }
+  // No reader font, no book: update() pops straight back without drawing.
+  open_ok_ = false;
+  if (!ext_font_set_ || !ext_font_set_->valid() || !wgb_.open(wgb_path_.c_str()))
+    return;
 
   pos_path_ = book_pos_path(wgb_path_.c_str());
 
@@ -171,7 +129,7 @@ void ReaderScreen::start(DrawBuffer& buf, IRuntime& runtime) {
   }
   if (!chapter_src_) {
     open_ok_ = false;
-    goto show_error;
+    return;
   }
   page_pos_ = saved_page_pos_;
   layout_engine_ = TextLayout{};
@@ -185,13 +143,6 @@ void ReaderScreen::start(DrawBuffer& buf, IRuntime& runtime) {
   resume_back_pending_ = config::kResumeOnePageBack;
   render_page_(buf);
   prerender_pending_ = true;
-  return;
-
-show_error:
-  if (buf_was_touched_) {
-    buf.fill(true);
-    buf.draw_text(kPaddingLeft, kPaddingTop, "Failed to open book", true, kScale);
-  }
 }
 
 // Snapshot the rendered page so resume() can put it back without re-rendering.
@@ -242,12 +193,10 @@ void ReaderScreen::resume(DrawBuffer& buf, IRuntime& runtime) {
     layout_engine_.set_image_size_fn(image_size_fn_);
     layout_engine_.set_hyphenation_lang(detect_language(wgb_.metadata().language));
   }
-  // Check if font settings changed (font_size_idx may have been updated in options).
-  if (const BitmapFontSet* fset = ext_font_set_ ? ext_font_set_ : (font_set_.valid() ? &font_set_ : nullptr)) {
-    const_cast<BitmapFontSet*>(fset)->set_base_size_index(reader_settings_.font_size_idx);
-  }
 
-  // Make sure to apply settings when coming from the reader options screen
+  // **Not redundant.** A font-size change keeps the same BitmapFontSet pointer
+  // and the same page options, so set_font()/set_options() see nothing new;
+  // re-setting the source is what invalidates the paragraph cache and the epoch.
   if (chapter_src_)
     layout_engine_.set_source(*chapter_src_);
 
@@ -288,20 +237,8 @@ void ReaderScreen::stop() {
 
 void ReaderScreen::update(const ButtonState& buttons, DrawBuffer& buf, IRuntime& runtime) {
   if (!open_ok_) {
-    // Auto-pop if the book was never found (no display was touched).
-    // Otherwise wait for back button so user can see the error message.
-    if (!buf_was_touched_) {
-      app_->pop_screen();
-      return;
-    }
-    // Still drain the history so stale events don't bleed into the next frame.
-    Button btn;
-    while (buttons.next_press(btn)) {
-      if (btn == Button::Button0) {
-        app_->pop_screen();
-        return;
-      }
-    }
+    // The book did not open; nothing was drawn, so go straight back.
+    app_->pop_screen();
     return;
   }
 
@@ -315,10 +252,7 @@ void ReaderScreen::update(const ButtonState& buttons, DrawBuffer& buf, IRuntime&
   //   portrait   Up = next,   Down = prev
   //   landscape  Down = next, Up   = prev
   //
-  // Landscape is Deg0 or Deg180 — "reversed" is still the same physical hold, so
-  // testing only Deg0 would leave the flipped case behaving like portrait.
-  const Rotation rot = buf.rotation();
-  const bool landscape_hold = (rot == Rotation::Deg0 || rot == Rotation::Deg180);
+  const bool landscape_hold = buf.rotation() == Rotation::Deg0;
   // Front row is fixed to the panel and does not rotate with the hold.
   constexpr Button logical_next_front = Button::Button3;
   constexpr Button logical_prev_front = Button::Button2;
@@ -518,7 +452,7 @@ bool ReaderScreen::take_predrawn_(DrawBuffer& buf) {
     return false;
   if (predrawn_.font_size_idx != reader_settings_.font_size_idx)
     return false;
-  const bool landscape = (buf.rotation() == Rotation::Deg0 || buf.rotation() == Rotation::Deg180);
+  const bool landscape = buf.rotation() == Rotation::Deg0;
   PageOptions opts = make_page_opts(buf.width(), buf.height());
   opts.padding_bottom = bottom_padding_(landscape);
   if (!(predrawn_.opts == opts))
@@ -571,18 +505,12 @@ void ReaderScreen::render_page_(DrawBuffer& buf) {
   const int W = buf.width();
   const int H = buf.height();
 
+  // start() refuses to open a book without the font set, so it is always here.
+  BitmapFontSet& fset = const_cast<BitmapFontSet&>(*ext_font_set_);
+  fset.set_base_size_index(reader_settings_.font_size_idx);
+  IFont& font = fset;
 
-  // Use proportional font if available, otherwise fallback to fixed.
-  // Static: the layout engine keeps a pointer to its font past this call
-  // (prev_page_, prerender), so a stack font would dangle.
-  static FixedFont fixed_font(kGlyphW * kScale, kGlyphH * kScale + 4);
-  const BitmapFontSet* fset = ext_font_set_ ? ext_font_set_ : (font_set_.valid() ? &font_set_ : nullptr);
-  if (fset) {
-    const_cast<BitmapFontSet*>(fset)->set_base_size_index(reader_settings_.font_size_idx);
-  }
-  IFont& font = fset ? static_cast<IFont&>(const_cast<BitmapFontSet&>(*fset)) : static_cast<IFont&>(fixed_font);
-
-  const bool landscape = (buf.rotation() == Rotation::Deg0 || buf.rotation() == Rotation::Deg180);
+  const bool landscape = buf.rotation() == Rotation::Deg0;
   PageOptions opts = make_page_opts(W, H);
   opts.padding_bottom = bottom_padding_(landscape);
   layout_engine_.set_font(font);
@@ -688,27 +616,7 @@ void ReaderScreen::render_page_(DrawBuffer& buf) {
   // ────────────────────────────────────────────────────────
   buf.fill(true);
 
-  if (fset) {
-    render_text_(buf, *fset, reader_settings_.h_padding());
-  } else {
-    for (const auto& ci : page_.items) {
-      const PageTextItem* item = std::get_if<PageTextItem>(&ci);
-      if (!item)
-        continue;
-      for (const auto& w : item->line.words) {
-        if (w.len == 0)
-          continue;
-        char text[64];
-        int tlen = static_cast<int>(w.len);
-        if (tlen > 63)
-          tlen = 63;
-        std::memcpy(text, w.text, tlen);
-        text[tlen] = '\0';
-        buf.draw_text_no_bg(reader_settings_.h_padding() + w.x, static_cast<int>(item->y_offset), text, false /*black*/,
-                            kScale);
-      }
-    }
-  }
+  render_text_(buf, fset, reader_settings_.h_padding());
 
   for (const auto& hr : page_.items) {
     const PageHrItem* h = std::get_if<PageHrItem>(&hr);
@@ -740,38 +648,13 @@ uint16_t ReaderScreen::bottom_padding_(bool landscape) {
                                (landscape ? 2 : 0));
 }
 
-bool ReaderScreen::render_current_page(DrawBuffer& buf) {
-  if (!open_ok_)
-    return false;
-  render_page_(buf);
-  return true;
-}
-
-bool ReaderScreen::next_page_and_render(DrawBuffer& buf) {
-  if (!open_ok_)
-    return false;
-  if (!next_page_())
-    return false;
-  render_page_(buf);
-  return true;
-}
-
-bool ReaderScreen::is_open_ok() const {
-  return open_ok_;
-}
-
-size_t ReaderScreen::current_chapter_index() const {
-  return chapter_idx_;
-}
-
 void ReaderScreen::render_text_(DrawBuffer& buf, const BitmapFontSet& fset, int left_padding) {
-  uint8_t* render = buf.render_buf();
   for (const auto& ci : page_.items) {
     const PageTextItem* item = std::get_if<PageTextItem>(&ci);
     if (!item)
       continue;
-    int baseline_y = static_cast<int>(item->y_offset) + item->baseline;
-    buf.draw_layout_line(render, left_padding, baseline_y, item->line, fset, GrayPlane::BW, false);
+    const int baseline_y = static_cast<int>(item->y_offset) + item->baseline;
+    buf.draw_layout_line(left_padding, baseline_y, item->line, fset, false);
   }
 }
 

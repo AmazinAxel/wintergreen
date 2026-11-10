@@ -25,9 +25,19 @@ second awake costs more than half an hour asleep. SMB also has no "give me the d
 primitive: it is a listing plus a stat per book. The Pi already runs bun on port 80, so one
 POST carries the whole negotiation. Samba stays — it is still how EPUBs get *onto* the Pi.
 
-**mDNS is not used and should not be added.** `esp_mdns` is a managed component, not part of
-IDF, so it would mean a component-manager fetch at build time. Resolution is: cached IP from
-NVS → literal IP in config → `getaddrinfo`.
+**`.local` names resolve through lwIP, not `esp_mdns`.** `esp_mdns` is a managed
+component, not part of IDF — a component-manager fetch at build time for a responder this
+device does not need to be. lwIP's resolver already does the client half:
+`CONFIG_LWIP_DNS_SUPPORT_MDNS_QUERIES` (pinned in `sdkconfig.defaults`) makes `getaddrinfo`
+send a one-shot query to 224.0.0.251:5353 for any name ending `.local`, and a legacy-unicast
+responder (Avahi on the Pi) answers it directly. Not yet confirmed on hardware.
+
+Resolution is: literal IP in config → IP cached in NVS (stored with the name it came from,
+so editing `syncServer` never reuses the old address) → `getaddrinfo`. **The cache is a
+hint.** It was once trusted forever: when the server's lease moved, every sync failed and
+nothing ever looked the name up again. Now a sync that fails against a cached address drops
+it, re-resolves and tries once more; `run_sync_` fails only on the POST, so the retry is
+safe.
 
 ### What a sync costs
 
@@ -86,7 +96,8 @@ Ordering is the entire safety property:
 
 1. device sends `done[]` (books at `progress_pct >= 100`)
 2. server appends to `finished` in `.sync.json` and **fsyncs**
-3. only then does the server unlink, and reply with `delete[]`
+3. only then does the server move the book to `/media/books/.read/<dir>/` (kept, never
+   listed or served again), and reply with `delete[]`
 4. only on seeing `delete[]` does the device unlink
 
 A crash at any step leaves the book present somewhere. `finished` is append-only and never
@@ -170,8 +181,8 @@ synced book does not appear until you navigate away from the list and back.
   timeout is the only bound.
 - **Never pin a cached BSSID/channel on the first attempt.** If the AP moved channel, every
   retry re-attempted the *same* pinned config and failed identically, never falling back to
-  a scan — indistinguishable from a wrong password. The hint is still cached for
-  `resolve_server_`, but association always starts with a normal scan.
+  a scan — indistinguishable from a wrong password. BSSID/channel are no longer cached at
+  all (they were written to NVS every sync and never read); association always scans.
 
 **BLE goes down first and does not come back on its own.** One radio, and ~13 KB free with
 the clicker up leaves no room for Wi-Fi's ~40-50 KB. `start()` calls
@@ -184,26 +195,23 @@ would cut the radio with files half written.
 
 ### The server side
 
-In the flake repo, not here: `hosts/alechomelab/webserver/booksync.js` bolted onto the
-existing bun server (no new service, no new port), plus `hosts/alechomelab/books.nix` — a
-systemd `.path` unit watching `/media/books` that converts any new EPUB into
-`.compiled/<stem>/` with `epub2wgb`, staged in a temp dir and moved into place so a
-half-written book is never visible to a concurrent sync.
+In the flake repo (`snowflake`), not here: `hosts/alechomelab/webserver/booksync.js` bolted
+onto the existing bun server (no new service, no new port). **The homelab never converts
+and never sees an EPUB.** `preprocess.fish` (this repo, packaged as `books` by `flake.nix`,
+installed by snowflake's `modules/desktop.nix`) reviews EPUBs in `~/Downloads/books`,
+rewrites them in place, converts locally, and uploads `/media/books/<dir>/` over ssh:
+tar into `/media/books/.incoming/`, then `mv` into place, so a half-uploaded book is never
+visible to a concurrent sync. The WGB is not kept on the desktop.
 
-`epub2wgb` is packaged by **this** repo's `flake.nix` and consumed as
-`inputs.wintergreen.packages.aarch64-linux.epub2wgb`. Its `CMakeLists.txt` has no
-`install()` rule, so the derivation supplies its own `installPhase`.
+Removed, don't re-add: `books.nix` (path unit converting on the Pi) and
+`scripts/convertBooks.fish`. The `DirectoryNotEmpty` retrigger loop that unit once had is
+moot with it.
 
 Endpoints: `POST /booksync` (the whole negotiation) and `GET /booksync/<dir>/<file>` (one
 book file). Book directory names are validated against `/^[A-Za-z0-9 ._-]+$/` and rejected
-if they contain `..` — they are used as path segments.
-
-One bug worth not repeating: **`DirectoryNotEmpty` is a level, not an edge.** It re-triggers
-for as long as the watched directory has *anything* in it, so the service restarted the
-instant it finished, forever, until systemd's rate limiter killed it with `start-limit-hit`
-— **part-way through the loop**, so the alphabetically last book was never converted and
-nothing said so. It is `PathChanged` now (fires once per upload), plus a `startLimitBurst`
-backstop so a future retrigger loop fails loudly instead of spinning.
+if they contain `..` or start with `.` — they are used as path segments, and dot dirs
+(`.read`, `.incoming`) must never be listed or served. `preprocess.fish`'s `slug` produces
+names that pass.
 
 Book names contain spaces, so anything built on them must encode them.
 

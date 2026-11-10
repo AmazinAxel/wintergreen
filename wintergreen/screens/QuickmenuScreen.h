@@ -19,8 +19,7 @@ namespace wintergreen {
 struct ReaderSettings {
   uint8_t font_size_idx = 0;  // base font size preset index (0 = 32px)
 
-  // Must match the sizes tools/make_font.py builds into the bundle, in order.
-  static constexpr const char* kFontSizeNames[] = {"32", "36"};
+  // Must match the number of sizes tools/make_font.py builds into the bundle.
   static constexpr uint8_t kNumFontSizePresets = 2;
 
   static constexpr uint16_t h_padding() {
@@ -47,10 +46,6 @@ class QuickmenuScreen final : public ListMenuScreen {
  public:
   QuickmenuScreen() = default;
 
-  const char* name() const override {
-    return "Options";
-  }
-
   // Set the settings object to read/write (must outlive this screen).
   void set_settings(ReaderSettings* s) {
     settings_ = s;
@@ -74,7 +69,7 @@ class QuickmenuScreen final : public ListMenuScreen {
   // Minimum gap between an ellipsised label and its right-hand value.
   static constexpr int kValueGap = 12;
   static constexpr int kPctGap = 10;    // title text → its percentage
-  static constexpr int kBlockGap = 10;  // between title, chapter and the rule
+  static constexpr int kBlockGap = 4;   // between title, chapter and the rule
   // The settings/chapters hairline uses the shared ListMenuScreen geometry
   // (kSeparatorH / draw_separator_) so it matches the book list exactly.
   // No battery on this screen — it is an overlay on the book, not a top-level
@@ -84,8 +79,11 @@ class QuickmenuScreen final : public ListMenuScreen {
 
   // The chapter is a subtitle to the book title: one step down in size, in the
   // same font the settings rows use.
-  const BitmapFont& chapter_font_() const { return section_font_.valid() ? section_font_ : subtitle_font_; }
-  const BitmapFont& title_font_() const { return header_font_.valid() ? header_font_ : ui_font_; }
+  const BitmapFont& chapter_font_() const { return section_font_; }
+  // A title too long for one line of ui_font_ is set in two lines of the
+  // chapter face instead (title_small_, decided in on_start()).
+  const BitmapFont& title_font_() const { return title_small_ ? section_font_ : ui_font_; }
+  bool title_small_ = false;
 
   // ── Chapter jump ──────────────────────────────────────────────────────────
   // The chapter list lives in this screen; there is no separate Chapters page.
@@ -129,7 +127,7 @@ class QuickmenuScreen final : public ListMenuScreen {
       const ClickerState now = runtime.clicker_state();
       const uint8_t pct = runtime.clicker_battery_pct();
       if (now != clicker_shown_ || pct != clicker_pct_shown_) {
-        refresh_items_(selected_index());
+        refresh_items_(selected());
         request_redraw();
       }
     }
@@ -138,15 +136,11 @@ class QuickmenuScreen final : public ListMenuScreen {
 
   void start(DrawBuffer& buf, IRuntime& runtime) override;
 
-  std::string_view get_item_subtitle(int index) const override;
-  std::string wintergreen_header_left() const override;
-
  protected:
   void on_start() override;
   void on_select(int index) override;
 
  private:
-  mutable std::string subtitle_buf_;
   ReaderSettings* settings_ = nullptr;
   DrawBuffer* buf_ = nullptr;
   IRuntime* runtime_ = nullptr;
@@ -198,6 +192,8 @@ class QuickmenuScreen final : public ListMenuScreen {
 
   // Pixels from the top of the panel to the rule above the item list.
   int header_h_() const;
+  // Height of the title + chapter lines alone, centred inside header_h_().
+  int header_content_h_() const;
 
   int book_progress_pct_ = 0;
   int chapter_progress_pct_ = 0;

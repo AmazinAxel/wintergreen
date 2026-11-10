@@ -25,9 +25,6 @@
 #include "ImageDecoder.h"
 #include "ZipReader.h"
 #include "miniz.h"
-#ifdef ESP_PLATFORM
-#include "esp_timer.h"
-#endif
 
 namespace wintergreen {
 
@@ -362,8 +359,6 @@ ImageError decode_png_from_entry(IZipFile& file, const ZipEntry& entry, uint16_t
                                  ImageRowSink* sink, ImagePixelSink* pixel_sink,
                                  ToneLut tone_lut, ToneHistogram* tone_hist) {
   // If no work_buf, allocate one
-#ifdef ESP_PLATFORM
-#endif
   std::unique_ptr<uint8_t[]> owned_work;
   if (!work_buf || work_buf_size < ZipEntryInput::kMinWorkBufSize) {
     owned_work = std::unique_ptr<uint8_t[]>(new (std::nothrow) uint8_t[ZipEntryInput::kMinWorkBufSize]);
@@ -784,8 +779,6 @@ ImageError decode_png_from_entry(IZipFile& file, const ZipEntry& entry, uint16_t
   uint32_t src_y = 0, out_y = 0;
 
   // ---- IDAT streaming decompression + row processing ----
-#ifdef ESP_PLATFORM
-#endif
   for (;;) {
     // Top up input buffer from the IDAT stream
     while (in_avail < kIDAT_BufSize) {

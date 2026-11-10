@@ -38,7 +38,7 @@ indistinguishable from a freeze.
 `HomeScreen::on_start()` picks the five most recently opened; if none have been (a fresh
 card, or wiped settings) it shows the alphabetically first books instead, ordered with
 the shared `ci_less()` so "first" means the same thing as in the book list's never-opened
-group. The "No books on the card" panel is only a safety net.
+group. A carousel with nothing at all draws only the battery.
 
 ### HomeScreen
 
@@ -58,17 +58,21 @@ item/selection/navigation machinery; every pixel comes from its own `draw_all_`.
 - The selected cover is loaded on demand **from inside `draw_all_`** (hence the `mutable`
   cover members). Loading from `update()` would draw one frame with the previous cover
   and then redraw — two e-ink refreshes per press.
-- **There is exactly one cover on the heap, and a second one crashes the device** — see
-  "Investigated and rejected".
-  `cover_slot_` is what stops the card being re-read every
-  frame, including for a book with no cover file: empty `cover_data_` with a valid
-  `cover_slot_` is a real state, not a miss.
+- **The cover lives in the spare framebuffer, not on the heap** (`claim_spare_cache(this)`,
+  trusted while `spare_cache_valid(cover_gen_)`). A heap copy was ~26 KB resident for as
+  long as the home screen was. The cache owner is part of the claim, so the book list's
+  thumbnails and this cover invalidate each other instead of trusting overwritten bytes.
+  With a radio up there is no spare and the placeholder frame is drawn. There is still
+  exactly **one** cover — a second, preloaded one crashed the device; see "Investigated
+  and rejected". `cover_slot_` is what stops the card being re-read every frame,
+  including for a book with no cover file: no cover with a valid `cover_slot_` is a real
+  state, not a miss. A cover that was loaded and then lost its spare is reloaded.
 - `on_start()` clears `cover_slot_` because it rebuilds `slots_` from the index — a sync,
   a serial upload or a delete repoints every index without necessarily changing one.
 - The cover is **`cover_home.bin`**, rendered by the converter to fit the box
   (`kHomeCoverW` × `kHomeCoverH` = 424x486 in `content/CoverPaths.h`) with its blank top
   and bottom rows already trimmed (`Book::write_cover_bin`), so a load is a header and
-  one `fread` into `cover_data_`. **There is no scaler on the device** and no fallback
+  one `fread` into the spare. **There is no scaler on the device** and no fallback
   file: a missing or oversized cover draws the placeholder frame. `cover_sleep.bin` is
   not a substitute — it is composed for the panel with bars baked in. The two constants
   mirror `draw_all_`'s layout maths; if the layout moves they drift and every cover
@@ -123,12 +127,20 @@ quick menu said "none" for a book the home screen named correctly.
 
 ### MainMenu
 
-**Row 0 of the book list is a `Sync` action, not a book.** Row 1 is its hairline (pushed
-into `separators_` like any other), and books start at row 2 — so `entries_index_for()`
-subtracts one *on top of* the separator shift, and `visual_for_entries()` skips both
-kinds of non-book row. Every derived separator position in `populate_list_()` carries the
-same `kFirstBook = 2` offset; getting that wrong shows up as the wrong book opening, not
-as a drawing glitch.
+**Row 0 of the book list is a `Sync` action, not a book** — when sync is compiled in
+(`has_sync_`, from `sync_state() != Unavailable` at `start()`; without `WG_WIFI_SYNC` the
+row would be a button that does nothing, so it is absent and books start at row 0). Row 1
+is its hairline (pushed into `separators_` like any other), and books start at row 2 — so
+`entries_index_for()` subtracts `sync_rows_()` *on top of* the separator shift, and
+`visual_for_entries()` skips both kinds of non-book row. Every derived separator position
+in `populate_list_()` carries the same `first_book` offset (2 or 0); getting that wrong
+shows up as the wrong book opening, not as a drawing glitch.
+
+Entries reference `BookIndex`'s pool for path, title and author (`path_of_()`); only hidden
+books own strings. A `std::string` path per book was up to 250 allocations per list build.
+
+Titles are drawn whole: the old `"Label: Value"` split (from long-gone settings screens)
+also cut book titles at their first `": "` whenever the row had an author.
 
 `run_sync_()` calls `IRuntime::start_sync()` and returns immediately. Its label reports
 progress (`Sync` / `Syncing...` / `Synced`), read from `sync_shown_` rather than the
@@ -182,11 +194,15 @@ Four things the hidden list depends on:
 
 ### ListMenuScreen
 
-Base class for every list screen. There is **one** visual theme; the `MenuTheme` enum is
-gone. Two per-instance booleans select the remaining variations:
+Base class for every list screen: item storage, navigation, hold-repeat, scrolling and
+the battery header. Its own draw pass is **one layout**, the book list's; `HomeScreen` and
+`QuickmenuScreen` override `draw_all_` and draw everything themselves. The other layouts
+it once carried — the `plain_list_` centred header, the book-details card selected by a
+non-empty `subtitle_`, centred single-line rows, `draw_bottom_`'s footer — had no screen
+left using them and are gone, along with the 14 px UI font only they used.
 
-- `detail_list_` — two-line rows (title + subtitle, full-width divider, right-hand
-  column). Set by MainMenu. The right column is the reading percentage and sits on the
+- Two-line rows (title + subtitle, full-width divider, right-hand column). The right
+  column is the reading percentage and sits on the
   **subtitle** baseline, bottom right beside the author, so the title gets the full row
   width. The **last** row draws no divider, and neither does a row whose next row is a
   section hairline, or the two rules land a few pixels apart and read as a double line.
@@ -206,10 +222,6 @@ gone. Two per-instance booleans select the remaining variations:
   contiguous heap and showed nothing on hardware: the heap is too fragmented for that
   gate. A load re-checks the spare after its last allocation, because the OOM handler
   releases it from inside any allocation.
-- `plain_list_` — centred-title header instead of the battery status bar.
-
-Both false = standard header + centred single-line rows. A non-empty `subtitle_` switches
-the header into the book-details card and is checked before either flag.
 
 **There is one separator, defined once.** `kSeparatorH` (14 px) and `draw_separator_()`
 are the only hairline geometry in the tree, and every list uses them, including
@@ -222,13 +234,13 @@ two-line height otherwise. `wintergreen_visible_from_` asks per index too, so sc
 stays consistent with what is drawn.
 
 No screen draws button labels, nav-arrow glyphs or a battery icon: the labelled `Back |
-Select` / `Down | Up` boxes and the ◀▶▲▼ hint row were removed, and `draw_bottom_` only
-draws the book-details footer. Don't add them back — the buttons are fixed and the panel
-is small.
+Select` / `Down | Up` boxes and the ◀▶▲▼ hint row were removed. Don't add them back —
+the buttons are fixed and the panel is small. Nor any empty-state text: an empty list is
+blank.
 
 **The header is battery-only.** No wordmark on any screen, no rule under the header. Its
-height is `battery_row_h_() + kHeaderBottomGap` in **both** `draw_header_` and
-`compute_header_h_`. It used to be measured off `header_font_` (41 px) while the
+height is `header_h_()` = `battery_row_h_() + kHeaderBottomGap`, used by both the draw
+and the scroll maths. It used to be measured off the 41 px header face while the
 percentage is drawn in `section_font_` (31 px), so the list started 10 px too low.
 
 Every screen draws the percentage through `draw_battery_`, and `HomeScreen` — which
@@ -238,10 +250,9 @@ screen on purpose: when the carousel had its own copy of the maths it drifted by
 pixels in both axes, visible as a jump when moving between screens. Don't reintroduce a
 per-screen `W - pad - pw`.
 
-Drawing is `draw_header_` → `draw_bottom_` → `draw_list_`, with `compute_header_h_`
-mirroring the header maths for scroll calculations. `get_visible_count_` must stay
-consistent with `draw_list_`'s branch selection — separate functions keyed on the same
-conditions, and divergence causes scroll bugs.
+Drawing is `draw_battery_` → `draw_list_`. `get_visible_count_` and `draw_list_` both
+measure rows through `wintergreen_visible_from_`; keep it that way, divergence causes
+scroll bugs.
 
 ### Sorting — never use std::sort here
 

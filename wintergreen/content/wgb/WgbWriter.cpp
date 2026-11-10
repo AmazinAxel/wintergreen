@@ -3,8 +3,6 @@
 #include <cerrno>
 #include <cstring>
 
-#ifdef ESP_PLATFORM
-#endif
 
 namespace wintergreen {
 
@@ -99,7 +97,6 @@ bool WgbWriter::open(const char* path) {
 
   // Write placeholder header (will be fixed up in finish()).
   WgbHeader hdr{};
-  std::memcpy(hdr.magic, kWgbMagic, 4);
   if (!write_bytes(&hdr, sizeof(hdr))) {
     close();
     return false;
@@ -159,9 +156,7 @@ void WgbWriter::end_chapter() {
 
   WgbChapterEntry entry{};
   entry.para_table_offset = table_offset;
-  entry.reserved = 0;
   entry.paragraph_count = chapter_para_count_;
-  entry.reserved1 = 0;
   entry.char_count = chapter_char_count_;
   chapters_.push_back(entry);
   in_chapter_ = false;
@@ -544,16 +539,14 @@ bool WgbWriter::finish(const EpubMetadata& meta, const TableOfContents& toc) {
   if (in_chapter_)
     end_chapter();
 
-  // --- Write chapter table (16 bytes each) ---
+  // --- Write chapter table (10 bytes each) ---
   uint32_t chapter_offset = bw_.tell();
   for (const auto& ch : chapters_) {
-    uint8_t buf[16];
+    uint8_t buf[kWgbChapterEntrySize];
     wgb_write_u32(buf, ch.para_table_offset);
-    wgb_write_u32(buf + 4, ch.reserved);
-    wgb_write_u16(buf + 8, ch.paragraph_count);
-    wgb_write_u16(buf + 10, 0);
-    wgb_write_u32(buf + 12, ch.char_count);
-    if (!write_bytes(buf, 16))
+    wgb_write_u16(buf + 4, ch.paragraph_count);
+    wgb_write_u32(buf + 6, ch.char_count);
+    if (!write_bytes(buf, kWgbChapterEntrySize))
       return false;
   }
 
@@ -618,7 +611,6 @@ bool WgbWriter::finish(const EpubMetadata& meta, const TableOfContents& toc) {
 
   // --- Fix up header ---
   WgbHeader hdr{};
-  std::memcpy(hdr.magic, kWgbMagic, 4);
   hdr.paragraph_count = paragraph_count_;
   hdr.chapter_count = static_cast<uint16_t>(chapters_.size());
   hdr.image_count = static_cast<uint16_t>(images_.size());
@@ -655,7 +647,7 @@ bool WgbWriter::write_text_paragraph(const TextParagraph& meta, uint16_t spacing
     chapter_char_count_ += static_cast<uint32_t>(runs[i].text.size());
 
   // Compute body size (pure arithmetic, no allocation).
-  static constexpr size_t kBodyHdrSize = 18;  // alignment(1)+indent(2)+ml(2)+mr(2)+spacing(2)+lh(1)+img(6)+runcount(2)
+  static constexpr size_t kBodyHdrSize = 14;  // alignment(1)+indent(2)+spacing(2)+lh(1)+img(6)+runcount(2)
   static constexpr size_t kRunHdrSize = 12;   // style(1)+size(1)+valign(1)+flags(1)+ml(2)+mr(2)+textlen(4)
   size_t body_size = kBodyHdrSize;
   for (size_t i = 0; i < run_count; ++i) {
@@ -669,16 +661,12 @@ bool WgbWriter::write_text_paragraph(const TextParagraph& meta, uint16_t spacing
   if (!write_bytes(outer, 5))
     return false;
 
-  // Write paragraph body header (18 bytes) from stack.
-  uint8_t hdr[18];
+  // Write paragraph body header (14 bytes) from stack.
+  uint8_t hdr[kBodyHdrSize];
   uint8_t* p = hdr;
   *p++ = meta.alignment.has_value() ? static_cast<uint8_t>(*meta.alignment) : kWgbAlignDefault;
   wgb_write_i16(p, meta.indent.value_or(kWgbIndentNone));
   p += 2;
-  wgb_write_u16(p, 0);
-  p += 2;  // margin_left placeholder
-  wgb_write_u16(p, 0);
-  p += 2;  // margin_right placeholder
   wgb_write_u16(p, spacing);
   p += 2;
   *p++ = meta.line_height_pct;
@@ -699,7 +687,7 @@ bool WgbWriter::write_text_paragraph(const TextParagraph& meta, uint16_t spacing
   }
   wgb_write_u16(p, static_cast<uint16_t>(run_count));
   p += 2;
-  if (!write_bytes(hdr, 18))
+  if (!write_bytes(hdr, kBodyHdrSize))
     return false;
 
   // Write each run using a 12-byte stack header.

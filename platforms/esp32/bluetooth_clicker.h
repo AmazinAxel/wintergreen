@@ -608,7 +608,7 @@ inline bool bringup_stack() {
     g_spare_released = true;
   }
 
-  // Same reasoning for main.cpp's OOM reserve: it is 28 KB of the same ~50 KB
+  // Same reasoning for main.cpp's OOM reserve: it comes out of the same ~50 KB
   // internal pool the controller allocates from, so holding it here is the
   // difference between a connect and a row that silently stays Disconnected.
   // The frame loop takes it back once the radio is down.

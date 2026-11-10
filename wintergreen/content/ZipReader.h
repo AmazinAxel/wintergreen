@@ -156,10 +156,6 @@ class ZipEntryInput : public IXmlInput {
 
   size_t read(void* buf, size_t max_size) override;
 
-  bool has_error() const {
-    return error_;
-  }
-
  private:
   IZipFile* file_ = nullptr;
   void* decomp_ = nullptr;  // tinfl_decompressor* (points into work_buf, NOT heap-allocated)

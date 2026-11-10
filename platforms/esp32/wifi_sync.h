@@ -61,7 +61,6 @@ using wintergreen::SyncState;
 #include "nvs_flash.h"
 #include "wintergreen/Application.h"
 #include "wintergreen/content/BookIndex.h"
-#include "wintergreen/content/wgb/WgbReader.h"
 #include "wintergreen/display/DrawBuffer.h"
 
 // Defined in main.cpp — see the note there. Hands back the OOM rescue block,
@@ -93,48 +92,44 @@ inline constexpr int kHttpTimeoutMs = 8000;
 // read; the point is that a 1 MB book is never held in RAM.
 inline constexpr int kChunk = 4096;
 
-inline int g_retries = 0;
-
-// ── Cached association state ───────────────────────────────────────────────
+// ── Cached server address ──────────────────────────────────────────────────
 //
 // In NVS rather than the settings file: this is device-local network state, not
 // a user setting, and the settings file is deliberately three keys.
 //
-// The BSSID and channel skip a full scan across every channel on reconnect,
-// which is 1-2 s of radio at full draw. The IP skips mDNS, which is multicast
-// and slower still. All three are hints — any failure falls back to the slow
-// path and re-caches.
+// The resolved IP skips the lookup — for a `.local` name that is an mDNS query,
+// multicast and a second or so of radio. It is stored with the name it was
+// resolved from, so editing syncServer never reuses the old server's address,
+// and it is only a hint: a sync that fails against it re-resolves once and
+// re-caches (see sync_task).
 
 inline constexpr const char* kNvsNamespace = "wgsync";
 
-struct NetHint {
-  uint8_t bssid[6] = {};
-  uint8_t channel = 0;
-  uint32_t ip = 0;
-  bool valid = false;
-};
-
-inline NetHint load_hint_() {
-  NetHint h;
+inline uint32_t load_cached_ip_() {
   nvs_handle_t nvs;
   if (nvs_open(kNvsNamespace, NVS_READONLY, &nvs) != ESP_OK)
-    return h;
-  size_t len = sizeof(h.bssid);
-  const bool got_bssid = nvs_get_blob(nvs, "bssid", h.bssid, &len) == ESP_OK && len == sizeof(h.bssid);
-  nvs_get_u8(nvs, "chan", &h.channel);
-  nvs_get_u32(nvs, "ip", &h.ip);
+    return 0;
+  uint32_t ip = 0;
+  char host[64] = {};
+  size_t len = sizeof(host);
+  const bool ok = nvs_get_u32(nvs, "ip", &ip) == ESP_OK && nvs_get_str(nvs, "host", host, &len) == ESP_OK &&
+                  std::strcmp(host, wintergreen::config::syncServer) == 0;
   nvs_close(nvs);
-  h.valid = got_bssid;
-  return h;
+  return ok ? ip : 0;
 }
 
-inline void save_hint_(const NetHint& h) {
+// ip 0 forgets the cached address. Only called when it changes, so a sync
+// against a good cache writes no NVS at all.
+inline void save_cached_ip_(uint32_t ip) {
   nvs_handle_t nvs;
   if (nvs_open(kNvsNamespace, NVS_READWRITE, &nvs) != ESP_OK)
     return;
-  nvs_set_blob(nvs, "bssid", h.bssid, sizeof(h.bssid));
-  nvs_set_u8(nvs, "chan", h.channel);
-  nvs_set_u32(nvs, "ip", h.ip);
+  if (ip) {
+    nvs_set_u32(nvs, "ip", ip);
+    nvs_set_str(nvs, "host", wintergreen::config::syncServer);
+  } else {
+    nvs_erase_key(nvs, "ip");
+  }
   nvs_commit(nvs);
   nvs_close(nvs);
 }
@@ -149,10 +144,8 @@ inline void wifi_event_(void*, esp_event_base_t base, int32_t id, void* data) {
     // attempts. A rejected association returns in milliseconds, so a small
     // attempt budget is exhausted long before the radio has really tried; the
     // wall-clock timeout is the honest bound and it is the one the user feels.
-    ++g_retries;
     esp_wifi_connect();
   } else if (base == IP_EVENT && id == IP_EVENT_STA_GOT_IP) {
-    g_retries = 0;
     xEventGroupSetBits(g_wifi_events, kConnectedBit);
   }
 }
@@ -301,7 +294,7 @@ inline bool http_get_file_(const std::string& url_path, const std::string& dest)
   // arrives as 200 + Content-Length + a body — and the first version wrote that
   // dashboard HTML to the card as book.wgb, four times, identically sized.
   // Insisting the body match the declared length catches a truncated transfer;
-  // the reader's WGB2 magic check catches the rest.
+  // the reader's header offset check catches the rest.
   if (ok && declared > 0 && written != declared)
     ok = false;
   if (ok && written == 0)
@@ -352,20 +345,6 @@ inline void append_escaped_(std::string& out, const std::string& s) {
   out.push_back('"');
 }
 
-// The last path segment: BookIndex stores full paths, the protocol keys on the
-// book's directory name.
-inline std::string dir_of_(const std::string& book_path) {
-  const size_t last = book_path.find_last_of('/');
-  // No directory component ("book.wgb"), or the file sits at the root
-  // ("/book.wgb") so there is no book folder to name. Callers skip an empty
-  // result; relying on `last - 1` wrapping to npos here would work by accident.
-  if (last == std::string::npos || last == 0)
-    return {};
-  const size_t prev = book_path.find_last_of('/', last - 1);
-  const size_t start = (prev == std::string::npos) ? 0 : prev + 1;
-  return book_path.substr(start, last - start);
-}
-
 // ── The sync itself ────────────────────────────────────────────────────────
 
 inline bool run_sync_() {
@@ -388,7 +367,8 @@ inline bool run_sync_() {
 
   for (const auto& e : index.entries()) {
     const std::string path(e.path.view(index.pool()));
-    const std::string dir = dir_of_(path);
+    // The protocol keys on the book's folder name; a book with none is skipped.
+    const std::string dir = wintergreen::book_folder_name(path);
     if (dir.empty())
       continue;
 
@@ -446,32 +426,20 @@ inline bool run_sync_() {
     // per book; one save at the end covers every mutation.
     //
     // **A book that does not open is never indexed.** WgbReader::open checks the
-    // WGB2 magic, so this is the backstop that catches anything the transfer
+    // header offsets, so this is the backstop that catches anything the transfer
     // checks missed. The first version ignored the result and indexed the book
     // anyway with the folder name as its title — so a bad download appeared in
     // the library looking perfectly normal and simply failed to open. Deleting
     // it here means the next sync re-offers it, since the device stops claiming
     // to have it.
     std::string title, author;
-    bool readable = false;
-    {
-      wintergreen::WgbReader r;
-      if (r.open(wgb.c_str())) {
-        readable = true;
-        title = r.metadata().title;
-        author = r.metadata().author.value_or("");
-        r.close();
-      }
-    }
-    if (!readable) {
+    if (!wintergreen::read_book_meta(wgb, title, author)) {
       std::remove(wgb.c_str());
       for (const char* cover : {"cover.bin", "cover_list.bin", "cover_home.bin", "cover_sleep.bin"})
         std::remove((book_dir + "/" + cover).c_str());
       ::rmdir(book_dir.c_str());
       continue;
     }
-    if (title.empty() || title == "none")
-      title = dir;
     index.remove_entry(wgb);
     index.add_entry(wgb, title, author);
     index_changed = true;
@@ -543,19 +511,14 @@ inline bool bring_up_wifi_(WifiGuard& guard) {
   std::snprintf(reinterpret_cast<char*>(wc.sta.password), sizeof(wc.sta.password), "%s",
                 wintergreen::config::kWifiPassword);
 
-  // **The BSSID/channel pin is not applied on the first attempt.**
-  //
-  // It was, and it is a trap: a pinned BSSID that has gone stale (the AP moved
-  // channel, or you are near a different one in a mesh) fails to associate, and
-  // the retry in wifi_event_ just calls esp_wifi_connect() again against the
-  // *same* pinned config — so every retry fails identically and the sync dies
-  // without ever trying a normal scan. Saving 1-2 s of scan is not worth a
-  // failure mode that looks exactly like a wrong password.
-  //
-  // The hint is still cached and still used, but only as a *fallback* ordering
-  // hint by esp_wifi's own scan, which is where it belongs.
+  // **No BSSID/channel pin.** It shipped once, and it is a trap: a pinned BSSID
+  // that has gone stale (the AP moved channel, or you are near a different one
+  // in a mesh) fails to associate, and the retry in wifi_event_ just calls
+  // esp_wifi_connect() again against the *same* pinned config — so every retry
+  // fails identically and the sync dies without ever trying a normal scan.
+  // Saving 1-2 s of scan is not worth a failure mode that looks exactly like a
+  // wrong password.
 
-  g_retries = 0;
   if (esp_wifi_set_mode(WIFI_MODE_STA) != ESP_OK)
     return false;
   // Credentials live in the firmware, so there is nothing to persist — and this
@@ -576,94 +539,91 @@ inline bool bring_up_wifi_(WifiGuard& guard) {
   // can come back in milliseconds (bad password, AP busy), so a small retry
   // budget is spent almost instantly and the sync gives up while the radio has
   // barely tried — user-visible as "Syncing..." flicking straight back to
-  // "Sync". kFailedBit is therefore not waited on here: wifi_event_ keeps
-  // reconnecting for as long as this timeout allows.
+  // "Sync". wifi_event_ keeps reconnecting for as long as this timeout allows.
   const EventBits_t bits = xEventGroupWaitBits(g_wifi_events, kConnectedBit, pdFALSE, pdFALSE,
                                                pdMS_TO_TICKS(kConnectTimeoutMs));
-  if (!(bits & kConnectedBit))
-    return false;
-
-  // Cache what actually worked, for resolve_server_ and as a scan hint.
-  wifi_ap_record_t ap;
-  if (esp_wifi_sta_get_ap_info(&ap) == ESP_OK) {
-    NetHint h = load_hint_();
-    std::memcpy(h.bssid, ap.bssid, 6);
-    h.channel = ap.primary;
-    h.valid = true;
-    save_hint_(h);
-  }
-  return true;
+  return (bits & kConnectedBit) != 0;
 }
 
-// Resolve the server, preferring the cached address.
+// Resolve the server to "http://<ipv4>".
 //
-// **No mDNS.** `esp_mdns` is a managed component, not part of IDF, so using it
-// would mean a component-manager fetch at build time — a real dependency for
-// something the cache covers in the steady state. Instead: cached IP first,
-// then lwIP's own resolver (which works whenever the router serves DNS for its
-// DHCP leases, as most do), and `syncServer` may simply be written as a literal
-// IP to skip the question entirely.
-inline bool resolve_server_(std::string& url_out) {
-  const NetHint hint = load_hint_();
-  if (hint.ip) {
-    esp_ip4_addr_t a;
-    a.addr = hint.ip;
-    char ip[16];
-    esp_ip4addr_ntoa(&a, ip, sizeof(ip));
-    url_out = std::string("http://") + ip;
-    return true;
-  }
+// **`.local` works, through lwIP rather than `esp_mdns`.** IDF builds lwIP with
+// LWIP_DNS_SUPPORT_MDNS_QUERIES (pinned in sdkconfig.defaults), so getaddrinfo
+// on a name ending in `.local` sends a one-shot multicast query to
+// 224.0.0.251:5353 and takes the responder's unicast answer — Avahi on the Pi
+// answers those. `esp_mdns` would be a managed component, a build-time fetch, for
+// a responder this device does not need to be. Any other name goes to the DHCP
+// DNS server, and a literal IP skips the question entirely.
+//
+// `use_cache` false forces a fresh lookup; the result is cached either way.
+inline bool resolve_server_(std::string& url_out, bool use_cache, bool* from_cache) {
+  *from_cache = false;
+  uint32_t addr = 0;
 
-  // A literal IP in the config needs no lookup at all.
+  // A literal IP in the config needs no lookup and no cache.
   ip_addr_t parsed;
   if (ipaddr_aton(wintergreen::config::syncServer, &parsed) && IP_IS_V4(&parsed)) {
-    url_out = std::string("http://") + wintergreen::config::syncServer;
-    NetHint h = hint;
-    h.ip = ip_2_ip4(&parsed)->addr;
-    save_hint_(h);
-    return true;
+    addr = ip_2_ip4(&parsed)->addr;
+  } else {
+    const uint32_t cached = use_cache ? load_cached_ip_() : 0;
+    if (cached) {
+      addr = cached;
+      *from_cache = true;
+    } else {
+      // IPv4 only: lwIP is built without IPv6 here.
+      struct addrinfo hints = {};
+      hints.ai_family = AF_INET;
+      hints.ai_socktype = SOCK_STREAM;
+      struct addrinfo* res = nullptr;
+      if (getaddrinfo(wintergreen::config::syncServer, "80", &hints, &res) != 0 || !res)
+        return false;
+      addr = reinterpret_cast<struct sockaddr_in*>(res->ai_addr)->sin_addr.s_addr;
+      freeaddrinfo(res);
+      if (addr != load_cached_ip_())
+        save_cached_ip_(addr);
+    }
   }
-
-  // IPv4 only: lwIP is built without IPv6 here, and the panel has no use for a
-  // AAAA record anyway.
-  struct addrinfo hints = {};
-  hints.ai_family = AF_INET;
-  hints.ai_socktype = SOCK_STREAM;
-  struct addrinfo* res = nullptr;
-  if (getaddrinfo(wintergreen::config::syncServer, "80", &hints, &res) != 0 || !res)
-    return false;
-
-  const uint32_t addr = reinterpret_cast<struct sockaddr_in*>(res->ai_addr)->sin_addr.s_addr;
-  freeaddrinfo(res);
 
   esp_ip4_addr_t a;
   a.addr = addr;
   char ip[16];
   esp_ip4addr_ntoa(&a, ip, sizeof(ip));
   url_out = std::string("http://") + ip;
-
-  NetHint h = hint;
-  h.ip = addr;
-  save_hint_(h);
   return true;
+}
+
+// One sync against g_base_url, on its own HTTP handle.
+inline bool sync_once_() {
+  esp_http_client_config_t hc = {};
+  hc.url = g_base_url.c_str();
+  hc.timeout_ms = kHttpTimeoutMs;
+  // One handle, kept alive across the POST and every GET: four files per
+  // book then cost one TCP handshake rather than four.
+  hc.keep_alive_enable = true;
+  g_http = esp_http_client_init(&hc);
+  if (!g_http)
+    return false;
+  const bool ok = run_sync_();
+  esp_http_client_cleanup(g_http);
+  g_http = nullptr;
+  return ok;
 }
 
 inline void sync_task(void*) {
   bool ok = false;
   {
     WifiGuard guard;  // radio down on every path out of this scope
-    if (bring_up_wifi_(guard) && resolve_server_(g_base_url)) {
-      esp_http_client_config_t hc = {};
-      hc.url = g_base_url.c_str();
-      hc.timeout_ms = kHttpTimeoutMs;
-      // One handle, kept alive across the POST and every GET: four files per
-      // book then cost one TCP handshake rather than four.
-      hc.keep_alive_enable = true;
-      g_http = esp_http_client_init(&hc);
-      if (g_http) {
-        ok = run_sync_();
-        esp_http_client_cleanup(g_http);
-        g_http = nullptr;
+    bool from_cache = false;
+    if (bring_up_wifi_(guard) && resolve_server_(g_base_url, true, &from_cache)) {
+      ok = sync_once_();
+      // **A cached address is a hint, not the answer.** It used to be trusted
+      // forever, so once the server's DHCP lease moved every sync failed and
+      // nothing ever looked the name up again. run_sync_ fails only when the
+      // POST does — download errors are skipped — so retrying is safe.
+      if (!ok && from_cache) {
+        save_cached_ip_(0);
+        if (resolve_server_(g_base_url, false, &from_cache))
+          ok = sync_once_();
       }
     }
   }
@@ -741,9 +701,9 @@ inline void start() {
   g_buf->release_spare();
 
   // Same for main.cpp's OOM reserve: esp_wifi_init() wants ~50 KB of internal
-  // RAM out of the same pool, so 28 KB held back for a rescue is the difference
-  // between a sync that runs and one that bails with nothing said. The frame
-  // loop takes it back when the radio is down.
+  // RAM out of the same pool, so a block held back for a rescue is the
+  // difference between a sync that runs and one that bails with nothing said.
+  // The frame loop takes it back when the radio is down.
   wg_release_oom_reserve();
 
   // **And the reader's caches, which the spare alone does not cover when a
@@ -758,10 +718,8 @@ inline void start() {
   // already spent everything. The reader's page and paragraph caches are the
   // largest thing still reclaimable, and being without them costs a re-layout
   // the sync screen never performs anyway.
-  // false: this runs from the book list, whose rows hold StringRefs into the
-  // index's StringPool. Dropping it blanks every title and author on a screen
-  // that stays on display for the whole sync.
-  // **The book index stays.** Releasing it here was tried twice and is wrong
+  //
+  // **The book index stays** (drop_book_index = false). Releasing it here was tried twice and is wrong
   // both ways round. Dropping the pool alone blanks every title and author,
   // because MainMenu::entries_ holds StringRefs into it and this screen is on
   // display for the whole sync. Clearing entries_ first and bumping the

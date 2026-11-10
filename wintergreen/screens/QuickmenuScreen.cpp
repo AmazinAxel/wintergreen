@@ -8,46 +8,9 @@
 #include "../content/BookIndex.h"
 
 namespace wintergreen {
-constexpr uint8_t ReaderSettings::kNumFontSizePresets;
-constexpr const char* ReaderSettings::kFontSizeNames[];
 
-static std::string_view strip_chapter_prefix(std::string_view label);
-
-// ---------------------------------------------------------------------------
-
-// Drop a leading "CHAPTER " from a TOC label, keeping the numeral: "CHAPTER I.
-// Down the Rabbit-Hole" reads "I. Down the Rabbit-Hole". The word is pure
-// redundancy in a list that is entirely chapters, and it costs the width that
-// the actual title needs — every row in a book like The Hobbit started with the
-// same eight characters.
-//
-// Only stripped when something recognisable follows, so a bare "CHAPTER" (a
-// part divider in some books) is left alone rather than blanked. The numeral
-// itself stays: it is the chapter's identity, and its punctuation varies by
-// publisher ("I." vs "I:"), so it is kept verbatim rather than reformatted.
-static std::string_view strip_chapter_prefix(std::string_view label) {
-  static constexpr std::string_view kWord = "CHAPTER";
-  if (label.size() <= kWord.size())
-    return label;
-
-  // Case-insensitive: books use "CHAPTER", "Chapter" and "chapter".
-  for (size_t i = 0; i < kWord.size(); ++i) {
-    const char c = label[i];
-    const char u = (c >= 'a' && c <= 'z') ? static_cast<char>(c - 32) : c;
-    if (u != kWord[i])
-      return label;
-  }
-  if (label[kWord.size()] != ' ')
-    return label;  // "CHAPTERHOUSE", not a prefix
-
-  std::string_view rest = label.substr(kWord.size() + 1);
-  while (!rest.empty() && rest.front() == ' ')
-    rest.remove_prefix(1);
-  if (rest.empty())
-    return label;  // nothing left to show; keep the original
-
-  return rest;
-}
+// TOC labels are shown verbatim: preprocess.fish writes every book's NCX with
+// final "N: Name" labels, so there is nothing left to rewrite here.
 
 // Left-aligned text, ellipsised when it does not fit in max_w. Chapter titles
 // come from the book and are arbitrarily long ("Chapter 1: In Which Pooh Goes
@@ -59,22 +22,9 @@ static std::string_view strip_chapter_prefix(std::string_view label) {
 static void draw_text_ellipsised(DrawBuffer& buf, int x, int baseline, const char* text, size_t len,
                                  const BitmapFont& f, int max_w, bool invert) {
   if (len == 0 || max_w <= 0) return;
-  if (f.word_width(text, len, FontStyle::Regular) <= max_w) {
-    buf.draw_text_proportional(x, baseline, text, len, f, invert);
-    return;
-  }
-
-  static const char kEll[] = "...";
-  const int budget = max_w - f.word_width(kEll, 3, FontStyle::Regular);
-  const size_t fit = fit_prefix(f, text, len, budget);
-
-  // Not even one character fits beside the ellipsis: draw the ellipsis alone
-  // rather than nothing, so the row still reads as "there is text here".
   char trunc[260];
-  const size_t cp = std::min<size_t>(fit, sizeof(trunc) - 4);
-  std::memcpy(trunc, text, cp);
-  std::memcpy(trunc + cp, kEll, 3);
-  buf.draw_text_proportional(x, baseline, trunc, cp + 3, f, invert);
+  const std::string_view t = ellipsize(f, text, len, max_w, trunc);
+  buf.draw_text_proportional(x, baseline, t.data(), t.size(), f, invert);
 }
 
 // ---------------------------------------------------------------------------
@@ -93,12 +43,8 @@ void QuickmenuScreen::populate(const TableOfContents& toc, uint16_t current_chap
       best_match = static_cast<int>(i);
     }
   }
-  if (best_match >= 0) {
-    // Same treatment as the TOC rows below: the header names the chapter you are
-    // in, so it would otherwise read "CHAPTER I. ..." while the list reads "I. ...".
-    const std::string full = toc_->entries[best_match].label.to_string(toc_->pool);
-    chapter_title_ = std::string(strip_chapter_prefix(full));
-  }
+  if (best_match >= 0)
+    chapter_title_ = toc_->entries[best_match].label.to_string(toc_->pool);
   // Before the first TOC entry (front matter) the nearest chapter is the first.
   current_chapter_offset_ = toc_->entries.empty() ? current_chapter : std::max(best_match, 0);
 
@@ -157,14 +103,19 @@ std::vector<std::string> QuickmenuScreen::wrap_(const BitmapFont& f, const std::
   return out;
 }
 
-int QuickmenuScreen::header_h_() const {
-  int h = header_top_();
-  h += static_cast<int>(title_lines_.size()) * title_font_().y_advance();
+int QuickmenuScreen::header_content_h_() const {
+  int h = static_cast<int>(title_lines_.size()) * title_font_().y_advance();
   if (!chapter_lines_.empty())
     h += kBlockGap + static_cast<int>(chapter_lines_.size()) * chapter_font_().y_advance();
-  // kHeaderTop again below the last line, so the highlight box has the same
-  // padding at the bottom as at the top; it is inside the box, not around it.
-  h += kHeaderTop;
+  return h;
+}
+
+int QuickmenuScreen::header_h_() const {
+  // Fixed height: one full-size title line plus one chapter line, kHeaderTop
+  // above and below (padding inside the highlight box, not around it). A title
+  // needing two lines drops to the chapter face instead of growing the block;
+  // draw_all_ centres the content, eating into that padding.
+  const int h = 2 * kHeaderTop + ui_font_.y_advance() + kBlockGap + section_font_.y_advance();
   // The rule under the header is drawn with the shared draw_separator_(), so it
   // occupies exactly kSeparatorH like every other hairline in the tree — half
   // above the line, half below — and content butts against both ends of that
@@ -177,18 +128,6 @@ int QuickmenuScreen::header_h_() const {
 static const char* fmt_setting(char* buf, size_t bufsz, const char* label, const char* value) {
   snprintf(buf, bufsz, "%s: %s", label, value);
   return buf;
-}
-
-std::string_view QuickmenuScreen::get_item_subtitle(int index) const {
-  std::string_view label = ListMenuScreen::get_item_label(index);
-  const auto pos = label.find(": ");
-  if (pos == std::string_view::npos) return {};
-  subtitle_buf_ = label.substr(pos + 2);
-  return subtitle_buf_;
-}
-
-std::string QuickmenuScreen::wintergreen_header_left() const {
-  return "reading";
 }
 
 void QuickmenuScreen::start(DrawBuffer& buf, IRuntime& runtime) {
@@ -208,13 +147,8 @@ void QuickmenuScreen::on_start() {
   // reader view was using.
   set_buf_rotation_(Rotation::Deg90);
 
-  // The header is drawn entirely by this screen's own draw_all_; the base
-  // class's card header (title_/subtitle_) is not used. The author was dropped —
-  // it is on the home screen and the book list, and says nothing here.
-  title_ = nullptr;
-  title2_ = nullptr;
-  subtitle_.clear();
-  subtitle2_.clear();
+  // The header is drawn entirely by this screen's own draw_all_. The author was
+  // dropped — it is on the home screen and the book list, and says nothing here.
 
   // Percentages sit at the right-hand end of the title and chapter lines rather
   // than on a row of their own.
@@ -233,8 +167,17 @@ void QuickmenuScreen::on_start() {
     const int avail = (buf_ ? buf_->width() : 0) - kLM - kRM;
     const int bp_w = tfont.valid() ? tfont.word_width(book_pct_buf_.c_str(), book_pct_buf_.size(), FontStyle::Regular) : 0;
     const int cp_w = cfont.valid() ? cfont.word_width(chapter_pct_buf_.c_str(), chapter_pct_buf_.size(), FontStyle::Regular) : 0;
+    title_small_ = false;
     title_lines_ = wrap_(tfont, book_title_, avail - bp_w - kPctGap, avail, 2);
-    chapter_lines_ = wrap_(cfont, chapter_title_, avail - cp_w - kPctGap, avail, 3);
+    if (title_lines_.size() > 1) {
+      // Too long for one full-size line: two lines of the smaller face, so the
+      // header keeps its fixed height (see header_h_()).
+      title_small_ = true;
+      const BitmapFont& sfont = title_font_();
+      const int sp_w = sfont.valid() ? sfont.word_width(book_pct_buf_.c_str(), book_pct_buf_.size(), FontStyle::Regular) : 0;
+      title_lines_ = wrap_(sfont, book_title_, avail - sp_w - kPctGap, avail, 2);
+    }
+    chapter_lines_ = wrap_(cfont, chapter_title_, avail - cp_w - kPctGap, avail, 1);
   }
 
   clear_items();
@@ -288,27 +231,14 @@ void QuickmenuScreen::on_start() {
     idx_reader_rotate_display_ = count();
     add_item(fmt_setting(tmp, sizeof(tmp), "Orientation", rotation_label(app_ ? app_->rotate_reader() : 0)));
 
+    // The reader font set is always present here: without it no book opens, and
+    // this menu only exists over an open book.
     idx_font_size_ = count();
-    if (app_ && app_->font_manager() && app_->font_manager()->valid()) {
-      auto* fonts = app_->font_manager()->font_set();
-      int sz = 0;
-      if (fonts && settings_->font_size_idx < fonts->num_fonts()) {
-        auto* f = fonts->get_font(settings_->font_size_idx);
-        if (f) {
-          sz = f->nominal_size();
-          if (sz == 0)
-            sz = f->y_advance();
-        }
-      }
-      char val[16];
-      if (sz > 0)
-        snprintf(val, sizeof(val), "%d", sz);
-      else
-        snprintf(val, sizeof(val), "Unknown");
-      add_item(fmt_setting(tmp, sizeof(tmp), "Font Size", val));
-    } else {
-      add_item(fmt_setting(tmp, sizeof(tmp), "Font Size", ReaderSettings::kFontSizeNames[settings_->font_size_idx]));
-    }
+    const BitmapFont* f = app_ ? app_->reader_font()->get_font(settings_->font_size_idx) : nullptr;
+    char val[16] = "";
+    if (f)
+      snprintf(val, sizeof(val), "%d", f->nominal_size() ? f->nominal_size() : f->y_advance());
+    add_item(fmt_setting(tmp, sizeof(tmp), "Font Size", val));
   }
 
   // Chapters, inline below the settings. Nested TOC entries keep their depth as
@@ -375,12 +305,12 @@ void QuickmenuScreen::draw_all_(DrawBuffer& buf, std::optional<uint8_t> battery_
   const int H = buf.height();
   buf.fill(true);
 
-  if (!ui_font_.valid() || !subtitle_font_.valid()) return;
+  if (!ui_font_.valid()) return;
 
   (void)battery_pct;  // no battery here — see kHeaderTop
   const BitmapFont& tfont = title_font_();
   const BitmapFont& cfont = chapter_font_();
-  int y = header_top_();
+  int y = (header_h_() - kSeparatorH - header_content_h_()) / 2;
 
   // The header block is item kIdxBack. When it is selected the whole block —
   // title, chapter and both percentages — is inverted, exactly as a list row is,
@@ -421,10 +351,8 @@ void QuickmenuScreen::draw_all_(DrawBuffer& buf, std::optional<uint8_t> battery_
     }
   }
 
-  // Bottom padding inside the highlight box, matching header_top_().
-  y += kHeaderTop;
-
   // Same helper, same geometry as every other hairline — see header_h_().
+  y = header_h_() - kSeparatorH;
   draw_separator_(buf, W, y);
   y += kSeparatorH;  // must match header_h_()
 
@@ -452,9 +380,7 @@ void QuickmenuScreen::draw_all_(DrawBuffer& buf, std::optional<uint8_t> battery_
     // ": " ("Chapter 1: The Beginning") and must never be split into columns.
     std::string_view display_label = label;
     std::string_view display_value;
-    if (is_chapter) {
-      display_label = strip_chapter_prefix(label);
-    } else {
+    if (!is_chapter) {
       const auto pos = label.find(": ");
       if (pos != std::string_view::npos) {
         display_label = label.substr(0, pos);
@@ -509,11 +435,9 @@ void QuickmenuScreen::on_select(int index) {
 
   if (index == idx_font_size_) {
     uint8_t max_idx = ReaderSettings::kNumFontSizePresets;
-    if (app_ && app_->font_manager() && app_->font_manager()->valid()) {
-      auto* fonts = app_->font_manager()->font_set();
-      if (fonts && fonts->num_fonts() > 0 && fonts->num_fonts() < max_idx)
-        max_idx = static_cast<uint8_t>(fonts->num_fonts());
-    }
+    const int n = app_ ? app_->reader_font()->num_fonts() : 0;
+    if (n > 0 && n < max_idx)
+      max_idx = static_cast<uint8_t>(n);
     settings_->font_size_idx = static_cast<uint8_t>((settings_->font_size_idx + 1) % max_idx);
     refresh_items_(index);
     return;

@@ -6,12 +6,17 @@
       systems = [ "x86_64-linux" "aarch64-linux" ];
       forAll = f: nixpkgs.lib.genAttrs systems (s: f nixpkgs.legacyPackages.${s});
     in {
-      # The host-side EPUB → WGB converter. The firmware itself is built with
-      # PlatformIO and is deliberately not packaged here.
-      #
-      # This is what the homelab runs to convert books before the reader pulls
-      # them, so it must cross-compile to aarch64 for the Pi.
+      # The host-side EPUB → WGB converter and the `books` front end that drives
+      # it (preprocess.fish). The firmware itself is built with PlatformIO and
+      # is deliberately not packaged here.
       packages = forAll (pkgs: rec {
+        books = pkgs.runCommand "books" { nativeBuildInputs = [ pkgs.makeWrapper ]; } ''
+          install -Dm755 ${./preprocess.fish} $out/bin/books
+          wrapProgram $out/bin/books --prefix PATH : ${pkgs.lib.makeBinPath (with pkgs; [
+            fish epub2wgb unzip zip xmlstarlet chafa openssh gnutar coreutils
+          ])}
+        '';
+
         epub2wgb = pkgs.stdenv.mkDerivation {
           pname = "epub2wgb";
           version = "0.1.0";

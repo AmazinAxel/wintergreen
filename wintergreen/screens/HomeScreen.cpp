@@ -1,22 +1,21 @@
 #include "HomeScreen.h"
 
 #include <algorithm>
-#include <cmath>
 #include <cstdio>
+#include <cstdlib>
 #include <cstring>
 
 #include "../Application.h"
 #include "../content/CoverPaths.h"
 #include "../content/BookIndex.h"
-#include "../display/ui_font_large.h"
 
 namespace wintergreen {
 
-// Largest bitmap load_cover_ can produce: it never scales beyond the layout
-// box, so this bounds every cover. cover_data_ is reserved to it once and then
-// never reallocates — see load_cover_ for why that matters.
+// Largest bitmap load_cover_ accepts: it never scales beyond the layout box, so
+// this bounds every cover, and it has to fit the spare it is read into.
 static constexpr size_t kCoverBytesMax =
     static_cast<size_t>((kHomeCoverW + 7) / 8) * kHomeCoverH;
+static_assert(kCoverBytesMax <= DrawBuffer::kBufSize, "home cover must fit the spare framebuffer");
 
 // Filled diamond (a square on its corner), one fill_rect per row. Hard edges —
 // the panel is 1-bit, so anything rounded only reads as a ragged circle.
@@ -60,20 +59,10 @@ static size_t fit_line(const BitmapFont& f, const char* text, size_t len, int ma
 static void draw_centred(DrawBuffer& buf, int cx, int baseline, const char* text, size_t len,
                          const BitmapFont& f, int max_w) {
   if (len == 0) return;
-  static const char kEll[] = "...";
-  const int w = f.word_width(text, len, FontStyle::Regular);
-  if (w <= max_w) {
-    buf.draw_text_proportional(cx - w / 2, baseline, text, len, f, false);
-    return;
-  }
-  const int budget = max_w - f.word_width(kEll, 3, FontStyle::Regular);
-  const size_t fit = fit_prefix(f, text, len, budget);
   char trunc[260];
-  const size_t cp = std::min<size_t>(fit, 256);
-  std::memcpy(trunc, text, cp);
-  std::memcpy(trunc + cp, kEll, 3);
-  const int tw = f.word_width(trunc, cp + 3, FontStyle::Regular);
-  buf.draw_text_proportional(cx - tw / 2, baseline, trunc, cp + 3, f, false);
+  const std::string_view t = ellipsize(f, text, len, max_w, trunc);
+  const int tw = f.word_width(t.data(), t.size(), FontStyle::Regular);
+  buf.draw_text_proportional(cx - tw / 2, baseline, t.data(), t.size(), f, false);
 }
 
 // Border outline around a rectangle, `t` pixels thick, growing inwards.
@@ -86,52 +75,36 @@ static void draw_outline(DrawBuffer& buf, int x, int y, int w, int h, int t = 1)
   buf.fill_rect(x + w - t, y,         t, h, false);
 }
 
-void HomeScreen::load_cover_(int i, int box_w, int box_h) const {
+void HomeScreen::load_cover_(DrawBuffer& buf, int i, int box_w, int box_h) const {
   cover_slot_ = i;
   cover_w_ = cover_h_ = 0;
-  cover_data_.clear();
+  cover_bits_ = nullptr;
   if (i < 0 || i >= num_books_ || slots_[i].home_path.empty())
     return;
   FILE* f = std::fopen(slots_[i].home_path.c_str(), "rb");
   if (!f)
     return;
   uint16_t hdr[2] = {};
-  if (std::fread(hdr, 2, 2, f) != 2 || hdr[0] == 0 || hdr[1] == 0 || hdr[0] > box_w || hdr[1] > box_h) {
-    std::fclose(f);
-    return;
-  }
-  const size_t need = static_cast<size_t>((hdr[0] + 7) / 8) * hdr[1];
-  // **Reserve to the largest cover once; never reallocate.** A vector whose size
-  // changes reallocates, holding the old and new blocks at once — ~25 KB each
-  // here, and with the clicker's BLE resident that spike was a bad_alloc, i.e. an
-  // abort() and a reboot mid-session. With the capacity fixed for the life of
-  // the screen, every later cover is a fill into memory already held.
-  if (cover_data_.capacity() < kCoverBytesMax)
-    cover_data_.reserve(kCoverBytesMax);
-  if (need > cover_data_.capacity()) {
-    std::fclose(f);
-    return;
-  }
-  cover_data_.resize(need);
+  bool ok = std::fread(hdr, 2, 2, f) == 2 && hdr[0] > 0 && hdr[1] > 0 && hdr[0] <= box_w && hdr[1] <= box_h;
+  const size_t need = ok ? static_cast<size_t>((hdr[0] + 7) / 8) * hdr[1] : 0;
+  ok = ok && need <= kCoverBytesMax;
+  // Claimed after the last allocation (newlib takes the FILE buffer on the
+  // first fread), so the OOM handler cannot release it between here and use.
+  uint8_t* dst = ok ? buf.claim_spare_cache(this) : nullptr;
   // Exactly the declared size: anything else is not a cover (a truncated
   // download, or an HTML error page saved under the name).
-  const bool ok = std::fread(cover_data_.data(), 1, need, f) == need && std::fgetc(f) == EOF;
+  ok = dst && std::fread(dst, 1, need, f) == need && std::fgetc(f) == EOF;
   std::fclose(f);
-  if (!ok) {
-    cover_data_.clear();
+  if (!ok)
     return;
-  }
+  cover_bits_ = dst;
+  cover_gen_ = buf.spare_cache_gen();
   cover_w_ = hdr[0];
   cover_h_ = hdr[1];
 }
 
 void HomeScreen::on_start() {
-  const Rotation rot = current_rotation_();
-  if (rot == Rotation::Deg0 || rot == Rotation::Deg180)
-    set_buf_rotation_(Rotation::Deg90);
-
-  if (!author_font_.valid())
-    author_font_.init(kFontData_ui_large_wgf, kFontData_ui_large_wgf_size);
+  set_buf_rotation_(Rotation::Deg90);
 
   // Same rule as MainMenu::on_start(): the resident index is authoritative, so
   // only parse book_index.dat when nothing is loaded (a cold boot). Backing out
@@ -153,7 +126,7 @@ void HomeScreen::on_start() {
   // is meaningless even where the number is unchanged — a sync or a serial
   // upload reorders the recents under us.
   cover_slot_ = -1;
-  cover_data_.clear();
+  cover_bits_ = nullptr;
   cover_w_ = cover_h_ = 0;
 
   // Pick the kMaxBooks most recently opened, by selection rather than by
@@ -352,7 +325,7 @@ void HomeScreen::draw_all_(DrawBuffer& buf, std::optional<uint8_t> battery_pct) 
   static constexpr int kFrameW     = 2;  // frame thickness
 
   const BitmapFont& tf = ui_font_;                                         // title
-  const BitmapFont& af = author_font_.valid() ? author_font_ : ui_font_;   // author
+  const BitmapFont& af = section_font_;                                    // author
 
   // Header battery — drawn by the base class so its position is identical on
   // every screen. Its height is the base's too, not kHeaderY.
@@ -369,17 +342,10 @@ void HomeScreen::draw_all_(DrawBuffer& buf, std::optional<uint8_t> battery_pct) 
   const int box_w     = W - 2 * kPad;
   const int box_h     = std::max(0, H - box_y - below_h);
 
-  if (num_books_ == 0) {
-    draw_outline(buf, kPad, box_y, box_w, box_h);
-    const int mid = box_y + box_h / 2;
-    // Only reachable if the card is genuinely empty, and Application::start
-    // normally routes that case to the book list instead — kept as a safety net.
-    static const char kEmpty[] = "No books on the card";
-    static const char kHint[]  = "Press Back for all books";
-    draw_centred(buf, W / 2, mid, kEmpty, std::strlen(kEmpty), tf, box_w);
-    draw_centred(buf, W / 2, mid + af.y_advance() + 8, kHint, std::strlen(kHint), af, box_w);
+  // Only reachable if the card is genuinely empty, and Application::start
+  // normally routes that case to the book list instead. Nothing is drawn.
+  if (num_books_ == 0)
     return;
-  }
 
   const int sel = std::min(std::max(selected(), 0), num_books_ - 1);
   // The frame sits outside the cover, so the cover itself gets the box less the
@@ -387,18 +353,19 @@ void HomeScreen::draw_all_(DrawBuffer& buf, std::optional<uint8_t> battery_pct) 
   const int inset      = kFrameGap + kFrameW;
   const int cover_boxw = std::max(0, box_w - 2 * inset);
   const int cover_boxh = std::max(0, box_h - 2 * inset);
-  if (cover_slot_ != sel) {
+  // Reload on a new selection, or when the cover was loaded but something has
+  // since taken the spare. A book with no cover, or no spare at all, is not
+  // retried on every draw.
+  if (cover_slot_ != sel || (cover_bits_ && !have_cover_(buf))) {
     // The card shares SPI2 with the panel; never overlap the read with a refresh.
     buf.wait_panel_idle();
-    load_cover_(sel, cover_boxw, cover_boxh);
+    load_cover_(buf, sel, cover_boxw, cover_boxh);
   }
 
-  if (cover_w_ > 0 && cover_h_ > 0) {
+  if (have_cover_(buf)) {
     const int cx = kPad + (box_w - cover_w_) / 2;
     const int cy = box_y + (box_h - cover_h_) / 2;
-    const int stride = (cover_w_ + 7) / 8;
-    for (int row = 0; row < cover_h_; ++row)
-      buf.blit_1bit_row(cx, cy + row, cover_data_.data() + static_cast<size_t>(row) * stride, cover_w_);
+    buf.blit_1bit(cx, cy, cover_bits_, cover_w_, cover_h_, (cover_w_ + 7) / 8);
     draw_outline(buf, cx - inset, cy - inset, cover_w_ + 2 * inset, cover_h_ + 2 * inset, kFrameW);
   } else {
     // No cover on the card — a placeholder box keeps the layout intact.

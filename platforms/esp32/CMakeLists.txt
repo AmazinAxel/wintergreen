@@ -6,6 +6,7 @@ set(LIB ${CMAKE_CURRENT_LIST_DIR}/../../wintergreen)
 
 set(lib_sources
     ${LIB}/Application.cpp
+    ${LIB}/display/DrawBuffer.cpp
     ${LIB}/screens/ListMenuScreen.cpp
     ${LIB}/screens/MainMenu.cpp
     ${LIB}/screens/ReaderScreen.cpp

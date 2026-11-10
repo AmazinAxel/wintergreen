@@ -69,7 +69,7 @@ class Esp32InputSource final : public wintergreen::IInputSource {
   }
 
   // Returns accumulated button press history since last poll (in arrival order),
-  // then clears the queue. pressed_latch is also derived for backward compat.
+  // then clears the queue. pressed_latch is the same presses as a mask.
   wintergreen::ButtonState poll_buttons() override {
     wintergreen::ButtonState result;
     portENTER_CRITICAL(&lock_);
@@ -107,7 +107,6 @@ class Esp32InputSource final : public wintergreen::IInputSource {
     const uint8_t btn_idx = static_cast<uint8_t>(button);
     portENTER_CRITICAL(&lock_);
     // Compact the ring buffer, dropping entries for this button.
-    uint8_t new_head = pq_head_;
     uint8_t new_tail = pq_head_;
     uint8_t r = pq_head_;
     while (r != pq_tail_) {
@@ -117,12 +116,10 @@ class Esp32InputSource final : public wintergreen::IInputSource {
       }
       r = static_cast<uint8_t>((r + 1) % kQueueSize);
     }
-    pq_head_ = new_head;
     pq_tail_ = new_tail;
     portEXIT_CRITICAL(&lock_);
   }
 
- public:
   adc_oneshot_unit_handle_t get_adc_handle() const {
     return adc_handle_;
   }
@@ -147,8 +144,6 @@ class Esp32InputSource final : public wintergreen::IInputSource {
   uint8_t prev_debounced_ = 0;
   bool last_raw_[kNumButtons] = {};
   uint32_t debounce_time_[kNumButtons] = {};
-
-  // (auto-repeat removed — screens handle hold-down acceleration themselves)
 
   // Ordered press queue — shared between timer callback (write) and poll_buttons (read+clear).
   // Ring buffer; entries are button indices (0–6). Full entries are silently dropped.

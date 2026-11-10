@@ -20,9 +20,6 @@ class FontManager {
     return font_set_.valid() ? &font_set_ : nullptr;
   }
 
-  bool valid() const {
-    return font_set_.valid();
-  }
  protected:
   BitmapFont prop_fonts_[kMaxFontSizes];
   BitmapFontSet font_set_;

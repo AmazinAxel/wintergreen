@@ -6,20 +6,6 @@
 namespace wintergreen {
 
 // ---------------------------------------------------------------------------
-// MemoryXmlInput
-// ---------------------------------------------------------------------------
-
-size_t MemoryXmlInput::read(void* buf, size_t max_size) {
-  size_t n = std::min(max_size, remaining_);
-  if (n > 0) {
-    std::memcpy(buf, data_, n);
-    data_ += n;
-    remaining_ -= n;
-  }
-  return n;
-}
-
-// ---------------------------------------------------------------------------
 // XmlAttributeReader
 // ---------------------------------------------------------------------------
 
@@ -195,18 +181,6 @@ size_t XmlReader::find_byte(char c) const {
   if (!p)
     return SIZE_MAX;
   return static_cast<size_t>(static_cast<const char*>(p) - view());
-}
-
-size_t XmlReader::find_str(const char* needle, size_t needle_len) const {
-  if (needle_len > view_len())
-    return SIZE_MAX;
-  size_t search_len = view_len() - needle_len + 1;
-  for (size_t i = 0; i < search_len; ++i) {
-    if (std::memcmp(view() + i, needle, needle_len) == 0) {
-      return i;
-    }
-  }
-  return SIZE_MAX;
 }
 
 // ---------------------------------------------------------------------------

@@ -1,23 +1,15 @@
 #include "MainMenu.h"
 
+#include <dirent.h>
+
 #include <algorithm>
-#include <cctype>
 #include <cstdio>
-#include <cstdlib>
 #include <cstring>
 #include <queue>
 
 #include "../Application.h"
 #include "../content/BookIndex.h"
 #include "../content/CoverPaths.h"
-#include "../content/wgb/WgbReader.h"
-
-#ifdef ESP_PLATFORM
-#include <dirent.h>
-#else
-#include <filesystem>
-namespace fs = std::filesystem;
-#endif
 
 namespace wintergreen {
 
@@ -75,8 +67,6 @@ static std::vector<uint16_t> iota_indices_(size_t n) {
 
 
 void MainMenu::on_start() {
-  title_ = "wintergreen";
-
   if (!app_->data_dir_)
     return;
 
@@ -118,7 +108,7 @@ void MainMenu::update(const ButtonState& buttons, DrawBuffer& buf, IRuntime& run
   // books arriving, but a sync that finds nothing new never bumps it — without
   // this the row would sit on "Syncing..." forever.
   const SyncState sync_now = runtime.sync_state();
-  if (sync_now != sync_shown_) {
+  if (has_sync_ && sync_now != sync_shown_) {
     sync_shown_ = sync_now;
     draw_all_(buf, runtime.battery_percentage());
     buf.refresh();
@@ -145,7 +135,7 @@ void MainMenu::run_sync_() {
 }
 
 void MainMenu::select_first_book_() {
-  if (entries_.empty() || selected() != kSyncRow)
+  if (entries_.empty() || !is_action_row_(selected()))
     return;
   set_selected(visual_for_entries(0));
 }
@@ -159,12 +149,13 @@ void MainMenu::on_select(int index) {
   const int real = entries_index_for(index);
   if (real < 0 || real >= static_cast<int>(entries_.size())) return;
   const BookEntry& e = entries_[real];
+  const std::string path(path_of_(e));
   // A hidden book is never recorded: mark_opened() would do nothing (it is not
   // indexed) and the index save would be pointless, but more to the point a
   // hidden book must not surface in the recents carousel.
   if (!e.hidden)
-    app_->record_book_opened(e.path);
-  app_->reader()->set_path(e.path.c_str());
+    app_->record_book_opened(path);
+  app_->reader()->set_path(path);
   // Normally replace, so backing out of a book lands on the home carousel rather
   // than back in this list — the carousel is sorted most-recently-opened first
   // and record_book_opened() has just put this book at its head. It also frees
@@ -180,9 +171,9 @@ void MainMenu::on_select(int index) {
 }
 
 void MainMenu::stop() {
-  const std::string& cur = current_book_path();
+  std::string cur = current_book_path();
   if (!cur.empty())
-    initial_selection_ = cur;
+    initial_selection_ = std::move(cur);
 
   // Revealing hidden books lasts only as long as the screen does — leaving and
   // coming back means performing the gesture again.
@@ -216,17 +207,6 @@ void MainMenu::scan_directory_() {
 
 }
 
-// Name of the directory containing `path` — the title fallback for a book whose
-// WGB metadata is empty, matching what BookIndex does for visible books.
-static std::string folder_name_of(const std::string& path) {
-  const size_t last = path.find_last_of('/');
-  if (last == std::string::npos || last == 0)
-    return path;
-  const size_t prev = path.find_last_of('/', last - 1);
-  const size_t start = prev == std::string::npos ? 0 : prev + 1;
-  return path.substr(start, last - start);
-}
-
 void MainMenu::scan_hidden_() {
   hidden_.clear();
   if (!books_dir_)
@@ -238,7 +218,6 @@ void MainMenu::scan_hidden_() {
   while (!q.empty()) {
     const std::string dir = std::move(q.front());
     q.pop();
-#ifdef ESP_PLATFORM
     DIR* d = opendir(dir.c_str());
     if (!d) continue;
     struct dirent* ent;
@@ -251,32 +230,13 @@ void MainMenu::scan_hidden_() {
         paths.push_back(full);
     }
     closedir(d);
-#else
-    try {
-      for (const auto& e : fs::directory_iterator(dir, fs::directory_options::skip_permission_denied)) {
-        std::string full = e.path().string();
-        for (char& c : full) if (c == '\\') c = '/';
-        if (e.path().filename().string()[0] == '.') continue;
-        if (e.is_directory())
-          q.push(full);
-        else if (BookIndex::is_wgb_path(full.c_str()))
-          paths.push_back(full);
-      }
-    } catch (...) {}
-#endif
   }
 
   for (auto& p : paths) {
     BookEntry e;
-    WgbReader r;
-    if (!r.open(p.c_str()))
+    if (!read_book_meta(p, e.title_own, e.author_own))
       continue;
-    e.title_own = r.metadata().title;
-    e.author_own = r.metadata().author.value_or("");
-    r.close();
-    if (e.title_own.empty() || e.title_own == "none")
-      e.title_own = folder_name_of(p);
-    e.path = std::move(p);
+    e.path_own = std::move(p);
     e.hidden = true;
     hidden_.push_back(std::move(e));
   }
@@ -293,14 +253,18 @@ void MainMenu::scan_hidden_() {
   }
 }
 
+std::string_view MainMenu::path_of_(const BookEntry& e) const {
+  return e.hidden ? std::string_view(e.path_own) : e.path_ref.view(BookIndex::instance().pool());
+}
+
 int MainMenu::count() const {
-  // +1 for the Sync row; its hairline is already in separators_.
-  return 1 + static_cast<int>(entries_.size()) + static_cast<int>(separators_.size());
+  // The Sync row, if any; its hairline is already in separators_.
+  return sync_rows_() + static_cast<int>(entries_.size()) + static_cast<int>(separators_.size());
 }
 
 bool MainMenu::is_separator(int index) const {
-  for (const auto& s : separators_)
-    if (s.first == index) return true;
+  for (const int s : separators_)
+    if (s == index) return true;
   return false;
 }
 
@@ -316,11 +280,8 @@ std::string_view MainMenu::get_item_label(int index) const {
       default: return "Sync";
     }
   }
-  if (is_separator(index)) {
-    for (const auto& s : separators_)
-      if (s.first == index) return s.second;
+  if (is_separator(index))
     return {};
-  }
   int real = entries_index_for(index);
   if (real < 0 || real >= static_cast<int>(entries_.size()))
     return {};
@@ -351,21 +312,9 @@ std::string_view MainMenu::get_item_subtitle(int index) const {
   int real = entries_index_for(index);
   if (real < 0 || real >= static_cast<int>(entries_.size())) return {};
   const BookEntry& e = entries_[real];
-  if (e.hidden) {
-    subtitle_buf_ = e.author_own;
-    return subtitle_buf_;
-  }
-  const StringPool& pool = BookIndex::instance().pool();
-
-  subtitle_buf_ = e.author_ref.view(pool);
-  return subtitle_buf_;
-}
-
-std::string MainMenu::wintergreen_header_left() const {
-  const int n = static_cast<int>(entries_.size());
-  char buf[24];
-  std::snprintf(buf, sizeof(buf), n == 1 ? "1 BOOK" : "%d BOOKS", n);
-  return buf;
+  // Views straight into stable storage — copying into a member string cost an
+  // allocation per row per draw for any author past the SSO length.
+  return e.hidden ? std::string_view(e.author_own) : e.author_ref.view(BookIndex::instance().pool());
 }
 
 void MainMenu::populate_list_() {
@@ -374,11 +323,11 @@ void MainMenu::populate_list_() {
   separators_.clear();
 
   const StringPool& bpool = BookIndex::instance().pool();
-  detail_list_ = true;
   detail_title_lines_ = 2;
+  entries_.reserve(BookIndex::instance().entries().size() + (show_hidden_ ? hidden_.size() : 0));
   for (const auto& idx : BookIndex::instance().entries()) {
     BookEntry e;
-    e.path = idx.path.to_string(bpool);
+    e.path_ref = idx.path;
     e.title_ref = idx.title;
     e.author_ref = idx.author;
     e.last_open_order = idx.last_open_order;
@@ -419,19 +368,19 @@ void MainMenu::populate_list_() {
   }
 
   // Separator positions are *visual* indices, so a separator shifts every one
-  // below it by a row — and so does the Sync row above them all. kFirstBook is
+  // below it by a row — and so does the Sync row above them all. first_book is
   // that combined offset: row 0 Sync, row 1 its hairline, books from row 2.
-  static constexpr int kFirstBook = 2;
-  if (!entries_.empty())
-    separators_.push_back({kSyncRow + 1, ""});
+  const int first_book = has_sync_ ? 2 : 0;
+  if (has_sync_ && !entries_.empty())
+    separators_.push_back(1);
   if (n_hidden > 0 && n_hidden < static_cast<int>(entries_.size()))
-    separators_.push_back({n_hidden + kFirstBook, ""});
+    separators_.push_back(n_hidden + first_book);
   if (split > n_hidden && split < static_cast<int>(entries_.size()))
-    separators_.push_back({split + (n_hidden > 0 ? 1 : 0) + kFirstBook, ""});
+    separators_.push_back(split + (n_hidden > 0 ? 1 : 0) + first_book);
 
   if (!initial_selection_.empty()) {
     for (int i = 0; i < static_cast<int>(entries_.size()); ++i) {
-      if (entries_[i].path == initial_selection_) {
+      if (path_of_(entries_[i]) == initial_selection_) {
         set_selected(visual_for_entries(i));
         break;
       }
@@ -443,7 +392,7 @@ void MainMenu::populate_list_() {
 
 // ── Cover thumbnails ────────────────────────────────────────────────────────
 
-uint32_t MainMenu::thumb_key_(const std::string& path) {
+uint32_t MainMenu::thumb_key_(std::string_view path) {
   uint32_t key = 2166136261u;
   for (const char c : path)
     key = (key ^ static_cast<uint8_t>(c)) * 16777619u;
@@ -457,7 +406,7 @@ bool MainMenu::thumb_cache_ready_(int w, int h) const {
     return true;
   // The spare went to something else since (or never held covers), or the box
   // changed: whatever it holds now is not ours. Null while a radio has it.
-  thumb_bits_ = buf_->claim_spare_cache();
+  thumb_bits_ = buf_->claim_spare_cache(this);
   thumb_gen_ = buf_->spare_cache_gen();
   thumb_w_ = w;
   thumb_h_ = h;
@@ -492,7 +441,8 @@ bool MainMenu::get_item_thumb(int index, Thumb& out) const {
 
   // Keyed by path, not by entries_ index: entries_ is rebuilt on every visit
   // and its order moves whenever a book is opened.
-  const uint32_t key = thumb_key_(entries_[real].path);
+  const std::string_view path = path_of_(entries_[real]);
+  const uint32_t key = thumb_key_(path);
   ThumbSlot* slot = find_thumb_(key);
   if (!slot) {
     // Least recently drawn slot; empty ones carry stamp 0 and go first. Rows
@@ -504,7 +454,7 @@ bool MainMenu::get_item_thumb(int index, Thumb& out) const {
         slot = &thumb_slots_[i];
     slot->key = key;
     slot->valid = true;
-    load_thumb_(entries_[real].path, thumb_slot_bits_(*slot), *slot);
+    load_thumb_(path, thumb_slot_bits_(*slot), *slot);
   }
   slot->used = ++thumb_clock_;
   if (slot->w == 0 || !buf_->spare_cache_valid(thumb_gen_))
@@ -519,11 +469,11 @@ bool MainMenu::get_item_thumb(int index, Thumb& out) const {
 // row's box. Read straight into the slot — a header and one fread. Leaves
 // slot.w == 0 when there is no usable file, which is cached like any other
 // answer so a coverless book is not looked up again on every redraw.
-void MainMenu::load_thumb_(const std::string& book_path, uint8_t* dst, ThumbSlot& slot) const {
+void MainMenu::load_thumb_(std::string_view book_path, uint8_t* dst, ThumbSlot& slot) const {
   slot.w = slot.h = 0;
   if (buf_)
     buf_->wait_panel_idle();  // the card shares SPI2 with the panel
-  const std::string path = cover_list_bin_path(book_path.c_str());
+  const std::string path = cover_list_bin_path(std::string(book_path).c_str());
   FILE* f = std::fopen(path.c_str(), "rb");
   if (!f)
     return;

@@ -13,8 +13,8 @@
 namespace wintergreen {
 
 
-// Main screen — lists EPUB books from a directory.
-// Button1 = open book, Button0 = settings.
+// The book list: every book on the card, a Sync row on top, and the hidden
+// books when the home screen's long-press asks for them.
 class MainMenu final : public ListMenuScreen {
  public:
   MainMenu() = default;
@@ -23,19 +23,12 @@ class MainMenu final : public ListMenuScreen {
     books_dir_ = dir;
   }
 
-  // Restore the book list selection to the entry matching this path.
-  // Call before start(); applied after directory scan.
-  void set_initial_selection(const char* path) {
-    initial_selection_ = path ? path : "";
-  }
-
   // The full path of the currently highlighted entry (even if not yet opened).
-  const std::string& current_book_path() const {
-    int idx = entries_index_for(selected());
+  std::string current_book_path() const {
+    const int idx = entries_index_for(selected());
     if (idx >= 0 && idx < static_cast<int>(entries_.size()))
-      return entries_[idx].path;
-    static const std::string kEmpty;
-    return kEmpty;
+      return std::string(path_of_(entries_[idx]));
+    return {};
   }
 
   // Reveal the books under .hidden/ at the top of the list. Set by the home
@@ -45,28 +38,13 @@ class MainMenu final : public ListMenuScreen {
     show_hidden_ = v;
   }
 
-  bool has_books_dir() const {
-    return books_dir_ != nullptr;
-  }
-
   const char* books_dir() const {
     return books_dir_;
-  }
-
-  const char* name() const override {
-    return "Books";
-  }
-
-
-
-  void set_app(Application* app) {
-    app_ = app;
   }
 
   std::string_view get_item_label(int index) const override;
   std::string_view get_item_subtitle(int index) const override;
   std::string_view get_item_right(int index) const override;
-  std::string wintergreen_header_left() const override;
   bool is_separator(int index) const override;
   // The Sync action never has an author line under it.
   bool is_single_line_row(int index) const override { return is_action_row_(index); }
@@ -77,6 +55,8 @@ class MainMenu final : public ListMenuScreen {
   void start(DrawBuffer& buf, IRuntime& runtime) override {
     buf_ = &buf;
     sync_runtime_ = &runtime;  // the first draw happens inside start(), before update()
+    // Compiled out (no WG_WIFI_SYNC) the row would be a button that does nothing.
+    has_sync_ = runtime.sync_state() != SyncState::Unavailable;
     ListMenuScreen::start(buf, runtime);
   }
 
@@ -99,46 +79,52 @@ class MainMenu final : public ListMenuScreen {
   // the list in place without requiring the user to navigate away and back.
   uint64_t cached_generation_ = 0;
 
+  // Indexed books reference BookIndex's pool for all three strings: a list
+  // build used to allocate a std::string path per book, up to MAX_BOOKS of them.
   struct BookEntry {
-    std::string path;
+    StringRef path_ref;
     StringRef title_ref;
     StringRef author_ref;
     uint32_t last_open_order = 0;
     uint8_t progress_pct = 0;
     // Books under .hidden/ are not in BookIndex — there is no pool to reference,
-    // so they carry their own metadata and are read straight from the WGB.
+    // so they carry their own strings and are read straight from the WGB.
     bool hidden = false;
+    std::string path_own;
     std::string title_own;
     std::string author_own;
   };
   std::vector<BookEntry> entries_;
-  mutable std::string subtitle_buf_;
   mutable std::string right_buf_;
 
-  // Labeled section separators: {visual_index, label}.
-  // Inserted by populate_list_() for LastOpened sort ("Recents", "All Books").
-  std::vector<std::pair<int, std::string>> separators_;
+  std::string_view path_of_(const BookEntry& e) const;
+
+  // Hairline divider positions, as visual indices.
+  std::vector<int> separators_;
 
 
   // Number of separators with visual_index strictly less than v.
   int seps_before_(int v) const {
     int cnt = 0;
-    for (const auto& s : separators_)
-      if (s.first < v) cnt++;
+    for (const int s : separators_)
+      if (s < v) cnt++;
     return cnt;
   }
 
-  // Row 0 is the Sync action, row 1 the hairline under it; books start at 2.
-  // Both are visual-only, so every entries_ index shifts by one on top of the
-  // separator shift.
-  static constexpr int kSyncRow = 0;
-  static bool is_action_row_(int visual) {
-    return visual == kSyncRow;
+  // With sync compiled in, row 0 is the Sync action and row 1 the hairline
+  // under it; books start at 2. Both are visual-only, so every entries_ index
+  // shifts by one on top of the separator shift.
+  bool has_sync_ = false;
+  int sync_rows_() const {
+    return has_sync_ ? 1 : 0;
+  }
+  bool is_action_row_(int visual) const {
+    return has_sync_ && visual == 0;
   }
 
   int entries_index_for(int visual) const {
     if (is_action_row_(visual)) return -1;
-    return visual - seps_before_(visual) - 1;
+    return visual - seps_before_(visual) - sync_rows_();
   }
 
   int visual_for_entries(int real) const {
@@ -157,8 +143,7 @@ class MainMenu final : public ListMenuScreen {
   // after populate_list_() from the two paths that build the list on entry, so
   // an in-place refresh (serial upload) does not move the cursor.
   void select_first_book_();
-  // NAS sync, the one thing kWifiSsid/kWifiPassword are reserved for. No Wi-Fi
-  // subsystem exists yet, so this is the single hook that will start it.
+  // NAS sync: hands off to IRuntime::start_sync() and returns.
   void run_sync_();
   // Reads <books_dir>/.hidden/ into hidden_. Only called when the gesture asks
   // for it, so the card is not walked on every visit to this screen.
@@ -193,7 +178,7 @@ class MainMenu final : public ListMenuScreen {
   mutable ThumbSlot thumb_slots_[kThumbSlotsMax];
   mutable uint32_t thumb_clock_ = 0;
   size_t thumb_slot_bytes_() const { return static_cast<size_t>((thumb_w_ + 7) / 8) * thumb_h_; }
-  static uint32_t thumb_key_(const std::string& path);
+  static uint32_t thumb_key_(std::string_view path);
   // Claims (or re-validates) the cache for a w x h box; false when the spare is
   // unavailable. Changing the box empties every slot.
   bool thumb_cache_ready_(int w, int h) const;
@@ -201,7 +186,7 @@ class MainMenu final : public ListMenuScreen {
   uint8_t* thumb_slot_bits_(const ThumbSlot& s) const {
     return thumb_bits_ + static_cast<size_t>(&s - thumb_slots_) * thumb_slot_bytes_();
   }
-  void load_thumb_(const std::string& book_path, uint8_t* dst, ThumbSlot& slot) const;
+  void load_thumb_(std::string_view book_path, uint8_t* dst, ThumbSlot& slot) const;
   void forget_thumbs_() const;  // a book may have changed under its path
 
   // Last sync state painted, so the Sync row repaints when it changes.

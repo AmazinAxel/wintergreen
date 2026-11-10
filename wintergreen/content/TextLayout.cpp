@@ -8,34 +8,6 @@
 
 namespace wintergreen {
 
-// ---------------------------------------------------------------------------
-// PageContent typed accessors
-// ---------------------------------------------------------------------------
-
-std::vector<PageTextItem> PageContent::text_items() const {
-  std::vector<PageTextItem> r;
-  for (const auto& ci : items)
-    if (const PageTextItem* p = std::get_if<PageTextItem>(&ci))
-      r.push_back(*p);
-  return r;
-}
-
-std::vector<PageImageItem> PageContent::image_items() const {
-  std::vector<PageImageItem> r;
-  for (const auto& ci : items)
-    if (const PageImageItem* p = std::get_if<PageImageItem>(&ci))
-      r.push_back(*p);
-  return r;
-}
-
-std::vector<PageHrItem> PageContent::hr_items() const {
-  std::vector<PageHrItem> r;
-  for (const auto& ci : items)
-    if (const PageHrItem* p = std::get_if<PageHrItem>(&ci))
-      r.push_back(*p);
-  return r;
-}
-
 static bool is_ws(char c) {
   return c == ' ' || c == '\t' || c == '\n' || c == '\r';
 }
@@ -757,7 +729,7 @@ static void bake_y(PageContent& page, uint16_t v_off) {
 // Returns the total y consumed (before any padding/centering).
 template <typename GetLP>
 static uint16_t build_page_items(PageContent& page, std::vector<TextLayout::PageItem>& raw, const PageOptions& opts,
-                                 const IFont& font, IParagraphSource& source, bool is_chapter_start, GetLP get_lp) {
+                                 const IFont& font, IParagraphSource& source, GetLP get_lp) {
   page.items.reserve(raw.size());
 
   // Reserve word_pool exactly, in one pass over the same cached paragraphs the
@@ -928,17 +900,24 @@ static void spread_text_items(PageContent& page, const PageOptions& opts, const 
       opts.height > opts.padding_top + opts.padding_bottom ? opts.height - opts.padding_top - opts.padding_bottom : 0;
 
   // Collect spreadable item indices (skip non-promoted inline images).
-  std::vector<size_t> idxs;
+  //
+  // Fixed arrays, not vectors: this runs on every page layout, and four small
+  // short-lived allocations per page are exactly the churn that fragments this
+  // heap. A page holds a few dozen lines at the smallest size; one that somehow
+  // holds more is simply not spread.
+  static constexpr size_t kMaxSpread = 96;
+  uint16_t idxs[kMaxSpread];
+  size_t N = 0;
   for (size_t i = 0; i < page.items.size(); ++i) {
     const PageImageItem* img = std::get_if<PageImageItem>(&page.items[i]);
     if (img && img->full_height == 0)
       continue;  // non-promoted inline — skip
-    idxs.push_back(i);
+    if (N == kMaxSpread)
+      return;
+    idxs[N++] = static_cast<uint16_t>(i);
   }
-  if (idxs.size() < 2)
+  if (N < 2)
     return;
-
-  const size_t N = idxs.size();
 
   // Compute slack so that the LAST spreadable item lands at the page bottom.
   //   * If the last item is a text line, anchor by its baseline (so padding_bottom
@@ -948,7 +927,7 @@ static void spread_text_items(PageContent& page, const PageOptions& opts, const 
   //     push trailing blocks (e.g. a chapter-end HR) below the page boundary.
   int32_t slack;
   {
-    size_t last = idxs.back();
+    size_t last = idxs[N - 1];
     if (const PageTextItem* ti = std::get_if<PageTextItem>(&page.items[last])) {
       uint16_t last_baseline_y = item_y(page.items[last]) + ti->baseline;
       slack = static_cast<int32_t>(ph) - static_cast<int32_t>(last_baseline_y);
@@ -962,7 +941,7 @@ static void spread_text_items(PageContent& page, const PageOptions& opts, const 
     return;
 
   // Compute raw gaps and weights between consecutive spreadable items.
-  std::vector<int32_t> raw_gaps(N - 1), weights(N - 1);
+  int32_t raw_gaps[kMaxSpread], weights[kMaxSpread], extra[kMaxSpread] = {};
   int32_t total_weight = 0;
   for (size_t i = 0; i < N - 1; ++i) {
     auto& a = page.items[idxs[i]];
@@ -977,7 +956,6 @@ static void spread_text_items(PageContent& page, const PageOptions& opts, const 
     return;
 
   // Distribute slack: base pixels per weight unit, remainder spread left-to-right.
-  std::vector<int32_t> extra(N - 1, 0);
   int32_t base = slack / total_weight, leftover = slack % total_weight, units = 0;
   for (size_t i = 0; i < N - 1; ++i)
     for (int32_t w = 0; w < weights[i]; ++w)
@@ -1022,8 +1000,7 @@ PageContent TextLayout::assemble_page(std::vector<PageItem>& items, PagePosition
   if (!source_ || !font_)
     return page;
 
-  bool is_cs = (start.paragraph == 0 && start.offset == 0);
-  uint16_t y = build_page_items(page, items, opts_, *font_, *source_, is_cs,
+  uint16_t y = build_page_items(page, items, opts_, *font_, *source_,
                                 [this](size_t pi) -> const LaidOutParagraph& { return get_laid_out_(pi); });
 
   auto [has_text, has_img, has_hr] = classify_items(page);
@@ -1326,19 +1303,18 @@ std::optional<Collected> TextLayout::LaidOutParagraph::collect_backward(size_t e
 // Returns break_idx: the idx at which collection stopped.
 // ---------------------------------------------------------------------------
 
-// pending_desc is the uncharged descender of the last placed TextLine (0 otherwise).
-// It is paid when placing the next item so that 'used' always represents:
-//   sum of y_advance for all but the last item + baseline of the last item.
-// This makes the budget identical in the forward and backward passes.
+// Every item is charged its full height, in both directions — see the note on
+// require_full_height in LaidOutParagraph::collect — so `used` is simply the sum
+// of what has been placed.
 static size_t collect_para_items(const LaidOut& lp, size_t start_idx, uint16_t spc, uint16_t ph, uint16_t& used,
-                                 uint16_t& pending_desc, bool& has_content, bool& page_full, bool& pending_page_break,
+                                 bool& has_content, bool& page_full, bool& pending_page_break,
                                  PagePosition& boundary, std::vector<PageItem>& items) {
   size_t break_idx = start_idx;
   for (size_t idx = start_idx; !page_full; ++idx) {
     break_idx = idx;
     uint16_t gap = (idx == start_idx && !items.empty()) ? spc : 0;
-    // avail = space left for the new item's leading dimension (baseline or height)
-    uint16_t avail = (used + pending_desc + gap < ph) ? static_cast<uint16_t>(ph - used - pending_desc - gap) : 0;
+    // avail = space left for the new item
+    uint16_t avail = (used + gap < ph) ? static_cast<uint16_t>(ph - used - gap) : 0;
 
     if (avail == 0) {
       auto probe = lp.collect(idx, ph);
@@ -1366,10 +1342,6 @@ static size_t collect_para_items(const LaidOut& lp, size_t start_idx, uint16_t s
       break;
     }
 
-    // Charge the full height, matching collect_para_items_bwd. The old model
-    // charged a TextLine's baseline and carried its descender in pending_desc,
-    // which the backward walk has no equivalent of — see the note on
-    // require_full_height in LaidOutParagraph::collect.
     used += gap + r->item.height;
     has_content |= (r->item.kind != PageItem::Empty);
     size_t next_idx = r->next_idx;
@@ -1399,7 +1371,7 @@ TextLayout::CollectResult TextLayout::collect_page_items(PagePosition pos) const
 
   std::vector<PageItem> items;
   items.reserve(64);  // see collect_page_items_backward
-  uint16_t used = 0, pending_desc = 0;
+  uint16_t used = 0;
   bool has_content = false, page_full = false, pending_page_break = false;
   PagePosition boundary = pos;
 
@@ -1417,8 +1389,8 @@ TextLayout::CollectResult TextLayout::collect_page_items(PagePosition pos) const
     uint16_t spc = static_cast<uint16_t>(spc_i < 0 ? 0 : spc_i);
     size_t start_idx = (pi == (size_t)pos.paragraph) ? (size_t)pos.offset : 0;
 
-    size_t break_idx = collect_para_items(lp, start_idx, spc, ph, used, pending_desc, has_content, page_full,
-                                          pending_page_break, boundary, items);
+    size_t break_idx =
+        collect_para_items(lp, start_idx, spc, ph, used, has_content, page_full, pending_page_break, boundary, items);
 
     if (!page_full && !items.empty()) {
       auto probe = lp.collect(break_idx, ph);
@@ -1440,10 +1412,6 @@ TextLayout::CollectResult TextLayout::collect_page_items(PagePosition pos) const
 // ---------------------------------------------------------------------------
 // TextLayout methods
 // ---------------------------------------------------------------------------
-
-std::vector<LayoutLine> TextLayout::layout_paragraph(const LayoutOptions& opts, const TextParagraph& para) const {
-  return layout_para_lines(*font_, opts, para, opts.hyphenation_lang);
-}
 
 PageContent TextLayout::layout() const {
   auto c = collect_page_items(position_);
@@ -1486,17 +1454,15 @@ static size_t paragraph_end_idx(const LaidOut& lp) {
   return base + (lp.leading_spacer > 0 ? 1 : 0);
 }
 
-// Mirror of collect_para_items, going backward.
-// Uses the same pending_desc model: cost = pending_desc + gap + baseline (TextLine) or height (others).
-// pending_desc carries across paragraph boundaries, exactly mirroring the forward pass.
+// Mirror of collect_para_items, going backward, with the same full-height cost.
 // Returns the remaining start offset within the paragraph (0 = fully consumed).
 static size_t collect_para_items_bwd(const LaidOut& lp, size_t end_idx, uint16_t spc, uint16_t ph, uint16_t& used,
-                                     uint16_t& pending_desc, bool& page_full, std::vector<PageItem>& rev_items) {
+                                     bool& page_full, std::vector<PageItem>& rev_items) {
   size_t idx = end_idx;
   bool first_item = true;
   while (idx > 0 && !page_full) {
     uint16_t gap = (first_item && !rev_items.empty()) ? spc : 0;
-    uint16_t avail = (used + pending_desc + gap < ph) ? static_cast<uint16_t>(ph - used - pending_desc - gap) : 0;
+    uint16_t avail = (used + gap < ph) ? static_cast<uint16_t>(ph - used - gap) : 0;
 
     if (avail == 0) {
       auto probe = lp.collect_backward(idx, ph);
@@ -1534,11 +1500,10 @@ static size_t collect_para_items_bwd(const LaidOut& lp, size_t end_idx, uint16_t
     }
 
     // Charge the full height of every item, matching the acceptance test above.
-    // The old special case charged the bottommost line only its baseline while
-    // leaving pending_desc at 0, so the descender it had been allowed was never
-    // accounted for anywhere — a free line on every backward page.
-    used += pending_desc + gap + r->item.height;
-    pending_desc = 0;
+    // The old special case charged the bottommost line only its baseline, so
+    // the descender it had been allowed was never accounted for anywhere — a
+    // free line on every backward page.
+    used += gap + r->item.height;
     first_item = false;
     idx = r->next_idx;
     rev_items.push_back(std::move(r->item));
@@ -1570,7 +1535,7 @@ TextLayout::CollectResult TextLayout::collect_page_items_backward(PagePosition e
   // A page holds at most height/y_advance lines; 64 covers the smallest font
   // with room to spare, so this never reallocs in practice.
   rev_items.reserve(64);
-  uint16_t used = 0, pending_desc = 0;
+  uint16_t used = 0;
   bool page_full = false;
   bool stopped_at_page_break = false;
   PagePosition start = {0, 0, 0};
@@ -1635,7 +1600,7 @@ TextLayout::CollectResult TextLayout::collect_page_items_backward(PagePosition e
                     : 0;
     uint16_t spc = static_cast<uint16_t>(spc_i < 0 ? 0 : spc_i);
 
-    size_t remaining = collect_para_items_bwd(lp, para_end_idx, spc, ph, used, pending_desc, page_full, rev_items);
+    size_t remaining = collect_para_items_bwd(lp, para_end_idx, spc, ph, used, page_full, rev_items);
 
     // Update start only when at least one item was collected from this paragraph.
     if (!rev_items.empty() && remaining < para_end_idx) {

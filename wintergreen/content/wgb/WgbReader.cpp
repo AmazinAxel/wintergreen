@@ -16,13 +16,10 @@ bool WgbReader::open(const char* path) {
     close();
     return false;
   }
-  if (std::memcmp(header_.magic, kWgbMagic, 4) != 0) {
-    close();
-    return false;
-  }
-
-  // Read chapter table (16 bytes per entry in v2)
-  if (header_.chapter_count > 2048 || header_.image_count > 4096) {
+  // Stands in for a magic: the image ref table always ends at the metadata blob.
+  if (header_.chapter_count > 2048 || header_.image_count > 4096 || header_.chapter_offset < sizeof(WgbHeader) ||
+      header_.image_offset < header_.chapter_offset + header_.chapter_count * kWgbChapterEntrySize ||
+      header_.meta_offset != header_.image_offset + header_.image_count * 12u) {
     close();
     return false;
   }
@@ -31,19 +28,17 @@ bool WgbReader::open(const char* path) {
   // hundreds of chapters — this is the bulk of open() time.
   chapters_.resize(header_.chapter_count);
   if (header_.chapter_count > 0) {
-    std::vector<uint8_t> raw(static_cast<size_t>(header_.chapter_count) * 16);
+    std::vector<uint8_t> raw(static_cast<size_t>(header_.chapter_count) * kWgbChapterEntrySize);
     fseek(f_, static_cast<long>(header_.chapter_offset), SEEK_SET);
     if (!read_bytes(raw.data(), raw.size())) {
       close();
       return false;
     }
     for (uint16_t i = 0; i < header_.chapter_count; ++i) {
-      const uint8_t* b = raw.data() + static_cast<size_t>(i) * 16;
+      const uint8_t* b = raw.data() + static_cast<size_t>(i) * kWgbChapterEntrySize;
       chapters_[i].para_table_offset = wgb_read_u32(b);
-      chapters_[i].reserved = wgb_read_u32(b + 4);
-      chapters_[i].paragraph_count = wgb_read_u16(b + 8);
-      chapters_[i].reserved1 = wgb_read_u16(b + 10);
-      chapters_[i].char_count = wgb_read_u32(b + 12);
+      chapters_[i].paragraph_count = wgb_read_u16(b + 4);
+      chapters_[i].char_count = wgb_read_u32(b + 6);
     }
   }
 
@@ -103,6 +98,7 @@ void WgbReader::close() {
   chapters_.shrink_to_fit();
   images_.clear();
   images_.shrink_to_fit();
+  std::vector<uint8_t>().swap(body_);
   header_ = {};
   metadata_ = {};
   toc_ = {};
@@ -133,33 +129,35 @@ uint64_t WgbReader::total_char_count() const {
   return total;
 }
 
-WgbReader::LoadResult WgbReader::load_paragraph(uint32_t file_offset, Paragraph& out) {
-  LoadResult result;
+bool WgbReader::load_paragraph(uint32_t file_offset, Paragraph& out) {
   if (!f_ || file_offset == 0)
-    return result;
+    return false;
 
   fseek(f_, static_cast<long>(file_offset), SEEK_SET);
 
-  // Read type + data_size (5 bytes). No link header in v8+.
+  // Read type + data_size (5 bytes).
   uint8_t hdr[5];
   if (!read_bytes(hdr, 5))
-    return result;
+    return false;
 
   uint8_t type = hdr[0];
   uint32_t data_size = wgb_read_u32(hdr + 1);
   if (data_size > 65536)
-    return result;
+    return false;
 
-  // Read body
-  std::vector<uint8_t> body(data_size);
-  if (data_size > 0 && !read_bytes(body.data(), data_size))
-    return result;
+  body_.resize(data_size);
+  const bool ok = (data_size == 0 || read_bytes(body_.data(), data_size)) && parse_paragraph_(type, out);
+  if (body_.capacity() > kBodyKeepBytes)
+    std::vector<uint8_t>().swap(body_);
+  return ok;
+}
 
+bool WgbReader::parse_paragraph_(uint8_t type, Paragraph& out) {
+  const std::vector<uint8_t>& body = body_;
+  const size_t data_size = body.size();
   switch (type) {
     case kWgbParaText:
-      if (deserialize_text(body.data(), body.size(), out))
-        result.ok = true;
-      return result;
+      return deserialize_text(body.data(), body.size(), out);
 
     case kWgbParaImage: {
       out = Paragraph{};
@@ -177,8 +175,7 @@ WgbReader::LoadResult WgbReader::load_paragraph(uint32_t file_offset, Paragraph&
         if (sp != kWgbSpacingDefault)
           out.spacing_before = sp;
       }
-      result.ok = true;
-      return result;
+      return true;
     }
 
     case kWgbParaHr: {
@@ -193,17 +190,15 @@ WgbReader::LoadResult WgbReader::load_paragraph(uint32_t file_offset, Paragraph&
         if (w != kWgbHrWidthDefault)
           out.hr_width_pct = w;
       }
-      result.ok = true;
-      return result;
+      return true;
     }
 
     case kWgbParaPageBreak:
       out = Paragraph::make_page_break();
-      result.ok = true;
-      return result;
+      return true;
 
     default:
-      return result;
+      return false;
   }
 }
 
@@ -215,7 +210,7 @@ bool WgbReader::deserialize_text(const uint8_t* data, size_t size, Paragraph& ou
   out = Paragraph{};
   out.type = ParagraphType::Text;
 
-  if (size < 18)  // minimum: header fields + run_count
+  if (size < 14)  // minimum: header fields + run_count
     return false;
 
   size_t pos = 0;
@@ -230,10 +225,6 @@ bool WgbReader::deserialize_text(const uint8_t* data, size_t size, Paragraph& ou
   pos += 2;
   if (indent_val != kWgbIndentNone)
     out.text.indent = indent_val;
-
-  // margin_left, margin_right (paragraph-level, currently unused placeholders)
-  pos += 2;  // skip margin_left
-  pos += 2;  // skip margin_right
 
   // spacing_before
   uint16_t spacing = wgb_read_u16(data + pos);
@@ -301,11 +292,6 @@ bool WgbReader::deserialize_text(const uint8_t* data, size_t size, Paragraph& ou
 
 bool WgbReader::read_bytes(void* buf, size_t size) {
   return fread(buf, 1, size, f_) == size;
-}
-
-bool WgbReader::read_at(uint32_t offset, void* buf, size_t size) {
-  fseek(f_, static_cast<long>(offset), SEEK_SET);
-  return read_bytes(buf, size);
 }
 
 std::string WgbReader::read_string() {

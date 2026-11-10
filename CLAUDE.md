@@ -12,7 +12,7 @@ Mostly negative knowledge: hardware-tested failures. "Don't" = cost a debug sess
 | `docs/architecture.md` | screens, stack, home/list/quick menu, sorting | `ScreenManager::pop()` keeps last screen; screens pushed from press inherit held button; no `std::sort` (34 KB) |
 | `docs/bluetooth.md` | BLE clicker host, heap, OOM rescue | NimBLE never torn down; reserve before growing page-sized things; guard `largest_free_block_bytes()`, never total free; release OOM reserve before `xTaskCreate` |
 | `docs/sync.md` | NAS sync over HTTP | radio teardown scope-bound (`WifiGuard`); never call saving `BookIndex` mutators per book; downloads → `.tmp`, must match Content-Length |
-| `docs/content.md` | EPUB→WGB, WGB/WGF formats, books on card, fonts, size budget | formats magic-as-version; covers beside literal `book.wgb`; font presets mirror `make_font.py --sizes` |
+| `docs/content.md` | EPUB→WGB, WGB/WGF formats, books on card, fonts, size budget | WGF magic-as-version, WGB unversioned; covers beside literal `book.wgb`; font presets mirror `make_font.py --sizes` |
 | `docs/history.md` | open, rejected, removed | don't resurrect without asking |
 
 ## Build / flash
@@ -22,7 +22,7 @@ pio run -t upload
 pio device monitor      # 115200
 ```
 - `/dev/ttyACM0`, `303A:1001` (native USB JTAG/serial). `upload_port` unset on purpose (autodetect).
-- No desktop build. Only host build = `tools/epub2wgb`. It and `platforms/esp32/CMakeLists.txt` list core sources explicitly: add/delete core `.cpp` → edit both, else CMake fails at generate naming `idf_component_register`.
+- No desktop build. Only host build = `tools/epub2wgb`. It and `platforms/esp32/CMakeLists.txt` list core sources explicitly: add/delete core `.cpp` → edit both, else CMake fails at generate naming `idf_component_register`. Exception: `display/DrawBuffer.cpp` is firmware-only (converter includes `DrawBuffer.h` for constants, never draws).
 - `ESP_PLATFORM` (IDF macro) = firmware/host-converter seam. Stays.
 - Flash DIO @ 80 MHz (`sdkconfig.defaults`). QIO bricks boot (bootloader quad self-upgrade never finishes). DIO@80 = QIO@40 = 20 MB/s. `board_build.flash_mode` inert under espidf.
 - SD clock (`platforms/esp32/sdcard.h`) divides 80 MHz APB: 80/40/26.7/20 only. 40 fails (12.5 ns half-period < 14 ns card output delay; panel fine at 40, write-only). 26.67 fails (empty book list). 20 = ceiling. Card `input_delay` unreachable via `sdspi_device_config_t` (would need IDF patch).
@@ -70,14 +70,14 @@ A session can write nothing: same book, read, sleep → `mark_opened` / `set_pro
 
 | Constant | Default | Notes |
 |---|---|---|
-| `WG_BLUETOOTH_PAGE_TURNER` | commented out | `#define`, clicker MAC `"AA:BB:CC:DD:EE:FF"`. Undefined = no NimBLE. |
-| `WG_WIFI_SYNC` | defined | `#define`. Undefined drops Wi-Fi, lwIP, `esp_http_client`. |
-| `kWifiName` / `kWifiPassword` / `syncServer` | `""` | Read by `platforms/esp32/wifi_sync.h`. `syncServer` never `.local` (mDNS, no resolver); literal IP or router-DNS name. |
+| `WG_BLUETOOTH_PAGE_TURNER` | defined | `#define`, clicker MAC `"AA:BB:CC:DD:EE:FF"`. Undefined = no NimBLE, no quick-menu row. |
+| `WG_WIFI_SYNC` | defined | `#define`. Undefined drops Wi-Fi, lwIP, `esp_http_client` and the book list's Sync row. |
+| `kWifiName` / `kWifiPassword` / `syncServer` | `""` | Read by `platforms/esp32/wifi_sync.h`. `syncServer`: literal IP, router-DNS name, or `.local` (lwIP one-shot mDNS query, `CONFIG_LWIP_DNS_SUPPORT_MDNS_QUERIES`; no `esp_mdns`). Resolved IP cached in NVS per name; failed sync re-resolves once. |
 | `kSunlightFadingFix` | `false` | Panel off after every full refresh (restores sunlight contrast). No periodic full refreshes → affects sleep image + boot paint only. `Application::start`. |
 | `kAutoSleepMinutes` | `1` | `Application::update`. |
-| `kPowerHoldSleepMs` | `kHoldDelayMs` (250) | Power hold before sleep; same tap/hold split for all buttons. |
-| `kHoldDelayMs` | `250` | Hold before nav auto-repeat. < ~250 ms tap reads as two. |
-| `kHoldRepeatMs` | `200` | Repeat gap. |
+| `kResumeOnePageBack` | `false` | Fresh open steps back one page (re-shows last page read). `ReaderScreen::resume_one_page_back_`. |
+| `kHoldDelayMs` | `250` | Hold before nav auto-repeat; also power hold before sleep and clicker tap/hold split. < ~250 ms tap reads as two. |
+| `kHoldRepeatMs` | `100` | Repeat gap. |
 | `kHoldAccelStep` | `0` | Extra entries per repeat. Shipped `0.9` on `int` → 0, accel never on. Make float for fractions. Reader ignores (pages never accelerate). |
 
 - All `inline constexpr` except the two `#define`s (only preprocessor can drop an IDF stack). `#if config::kBluetoothPageTurner[0] != '\0'` fails (`#if` can't eval C++; error names `::`).
@@ -90,6 +90,8 @@ Everything else hardcoded at call site. Removed `Application` `static constexpr`
 - Images always render; `images_enabled` gone.
 - One reader font (Libron, `font` partition), no picker.
 - Book list title-only, most-recently-opened first, hairline before never-opened.
+- No placeholder/empty-state/error text anywhere ("No items", "No books", "Failed to open book" all gone). Empty = blank; failed book open pops silently.
+- Two rotations only: `Rotation::Deg0` (reader landscape) / `Deg90`. Reversed ones and their draw branches gone.
 - Fixed geometry: `ReaderSettings::h_padding()`/`v_padding()`; alignment, spacing, sizes from book CSS.
 
 Runtime state: `ReaderSettings::font_size_idx`, `Application::rotate_reader_`, reading position. Hyphenation always on (English; unknown tag → none).
@@ -99,6 +101,7 @@ Flattened in `18fa42b`: core `lib/wintergreen/` → `wintergreen/`, `platforms/d
 
 ```
 WintergreenConfig.h        only tunables (gitignored)
+preprocess.fish            `books`: review EPUBs (title/author/cover/chapters → wg.ncx "N: Name"), rewrite in place, convert, ssh to homelab
 CMakeLists.txt             IDF stub; real source list in platforms/esp32/
 platformio.ini             env esp32c3; pre-build tools/generate_assets.py
 sdkconfig.defaults         checked in; sdkconfig.esp32c3 generated
@@ -131,8 +134,9 @@ wintergreen/               portable core
     ReaderScreen.{h,cpp}   paging, images, .pos, page cache
     QuickmenuScreen.{h,cpp} in-book menu + inline TOC
   display/
-    DrawBuffer.h           IDisplay + double buffer + all drawing
-    ui_font_{small,large,header}.h   Iosevka Slab Medium 14/24/32 px
+    DrawBuffer.h           IDisplay + double buffer + fills/spare (host-safe constants)
+    DrawBuffer.cpp         text + 1-bit blit (byte-packed, both rotations); firmware CMake only
+    ui_font_{large,header}.h   Iosevka Slab Medium 24/32 px
   content/
     BitmapFont{,Format}.h  WGF1 reader / format doc
     ContentModel.h         Paragraph/Run/TextStyle; kMaxFontSizes = 8
@@ -142,25 +146,25 @@ wintergreen/               portable core
     BookIndex.{h,cpp}      singleton index + StringPool, .wintergreen-index
     StringPool.h           StringRef arena
     CoverPaths.{h,cpp}     cover_*.bin + book.pos paths, kHomeCover/kSleepCover
-    wgb/WgbFormat.h        on-disk WGB (magic WGB2, no version field)
+    wgb/WgbFormat.h        on-disk WGB (no magic, no version field)
     wgb/WgbReader.{h,cpp}  device read path
     wgb/WgbWriter.{h,cpp}  host-only
     wgb/WgbConverter.*     host-only EPUB → WGB
     Book/EpubParser/CssParser/XmlReader/HtmlEntities   host-only
     ZipReader.{h,cpp}      host-only
-    ImageDecoder/JpegDecoder/PngDecoder/stb_image.h    host-only
+    ImageDecoder/JpegDecoder/PngDecoder   host-only (streaming; no stb_image)
     hyphenation/           Liang, English only (27 KB trie)
 
 docs/                      deep-dive notes (index above)
 
 tools/
   generate_assets.py       pre-build: font/sleep flash images
-  make_font.py             TTF → WGF1 / WGFS; --mono mandatory
+  make_font.py             TTF → WGF1 / WGFS; always hinted 1-bit (--mono accepted, no-op)
   check_font.py            validate bundle, ASCII-render sample
   make_sleep_image.py      PNG → MGR2
   convert-books.sh         nix-shell wrapper for epub2wgb
   merge-bin.sh             single flash-at-0x0 release image
-  epub2wgb/                host converter (own CMakeLists, explicit sources)
+  epub2wgb/                host converter (own CMakeLists, explicit sources); no flags, writes ./<stem>/
   tests/                   host checks; run.sh
 ```
 
@@ -176,7 +180,7 @@ tools/
 
 ## Serial protocol
 - `platforms/esp32/serial_communication.h`: FreeRTOS task `serial_rx` (8 KB stack), USB-JTAG, 2 KB tx / 4 KB rx (~14 KB RAM, only once host attached).
-- File management only; no debug console. Commands: `A` dir list, `B` inject buttons, `K` mkdir, `L` list books, `N` rename, `O` open book, `R` recursive delete, `T` read file, `W` upload, `Z` clear `/sdcard/sleep/`. Frame magics `EPUB`, `SIMG`, `CMND`.
+- File management only; no debug console. Commands: `A` dir list, `B` inject buttons, `K` mkdir, `L` list books, `N` rename, `O` open book, `R` recursive delete, `T` read file, `W` upload. Frame magics `EPUB`, `CMND`. (`SIMG`/`Z` removed: nothing reads `/sdcard/sleep/`.)
 - Add/Rename/Remove don't run in receiver: handed to `main.cpp` via single-slot SPSC `g_index_op`, deferred while reader owns scratch buffers or panel refreshing.
 - Lazy start: `serial_start_if_connected()` from main loop first time `usb_serial_jtag_is_connected()` true; no-op after. On battery: never allocated, no 50 ms wakeups. Polling the check is free (reads peripheral, no driver).
 
@@ -247,3 +251,4 @@ nix-shell -p gcc cmake gnumake --run 'tools/tests/run.sh ~/books'
 | `book_index_test.cpp` | index parse/save round trip |
 | `blank_para_test.cpp` | empty paragraphs |
 | `stretch_lut_test.cpp` | cover scaler stretch tables |
+| `blit_test.cpp` | `DrawBuffer::blit_1bit` + glyph ink vs per-pixel reference, both rotations, all clipping |

@@ -41,7 +41,6 @@ class CssCache {
   void clear();
 
   size_t entry_count() const { return count_; }
-  size_t total_bytes() const { return total_bytes_; }
   uint32_t current_gen() const { return gen_; }
 
  private:
@@ -78,7 +77,7 @@ enum class EpubError {
 
 // EPUB book: parsed from an EPUB file.
 // Stores the ZIP entries, spine, metadata, and global stylesheet.
-// Chapters are parsed on-demand via parse_chapter().
+// Chapters are stream-parsed on demand via parse_chapter_streaming().
 class Epub {
  public:
   Epub() = default;
@@ -86,9 +85,6 @@ class Epub {
   // Set CSS unit conversion config (call before open()).
   void set_css_config(const CssConfig& config) {
     css_config_ = config;
-  }
-  const CssConfig& css_config() const {
-    return css_config_;
   }
 
   // Open an EPUB file. work_buf (~45KB) and xml_buf (~4KB) are used during
@@ -108,9 +104,6 @@ class Epub {
   size_t chapter_count() const {
     return spine_.size();
   }
-
-  // Parse a specific chapter by index.
-  EpubError parse_chapter(IZipFile& file, size_t index, Chapter& out) const;
 
   // Stream-parse a chapter: paragraphs are emitted one at a time via sink.
   // Uses ~37KB working memory instead of extracting the full XHTML.
@@ -137,19 +130,10 @@ class Epub {
   const std::vector<SpineItem>& spine() const {
     return spine_;
   }
-  const CssCache& css_cache() const {
-    return css_cache_;
-  }
 
   // Resolve a path relative to a content file's directory.
   // e.g. resolve_path("OEBPS/chapters/", "../images/test.jpg") → "OEBPS/images/test.jpg"
   static std::string resolve_path(const std::string& base_dir, const std::string& href);
-
-  // Find an entry index by path.
-  const ZipEntry* find_entry(const std::string& path) const {
-    return zip_.find(path);
-  }
-  int find_entry_index(const std::string& path) const;
 
   // Returns the zip entry index of the cover image, or -1 if not found.
   int cover_zip_idx() const { return cover_idx_; }
@@ -170,11 +154,5 @@ class Epub {
   EpubError parse_opf(IZipFile& file, const std::string& opf_path, uint8_t* work_buf, uint8_t* xml_buf,
                       bool parse_css_ncx);
 };
-
-// Parse XHTML body into paragraphs (used by Epub::parse_chapter, also
-// usable standalone for testing).
-EpubError parse_xhtml_body(const uint8_t* data, size_t size, const CssStylesheet* inline_css,
-                           const CssStylesheet* extern_css, const std::string& base_dir, const ZipReader& zip,
-                           std::vector<Paragraph>& out);
 
 }  // namespace wintergreen

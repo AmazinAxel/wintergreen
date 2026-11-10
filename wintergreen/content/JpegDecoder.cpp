@@ -18,10 +18,6 @@
 #include <cstring>
 #include <memory>
 
-#ifdef ESP_PLATFORM
-#include "esp_heap_caps.h"
-#include "esp_timer.h"
-#endif
 #include "ImageDecoder.h"
 #include "ZipReader.h"
 #include "miniz.h"
@@ -944,11 +940,6 @@ static const char* decode_baseline(const JpegState& st, BitReader& r, uint16_t m
   out.height = static_cast<uint16_t>(out_h);
   if (!sink) {
     size_t data_bytes = static_cast<size_t>(out_stride) * static_cast<size_t>(out_h);
-#ifdef ESP_PLATFORM
-    size_t largest = heap_caps_get_largest_free_block(MALLOC_CAP_8BIT);
-    if (largest < data_bytes + 2048)
-      return "jpeg: OOM for output buffer";
-#endif
     out.data.resize(data_bytes);
     std::fill(out.data.begin(), out.data.end(), uint8_t(0));
   }
@@ -1087,8 +1078,6 @@ ImageError decode_jpeg_from_entry(IZipFile& file, const ZipEntry& entry, uint16_
   }
 
   BitReader r(inp);
-#ifdef ESP_PLATFORM
-#endif
   err = decode_baseline(*st, r, max_w, max_h, out, scale_to_fill, sink, tone_lut, tone_hist);
   if (err) {
     return ImageError::InvalidData;

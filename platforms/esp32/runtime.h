@@ -141,9 +141,6 @@ class Esp32Runtime final : public wintergreen::IRuntime {
   bool clicker_holds_ram() const override {
     return wg_clicker::holds_ram();
   }
-  uint32_t free_memory_bytes() const override {
-    return static_cast<uint32_t>(heap_caps_get_free_size(MALLOC_CAP_INTERNAL));
-  }
   uint32_t largest_free_block_bytes() const override {
     return static_cast<uint32_t>(heap_caps_get_largest_free_block(MALLOC_CAP_INTERNAL));
   }

@@ -353,6 +353,9 @@ CONFIG_ESP_WIFI_NVS_ENABLED=n
 CONFIG_LWIP_MAX_SOCKETS=4
 CONFIG_LWIP_IPV6=n
 CONFIG_LWIP_DHCPS=n
+# syncServer may be a .local name: lwIP's resolver sends a one-shot mDNS query
+# for it (no esp_mdns component). IDF's default, pinned so it cannot drift.
+CONFIG_LWIP_DNS_SUPPORT_MDNS_QUERIES=y
 CONFIG_LWIP_TCP_SND_BUF_DEFAULT=5760
 CONFIG_LWIP_TCP_WND_DEFAULT=5760
 

@@ -8,29 +8,17 @@
 #include "../Application.h"
 #include "../display/ui_font_header.h"
 #include "../display/ui_font_large.h"
-#include "../display/ui_font_small.h"
 
 namespace wintergreen {
 
-static constexpr int kHeaderY = 15;         // top padding before the title text
 static constexpr int kHeaderBottomGap = 4;  // gap between last header line and first list item
 // Nothing is drawn at the bottom of a list any more — only a breathing margin so
 // the last row isn't flush against the panel edge.
 static constexpr int kBottomPad = 8;
-static constexpr int kSubtitleGap = 3;      // gap between bottom of title block and first subtitle
-static constexpr int kSubtitleSpacing = 6;  // extra pixels between consecutive subtitles (added to y_advance)
-static constexpr int kItemSpacing = 6;      // vertical gap between list item rows
 
 void ListMenuScreen::start(DrawBuffer& buf, IRuntime& runtime) {
   buf_ = &buf;
-  runtime_ = &runtime;
-  ui_font_ = BitmapFont{};
   ui_font_.init(kFontData_ui_header_wgf, kFontData_ui_header_wgf_size);
-  if (!header_font_.valid())
-    header_font_.init(kFontData_ui_header_wgf, kFontData_ui_header_wgf_size);
-  subtitle_font_ = BitmapFont{};
-  subtitle_font_.init(kFontData_ui_small_wgf, kFontData_ui_small_wgf_size);
-  section_font_ = BitmapFont{};
   section_font_.init(kFontData_ui_large_wgf, kFontData_ui_large_wgf_size);
   const int prev_selected = selected_;
   clear_items();
@@ -38,12 +26,8 @@ void ListMenuScreen::start(DrawBuffer& buf, IRuntime& runtime) {
   on_start();
   // Restore selection if on_start() didn't explicitly call set_selected()
   // (e.g. returning from a sub-screen after navigating away).
-  if (!on_start_set_selection_ && initial_selection_ >= 0 && initial_selection_ < count()) {
-    selected_ = initial_selection_;
-    initial_selection_ = -1;  // Only use once
-  } else if (!on_start_set_selection_ && prev_selected > 0 && prev_selected < count()) {
+  if (!on_start_set_selection_ && prev_selected > 0 && prev_selected < count())
     selected_ = prev_selected;
-  }
   if (on_start_set_selection_ || selected_ > 0)
     center_on_selected_();
   else
@@ -55,13 +39,11 @@ void ListMenuScreen::start(DrawBuffer& buf, IRuntime& runtime) {
 
 int ListMenuScreen::wintergreen_slot_h_(int index) const {
   static constexpr int kPadT = 5, kGap = 3, kPadB = 6;
-  if (!subtitle_font_.valid()) return ui_font_.y_advance() + kItemSpacing;
   // A row that will never carry a subtitle gets the title line only — reserving
   // the second line leaves it looking like a row with something missing.
   if (index >= 0 && is_single_line_row(index))
     return kPadT + ui_font_.y_advance() + kPadB + 1;
-  const int sub_h = section_font_.valid() ? section_font_.y_advance() : subtitle_font_.y_advance();
-  return kPadT + detail_title_lines_ * ui_font_.y_advance() + kGap + sub_h + kPadB + 1;
+  return kPadT + detail_title_lines_ * ui_font_.y_advance() + kGap + section_font_.y_advance() + kPadB + 1;
 }
 
 int ListMenuScreen::wintergreen_visible_from_(int scroll_off, int available_h) const {
@@ -75,16 +57,7 @@ int ListMenuScreen::wintergreen_visible_from_(int scroll_off, int available_h) c
 }
 
 int ListMenuScreen::get_visible_count_(int H, int scroll_off) const {
-  const int header_h = compute_header_h_();
-  if (!subtitle_.empty() && subtitle_font_.valid()) {
-    static constexpr int kBarPadY = 6;
-    return wintergreen_visible_from_(scroll_off, H - header_h - (kBarPadY + subtitle_font_.y_advance() + kBarPadY + 1));
-  }
-  if (subtitle_font_.valid() && (!plain_list_ || detail_list_))
-    return wintergreen_visible_from_(scroll_off, H - header_h - kBottomPad);
-  const int line_h = ui_font_.y_advance() + kItemSpacing;
-  const int avail = H - header_h - kBottomPad;
-  return avail > 0 ? (avail + kItemSpacing) / line_h : 0;
+  return wintergreen_visible_from_(scroll_off, H - header_h_() - kBottomPad);
 }
 
 void ListMenuScreen::ensure_visible_() {
@@ -116,595 +89,175 @@ void ListMenuScreen::center_on_selected_() {
   scroll_offset_ = std::max(0, std::min(max_scroll, selected_ - visible / 2));
 }
 
-// ─────────────────────────────────────────────────────────────────────────────
-// draw_all_: orchestrates the four drawing passes.
-// ─────────────────────────────────────────────────────────────────────────────
 void ListMenuScreen::draw_all_(DrawBuffer& buf, std::optional<uint8_t> battery_pct) const {
   const int W = buf.width();
   const int H = buf.height();
   buf.fill(true);
-  const int header_h = draw_header_(buf, W, H, battery_pct);
-  const int bottom_h = draw_bottom_(buf, W, H, battery_pct);
-  draw_list_(buf, W, H, header_h, bottom_h);
+  // Battery percentage and nothing else: no wordmark, and no rule under it.
+  // Same helper the home screen calls, so the two land on the same pixel.
+  draw_battery_(buf, W, battery_pct);
+  draw_list_(buf, W, H, header_h_());
 }
 
 void ListMenuScreen::draw_battery_(DrawBuffer& buf, int W, std::optional<uint8_t> battery_pct) const {
-  if (!battery_pct)
-    return;
-  const BitmapFont& bf = section_font_.valid() ? section_font_ : ui_font_;
-  if (!bf.valid())
+  if (!battery_pct || !section_font_.valid())
     return;
   char pbuf[8];
   std::snprintf(pbuf, sizeof(pbuf), "%u%%", static_cast<unsigned>(*battery_pct));
   const size_t len = std::strlen(pbuf);
-  const int pw = bf.word_width(pbuf, len, FontStyle::Regular);
-  buf.draw_text_proportional(W - kBatteryPadX - pw, kBatteryPadY + bf.baseline(), pbuf, len, bf, false);
+  const int pw = section_font_.word_width(pbuf, len, FontStyle::Regular);
+  buf.draw_text_proportional(W - kBatteryPadX - pw, kBatteryPadY + section_font_.baseline(), pbuf, len, section_font_,
+                             false);
 }
 
-// ─────────────────────────────────────────────────────────────────────────────
-// 1. compute_header_h_: returns the header height without drawing anything.
-//    Used by ensure_visible_() and center_on_selected_() before the draw pass.
-// ─────────────────────────────────────────────────────────────────────────────
-int ListMenuScreen::compute_header_h_() const {
-  // Book-details card: unified across all themes when subtitle_ (author) is set.
-  if (!subtitle_.empty() && ui_font_.valid()) {
-    static constexpr int kBarPadY = 8;
-    int h = kBarPadY + ui_font_.y_advance() + kBarPadY;  // battery row, no rule
-    if (header_font_.valid() && subtitle_font_.valid()) {
-      static constexpr int kCardPadT = 10, kCardPadB = 10, kTitleGap = 4, kLineGap = 6;
-      h += kCardPadT;
-      if (title_)  h += header_font_.y_advance() + kTitleGap;
-      if (title2_) h += header_font_.y_advance() + kTitleGap;
-      h += subtitle_font_.y_advance() + kLineGap;   // author
-      h += subtitle_font_.y_advance() + kCardPadB;  // stats row
-      h += 1;  // bottom rule
-    }
-    return h;
-  }
-  if (!plain_list_) {
-    // Measured from the font the battery is actually drawn in (battery_row_h_),
-    // not the header face. Sizing it off header_font_ reserved a 41 px row for
-    // 31 px of text, which read as a lopsided gap above the first entry.
-    return battery_row_h_() + kHeaderBottomGap;
-  }
-  int subtitle_h = 0;
-  if (ui_font_.valid()) {
-    if (!subtitle_.empty())
-      subtitle_h += ui_font_.y_advance() + kSubtitleSpacing;
-    if (!subtitle2_.empty())
-      subtitle_h += ui_font_.y_advance() + kSubtitleSpacing;
-  }
-  const int hfh = header_font_.valid() ? header_font_.y_advance() : 0;
-  const int t2h = (title2_ && header_font_.valid()) ? header_font_.y_advance() : 0;
-  return kHeaderY + hfh + t2h + subtitle_h + kHeaderBottomGap;
+// Measured from the font the battery is actually drawn in (battery_row_h_), not
+// the header face. Sizing it off the header face reserved a 41 px row for 31 px
+// of text, which read as a lopsided gap above the first entry.
+int ListMenuScreen::header_h_() const {
+  return battery_row_h_() + kHeaderBottomGap;
 }
 
-// ─────────────────────────────────────────────────────────────────────────────
-// 2. draw_header_: draws title, title2, and subtitles.
-//    Returns header_h = pixels from y=0 to where list items begin.
-// ─────────────────────────────────────────────────────────────────────────────
-int ListMenuScreen::draw_header_(DrawBuffer& buf, int W, int H, std::optional<uint8_t> battery_pct) const {
-  // Book-details card: unified across all themes when subtitle_ (author) is set.
-  if (!subtitle_.empty() && ui_font_.valid()) {
-    // Same header as every other screen: battery top right, no wordmark, no rule.
-    static constexpr int kBarPadY = 8;
-    const int bar_h = kBarPadY + ui_font_.y_advance() + kBarPadY;
-    draw_battery_(buf, W, battery_pct);
-    int y = bar_h;
-    if (header_font_.valid() && subtitle_font_.valid()) {
-      static constexpr int kCardPadT = 10, kCardPadB = 10, kTitleGap = 4, kLineGap = 6;
-      static constexpr int kRM = 14;
-      y += kCardPadT;
-      if (title_) {
-        const size_t tlen = std::strlen(title_);
-        const int tw = header_font_.word_width(title_, tlen, FontStyle::Regular);
-        buf.draw_text_proportional((W - tw) / 2, y + header_font_.baseline(), title_, tlen, header_font_, false);
-        y += header_font_.y_advance() + kTitleGap;
-      }
-      if (title2_) {
-        const size_t tlen = std::strlen(title2_);
-        const int tw = header_font_.word_width(title2_, tlen, FontStyle::Regular);
-        buf.draw_text_proportional((W - tw) / 2, y + header_font_.baseline(), title2_, tlen, header_font_, false);
-        y += header_font_.y_advance() + kTitleGap;
-      }
-      // Author centered
-      {
-        const int sw = subtitle_font_.word_width(subtitle_.c_str(), subtitle_.size(), FontStyle::Regular);
-        buf.draw_text_proportional((W - sw) / 2, y + subtitle_font_.baseline(),
-                                   subtitle_.c_str(), subtitle_.size(), subtitle_font_, false);
-        y += subtitle_font_.y_advance() + kLineGap;
-      }
-      // Book progress, right-aligned.
-      {
-        const int stats_y = y + subtitle_font_.baseline();
-        if (!subtitle2_.empty()) {
-          const int rw = subtitle_font_.word_width(subtitle2_.c_str(), subtitle2_.size(), FontStyle::Regular);
-          buf.draw_text_proportional(W - kRM - rw, stats_y,
-                                     subtitle2_.c_str(), subtitle2_.size(), subtitle_font_, false);
-        }
-        y += subtitle_font_.y_advance() + kCardPadB;
-      }
-      buf.fill_rect(0, y, W, 1, false);
-      y += 1;
-    }
-    return y;
-  }
-  if (!plain_list_) {
-    if (!ui_font_.valid()) return 0;
-
-    // Battery percentage and nothing else: no wordmark, and no rule under it.
-    // Same helper the home screen calls, so the two land on the same pixel, and
-    // the same height compute_header_h_ uses — the two must not diverge.
-    draw_battery_(buf, W, battery_pct);
-    return battery_row_h_() + kHeaderBottomGap;
-  }
-  if (title_ && header_font_.valid()) {
-    const size_t len = std::strlen(title_);
-    const int tw = header_font_.word_width(title_, len, FontStyle::Regular);
-    buf.draw_text_proportional((W - tw) / 2, kHeaderY + header_font_.baseline(), title_, header_font_, false);
-  }
-  if (title2_ && header_font_.valid()) {
-    const size_t len = std::strlen(title2_);
-    const int tw = header_font_.word_width(title2_, len, FontStyle::Regular);
-    const int y = kHeaderY + header_font_.y_advance();
-    buf.draw_text_proportional((W - tw) / 2, y + header_font_.baseline(), title2_, header_font_, false);
-  }
-
-  // Subtitles stack from the bottom edge of the title block.
-  const int title_bottom = kHeaderY + (header_font_.valid() ? header_font_.y_advance() : 0) +
-                           ((title2_ && header_font_.valid()) ? header_font_.y_advance() + 4 : 0);
-  int sub_y = title_bottom + kSubtitleGap;
-  int subtitle_h = 0;
-  auto draw_subtitle = [&](const std::string& text) {
-    if (text.empty() || !ui_font_.valid())
-      return;
-    const int sw = ui_font_.word_width(text.c_str(), text.size(), FontStyle::Regular);
-    buf.draw_text_proportional((W - sw) / 2, sub_y + ui_font_.baseline(), text.c_str(), text.size(), ui_font_, false);
-    subtitle_h += ui_font_.y_advance() + kSubtitleSpacing;
-    sub_y += ui_font_.y_advance() + kSubtitleSpacing;
-  };
-  draw_subtitle(subtitle_);
-  draw_subtitle(subtitle2_);
-
-  const int hfh = header_font_.valid() ? header_font_.y_advance() : 0;
-  const int t2h = (title2_ && header_font_.valid()) ? header_font_.y_advance() : 0;
-  return kHeaderY + hfh + t2h + subtitle_h + kHeaderBottomGap;
-}
-
-// ─────────────────────────────────────────────────────────────────────────────
-// 3. draw_bottom_: draws the book-details footer, if there is one.
-//    Returns bottom_h = pixels reserved at the bottom (list must stay above).
-// ─────────────────────────────────────────────────────────────────────────────
-int ListMenuScreen::draw_bottom_(DrawBuffer& buf, int W, int H, std::optional<uint8_t> battery_pct) const {
-  if (!subtitle_.empty()) {
-    if (!subtitle_font_.valid()) return 0;
-    static constexpr int kBarPadY = 6;
-    const int bottom_h = kBarPadY + subtitle_font_.y_advance() + kBarPadY + 1;
-    const int bar_y = H - bottom_h;
-    buf.fill_rect(0, bar_y, W, 1, false);
-    // Battery lives in the header now, so it is not repeated down here.
-    const std::string footer = wintergreen_header_left();
-    if (!footer.empty()) {
-      const int fw = subtitle_font_.word_width(footer.c_str(), footer.size(), FontStyle::Regular);
-      const int text_y = bar_y + 1 + kBarPadY + subtitle_font_.baseline();
-      buf.draw_text_proportional((W - fw) / 2, text_y, footer.c_str(), footer.size(), subtitle_font_, false);
-    }
-    return bottom_h;
-  }
-  // Nothing else is drawn at the bottom: no nav glyphs, no battery icon. The
-  // battery percentage lives in the header (draw_header_).
-  (void)W;
-  (void)H;
-  (void)battery_pct;
-  return kBottomPad;
-}
-
-// ─────────────────────────────────────────────────────────────────────────────
-// 4. draw_list_: draws the scrollable item list, scrollbar, and boundary lines.
-// ─────────────────────────────────────────────────────────────────────────────
-void ListMenuScreen::draw_list_(DrawBuffer& buf, int W, int H, int header_h, int bottom_h) const {
+// Two-line rows: title (detail_title_lines_ lines) + subtitle, a full-width
+// divider, the right-hand column and the thumbnail column.
+void ListMenuScreen::draw_list_(DrawBuffer& buf, int W, int H, int header_h) const {
   const int n = count();
-  if (!ui_font_.valid())
+  if (n == 0 || !ui_font_.valid())
     return;
 
-  if (n == 0) {
-    static const char* kEmpty = "No items";
-    const int ew = ui_font_.word_width(kEmpty, std::strlen(kEmpty), FontStyle::Regular);
-    buf.draw_text_proportional((W - ew) / 2, H / 2 + ui_font_.baseline() - 2, kEmpty, std::strlen(kEmpty), ui_font_,
-                               false);
-    return;
-  }
+  static constexpr int kPadT = 5, kGap = 3;  // slot height comes from wintergreen_slot_h_
+  static constexpr int kLM = 14, kRM = 12;
+  const int title_h = ui_font_.y_advance();
+  const BitmapFont& sub_font = section_font_;
+  const int available_h = H - header_h - kBottomPad;
 
-  // ── Detail rows: title + subtitle, full-width divider, right-hand column ──
-  if (detail_list_ && subtitle_font_.valid() && subtitle_.empty()) {
-    // The standard header already draws its own rule; the plain header does not.
-    if (plain_list_)
-      buf.fill_rect(0, header_h, W, 1, false);
-
-    static constexpr int kPadT = 5, kGap = 3;  // slot height comes from wintergreen_slot_h_
-    static constexpr int kLM = 14, kRM = 12;
-    const int title_h = ui_font_.y_advance();
-    const BitmapFont& sub_font = section_font_.valid() ? section_font_ : subtitle_font_;
-    const int available_h = H - header_h - bottom_h;
-
-    const int visible = wintergreen_visible_from_(scroll_offset_, available_h);
-    if (visible <= 0) return;
-    const int end = std::min(scroll_offset_ + visible, n);
-    const bool has_scrollbar = (n > visible);
-    const int sb_reserved = has_scrollbar ? 8 : 0;
-
-    static const char kEll[] = "...";
-    const int ell_w = ui_font_.word_width(kEll, 3, FontStyle::Regular);
-    char trunc_buf[260];
-
-    // Thumbnail column at the right-hand end of every two-line row, inset from
-    // the row's edges by kThumbPad. The divider is the slot's last pixel row.
-    static constexpr int kThumbPad = 6, kThumbGap = 12;
-    const int thumb_box_h = wintergreen_slot_h_(-1) - 1 - 2 * kThumbPad;
-    const int thumb_w = prepare_thumbs(thumb_box_h);
-
-    int y = header_h;
-    for (int i = scroll_offset_; i < end; ++i) {
-      const bool sel = (i == selected_);
-
-      if (is_separator(i)) {
-        draw_separator_(buf, W, y);
-        y += kSeparatorH;
-        continue;
-      }
-
-      const int slot_h = wintergreen_slot_h_(i);
-      if (sel)
-        buf.fill_rect(0, y, W, slot_h - 1, false);
-
-      std::string_view label = get_item_label(i);
-      const std::string_view sub = get_item_subtitle(i);
-      const std::string_view right_txt = get_item_right(i);
-
-      // For settings screens: strip ": value" from label (shown in subtitle)
-      std::string_view display_label = label;
-      if (!sub.empty()) {
-        const auto pos = label.find(": ");
-        if (pos != std::string_view::npos)
-          display_label = label.substr(0, pos);
-      }
-
-      // Right column (reading percentage). It sits on the *subtitle* baseline,
-      // so the title gets the full width and only the author has to make room.
-      int right_w_actual = 0;
-      if (!right_txt.empty())
-        right_w_actual = sub_font.word_width(right_txt.data(), right_txt.size(), FontStyle::Regular);
-      const int right_reserved = right_txt.empty() ? 0 : (right_w_actual + 8);
-      // Text ends where the thumbnail column (if any) begins.
-      const bool row_thumb = thumb_w > 0 && !is_single_line_row(i);
-      const int text_r = W - kRM - sb_reserved - (row_thumb ? thumb_w + kThumbGap : 0);
-      const int max_lw = text_r - kLM;
-
-      // Title: up to detail_title_lines_ lines. Every line but the last breaks
-      // after the last whole word that fits (mid-word only for a single word
-      // wider than the column); the last takes the rest, ellipsised.
-      {
-        const char* p = display_label.data();
-        size_t left = display_label.size();
-        for (int line = 0; line < detail_title_lines_ && left > 0; ++line) {
-          const int title_y = y + kPadT + line * title_h + ui_font_.baseline();
-          const bool last = (line == detail_title_lines_ - 1);
-          if (ui_font_.word_width(p, left, FontStyle::Regular) <= max_lw) {
-            buf.draw_text_proportional(kLM, title_y, p, left, ui_font_, sel);
-            break;
-          }
-          if (last) {
-            const size_t fit = fit_prefix(ui_font_, p, left, max_lw - ell_w);
-            const size_t cp = fit < 256 ? fit : 256;
-            std::memcpy(trunc_buf, p, cp);
-            std::memcpy(trunc_buf + cp, kEll, 3);
-            trunc_buf[cp + 3] = '\0';
-            buf.draw_text_proportional(kLM, title_y, trunc_buf, cp + 3, ui_font_, sel);
-            break;
-          }
-          const size_t fit = fit_prefix(ui_font_, p, left, max_lw);
-          size_t brk = fit;
-          while (brk > 0 && p[brk] != ' ')
-            --brk;
-          if (brk == 0)
-            brk = fit;  // one word wider than the column: cut it
-          if (brk == 0)
-            break;      // not even a glyph fits
-          buf.draw_text_proportional(kLM, title_y, p, brk, ui_font_, sel);
-          p += brk;
-          left -= brk;
-          while (left > 0 && *p == ' ') {
-            ++p;
-            --left;
-          }
-        }
-      }
-
-      const int sub_baseline = y + kPadT + detail_title_lines_ * title_h + kGap + sub_font.baseline();
-
-      // Right-aligned percentage, on the author's baseline.
-      if (!right_txt.empty()) {
-        const int right_x = text_r - right_w_actual;
-        buf.draw_text_proportional(right_x, sub_baseline, right_txt.data(), right_txt.size(), sub_font, sel);
-      }
-
-      // Subtitle line (author, setting value)
-      if (!sub.empty()) {
-        const int sub_y = sub_baseline;
-        const int max_sw = text_r - kLM - right_reserved;
-        int sw = sub_font.word_width(sub.data(), sub.size(), FontStyle::Regular);
-        if (sw > max_sw) {
-          const int sel_ell_w = sub_font.word_width(kEll, 3, FontStyle::Regular);
-          const size_t fit = fit_prefix(sub_font, sub.data(), sub.size(), max_sw - sel_ell_w);
-          const size_t cp = fit < 256 ? fit : 256;
-          std::memcpy(trunc_buf, sub.data(), cp);
-          std::memcpy(trunc_buf + cp, kEll, 3);
-          trunc_buf[cp + 3] = '\0';
-          buf.draw_text_proportional(kLM, sub_y, trunc_buf, cp + 3, sub_font, sel);
-        } else {
-          buf.draw_text_proportional(kLM, sub_y, sub.data(), sub.size(), sub_font, sel);
-        }
-      }
-
-      // Cover thumbnail, centred in its box. The image keeps its own paper
-      // white on a selected (inverted) row, so it reads as a cover rather than
-      // a negative. A book without one gets an empty frame in the row's ink.
-      if (row_thumb) {
-        const int bx = W - kRM - sb_reserved - thumb_w;
-        const int by = y + kThumbPad;
-        Thumb t;
-        if (get_item_thumb(i, t) && t.bits && t.w > 0 && t.h > 0) {
-          const int tx = bx + (thumb_w - t.w) / 2;
-          const int ty = by + (thumb_box_h - t.h) / 2;
-          const int stride = (t.w + 7) / 8;
-          for (int r = 0; r < t.h; ++r)
-            buf.blit_1bit_row(tx, ty + r, t.bits + static_cast<size_t>(r) * stride, t.w);
-        } else {
-          buf.fill_rect(bx, by, thumb_w, 1, sel);
-          buf.fill_rect(bx, by + thumb_box_h - 1, thumb_w, 1, sel);
-          buf.fill_rect(bx, by, 1, thumb_box_h, sel);
-          buf.fill_rect(bx + thumb_w - 1, by, 1, thumb_box_h, sel);
-        }
-      }
-
-      // Full-width per-book divider. The last row has nothing below it to be
-      // divided from, so it gets none — nor does a row followed by a section
-      // hairline, which would otherwise draw two rules a few pixels apart.
-      if (i != n - 1 && !is_separator(i + 1))
-        buf.fill_rect(0, y + slot_h - 1, W, 1, false);
-      y += slot_h;
-    }
-
-    // Scrollbar
-    if (has_scrollbar) {
-      const int sb_x = W - 4;
-      const int thumb_h = std::max(available_h * visible / n, 16);
-      const int track = available_h - thumb_h;
-      const int max_scroll = n - visible;
-      const int thumb_y = header_h + (max_scroll > 0 ? track * scroll_offset_ / max_scroll : 0);
-      buf.fill_rect(sb_x, thumb_y, 3, thumb_h, false);
-    }
-    return;
-  }
-
-  // ── Book-details mode: centred rows under the details card ───────────────
-  if (!subtitle_.empty() && subtitle_font_.valid()) {
-    static constexpr int kPadT = 6, kGap = 2, kPadB = 6;
-    static constexpr int kDivW = 80;
-    const int title_h = ui_font_.y_advance();
-    const int sub_h = subtitle_font_.y_advance();
-    const int slot_h = kPadT + title_h + kGap + sub_h + kPadB + 1;
-    const int available_h = H - header_h - bottom_h;
-
-    const int visible = wintergreen_visible_from_(scroll_offset_, available_h);
-    if (visible <= 0) return;
-    const int end = std::min(scroll_offset_ + visible, n);
-
-    // Compute visible items total height for vertical centering
-    int total_h = 0;
-    for (int i = scroll_offset_; i < end; ++i)
-      total_h += is_separator(i) ? kSeparatorH : slot_h;
-    const int start_y = header_h + std::max(0, (available_h - total_h) / 2);
-
-    static const char kEll[] = "...";
-    char trunc_buf[260];
-
-    int y = start_y;
-    for (int i = scroll_offset_; i < end; ++i) {
-      const bool sel = (i == selected_);
-
-      if (is_separator(i)) {
-        draw_separator_(buf, W, y);
-        y += kSeparatorH;
-        continue;
-      }
-
-      if (sel)
-        buf.fill_rect(0, y, W, slot_h - 1, false);
-
-      std::string_view label = get_item_label(i);
-      const std::string_view sub = get_item_subtitle(i);
-
-      // For settings screens: strip ": value" portion
-      std::string_view display_label = label;
-      if (!sub.empty()) {
-        const auto pos = label.find(": ");
-        if (pos != std::string_view::npos)
-          display_label = label.substr(0, pos);
-      }
-
-      // Title: centered horizontally
-      {
-        const int max_lw = W - 32;
-        const int lw = ui_font_.word_width(display_label.data(), display_label.size(), FontStyle::Regular);
-        const int title_y = y + kPadT + ui_font_.baseline();
-        if (lw > max_lw) {
-          const int ell_w = ui_font_.word_width(kEll, 3, FontStyle::Regular);
-          const size_t fit = fit_prefix(ui_font_, display_label.data(), display_label.size(), max_lw - ell_w);
-          const size_t cp = fit < 256 ? fit : 256;
-          std::memcpy(trunc_buf, display_label.data(), cp);
-          std::memcpy(trunc_buf + cp, kEll, 3);
-          trunc_buf[cp + 3] = '\0';
-          const int tw = ui_font_.word_width(trunc_buf, cp + 3, FontStyle::Regular);
-          buf.draw_text_proportional((W - tw) / 2, title_y, trunc_buf, cp + 3, ui_font_, sel);
-        } else {
-          buf.draw_text_proportional((W - lw) / 2, title_y, display_label.data(), display_label.size(), ui_font_, sel);
-        }
-      }
-
-      // Subtitle: centered (author + read time for MainMenu; setting value for Settings)
-      if (!sub.empty()) {
-        const int max_sw = W - 32;
-        const int sw = subtitle_font_.word_width(sub.data(), sub.size(), FontStyle::Regular);
-        const int sub_y = y + kPadT + title_h + kGap + subtitle_font_.baseline();
-        if (sw > max_sw) {
-          const int ell_w = subtitle_font_.word_width(kEll, 3, FontStyle::Regular);
-          const size_t fit = fit_prefix(subtitle_font_, sub.data(), sub.size(), max_sw - ell_w);
-          const size_t cp = fit < 256 ? fit : 256;
-          std::memcpy(trunc_buf, sub.data(), cp);
-          std::memcpy(trunc_buf + cp, kEll, 3);
-          trunc_buf[cp + 3] = '\0';
-          const int tw = subtitle_font_.word_width(trunc_buf, cp + 3, FontStyle::Regular);
-          buf.draw_text_proportional((W - tw) / 2, sub_y, trunc_buf, cp + 3, subtitle_font_, sel);
-        } else {
-          buf.draw_text_proportional((W - sw) / 2, sub_y, sub.data(), sub.size(), subtitle_font_, sel);
-        }
-      }
-
-      buf.fill_rect((W - kDivW) / 2, y + slot_h - 1, kDivW, 1, false);
-      y += slot_h;
-    }
-
-    // Scrollbar
-    if (n > visible) {
-      const int sb_x = W - 4;
-      const int thumb_h = std::max(available_h * visible / n, 16);
-      const int track = available_h - thumb_h;
-      const int max_scroll = n - visible;
-      const int thumb_y = header_h + (max_scroll > 0 ? track * scroll_offset_ / max_scroll : 0);
-      buf.fill_rect(sb_x, thumb_y, 3, thumb_h, false);
-    }
-    return;
-  }
-
-  // ── Layout metrics ────────────────────────────────────────────────────────
-  const int line_h = ui_font_.y_advance() + kItemSpacing;  // height per item slot
-  const int baseline = ui_font_.baseline();
-  const int available_h = H - header_h - bottom_h;
-  // N items need N*y_advance + (N-1)*kItemSpacing = N*line_h - kItemSpacing pixels.
-  // Rearranging: N = (available_h + kItemSpacing) / line_h.
-  const int visible = available_h > 0 ? (available_h + kItemSpacing) / line_h : 0;
+  const int visible = wintergreen_visible_from_(scroll_offset_, available_h);
+  if (visible <= 0) return;
   const int end = std::min(scroll_offset_ + visible, n);
+  const bool has_scrollbar = (n > visible);
+  const int sb_reserved = has_scrollbar ? 8 : 0;
 
-  // Total pixel height of the currently visible item slots (for centering).
-  int total_h = 0;
-  for (int i = scroll_offset_; i < end; ++i) {
-    if (is_separator(i))
-      total_h += !get_item_label(i).empty() ? line_h : kSeparatorH;
-    else
-      total_h += line_h;
-  }
-  // Remove the trailing gap that was counted for the last slot.
-  if (total_h >= kItemSpacing)
-    total_h -= kItemSpacing;
-
-  // Always vertically centre the visible items in the available space so the
-  // gap above the first item and below the last item is equal.
-  const int items_y = header_h + (available_h - total_h) / 2;
-
-  // ── Boundary indicator lines ───────────────────────────────────────────────
-  // Short centred horizontal lines showing the theoretical top and bottom of the
-  // list area, regardless of how many items are currently shown.
-  // {
-  //   const int ind_w = std::min(80, W / 3);
-  //   const int ind_x = (W - ind_w) / 2;
-  //   buf.fill_rect(ind_x, header_h, ind_w, 1, false);          // top bound
-  //   buf.fill_rect(ind_x, H - bottom_h - 1, ind_w, 1, false);  // bottom bound
-  // }
-
-  // ── DEBUG: corner rectangles at screen edges ─────────────────────────────
-  // {
-  //   const int s = 8;
-  //   buf.fill_rect(0, 0, s, s, false);          // top-left
-  //   buf.fill_rect(W - s, 0, s, s, false);      // top-right
-  //   buf.fill_rect(0, H - s, s, s, false);      // bottom-left
-  //   buf.fill_rect(W - s, H - s, s, s, false);  // bottom-right
-  // }
-
-  // ── Item rendering ────────────────────────────────────────────────────────
-  static const char kEllipsis[] = "...";
-  const int ellipsis_w = ui_font_.word_width(kEllipsis, 3, FontStyle::Regular);
   char trunc_buf[260];
 
-  int y = items_y;
+  // Thumbnail column at the right-hand end of every two-line row, inset from
+  // the row's edges by kThumbPad. The divider is the slot's last pixel row.
+  static constexpr int kThumbPad = 6, kThumbGap = 12;
+  const int thumb_box_h = wintergreen_slot_h_(-1) - 1 - 2 * kThumbPad;
+  const int thumb_w = prepare_thumbs(thumb_box_h);
+
+  int y = header_h;
   for (int i = scroll_offset_; i < end; ++i) {
-    // Separator row
+    const bool sel = (i == selected_);
+
     if (is_separator(i)) {
-      const std::string_view hdr = get_item_label(i);
-      if (!hdr.empty()) {
-        const int hw = ui_font_.word_width(hdr.data(), hdr.size(), FontStyle::Regular);
-        buf.draw_text_proportional((W - hw) / 2, y + baseline, hdr.data(), hdr.size(), ui_font_, false);
-        y += line_h;
-      } else {
-        // Same hairline, same gap, as every other list.
-        draw_separator_(buf, W, y);
-        y += kSeparatorH;
-      }
+      draw_separator_(buf, W, y);
+      y += kSeparatorH;
       continue;
     }
 
-    // Regular item
-    const std::string_view label_str = get_item_label(i);
-    const char* label = label_str.data();
-    size_t len = label_str.size();
-    int iw = ui_font_.word_width(label, len, FontStyle::Regular);
+    const int slot_h = wintergreen_slot_h_(i);
+    if (sel)
+      buf.fill_rect(0, y, W, slot_h - 1, false);
 
-    const int max_item_w = W - 48;
+    const std::string_view label = get_item_label(i);
+    const std::string_view sub = get_item_subtitle(i);
+    const std::string_view right_txt = get_item_right(i);
 
-    if (iw > max_item_w) {
-      const size_t fit = fit_prefix(ui_font_, label, len, max_item_w - ellipsis_w);
-      const size_t copy = fit < 256 ? fit : 256;
-      std::memcpy(trunc_buf, label, copy);
-      std::memcpy(trunc_buf + copy, kEllipsis, 3);
-      trunc_buf[copy + 3] = '\0';
-      label = trunc_buf;
-      len = copy + 3;
-      iw = ui_font_.word_width(label, len, FontStyle::Regular);
+    // Right column (reading percentage). It sits on the *subtitle* baseline,
+    // so the title gets the full width and only the author has to make room.
+    int right_w_actual = 0;
+    if (!right_txt.empty())
+      right_w_actual = sub_font.word_width(right_txt.data(), right_txt.size(), FontStyle::Regular);
+    const int right_reserved = right_txt.empty() ? 0 : (right_w_actual + 8);
+    // Text ends where the thumbnail column (if any) begins.
+    const bool row_thumb = thumb_w > 0 && !is_single_line_row(i);
+    const int text_r = W - kRM - sb_reserved - (row_thumb ? thumb_w + kThumbGap : 0);
+    const int max_lw = text_r - kLM;
+
+    // Title: up to detail_title_lines_ lines. Every line but the last breaks
+    // after the last whole word that fits (mid-word only for a single word
+    // wider than the column); the last takes the rest, ellipsised.
+    {
+      const char* p = label.data();
+      size_t left = label.size();
+      for (int line = 0; line < detail_title_lines_ && left > 0; ++line) {
+        const int title_y = y + kPadT + line * title_h + ui_font_.baseline();
+        const bool last = (line == detail_title_lines_ - 1);
+        if (ui_font_.word_width(p, left, FontStyle::Regular) <= max_lw) {
+          buf.draw_text_proportional(kLM, title_y, p, left, ui_font_, sel);
+          break;
+        }
+        if (last) {
+          const std::string_view t = ellipsize(ui_font_, p, left, max_lw, trunc_buf);
+          buf.draw_text_proportional(kLM, title_y, t.data(), t.size(), ui_font_, sel);
+          break;
+        }
+        const size_t fit = fit_prefix(ui_font_, p, left, max_lw);
+        size_t brk = fit;
+        while (brk > 0 && p[brk] != ' ')
+          --brk;
+        if (brk == 0)
+          brk = fit;  // one word wider than the column: cut it
+        if (brk == 0)
+          break;      // not even a glyph fits
+        buf.draw_text_proportional(kLM, title_y, p, brk, ui_font_, sel);
+        p += brk;
+        left -= brk;
+        while (left > 0 && *p == ' ') {
+          ++p;
+          --left;
+        }
+      }
     }
 
-    const int ix = (W - iw) / 2;
+    const int sub_baseline = y + kPadT + detail_title_lines_ * title_h + kGap + sub_font.baseline();
 
-    if (i == selected_) {
-      const int bar_w = 3;
-      const int bar_h = ui_font_.y_advance();
-      buf.fill_rect(ix - bar_w, y, iw + bar_w * 2, bar_h, false);
-      buf.fill_rect(ix - bar_w - 1, y + 1, 1, bar_h - 2, false);
-      buf.fill_rect(ix + iw + bar_w, y + 1, 1, bar_h - 2, false);
-      buf.draw_text_proportional(ix, y + baseline, label, len, ui_font_, true);
-    } else {
-      buf.draw_text_proportional(ix, y + baseline, label, len, ui_font_, false);
+    // Right-aligned percentage, on the author's baseline.
+    if (!right_txt.empty()) {
+      const int right_x = text_r - right_w_actual;
+      buf.draw_text_proportional(right_x, sub_baseline, right_txt.data(), right_txt.size(), sub_font, sel);
     }
-    y += line_h;
+
+    // Subtitle line (author)
+    if (!sub.empty()) {
+      const std::string_view s = ellipsize(sub_font, sub.data(), sub.size(), text_r - kLM - right_reserved, trunc_buf);
+      buf.draw_text_proportional(kLM, sub_baseline, s.data(), s.size(), sub_font, sel);
+    }
+
+    // Cover thumbnail, centred in its box. The image keeps its own paper
+    // white on a selected (inverted) row, so it reads as a cover rather than
+    // a negative. A book without one gets an empty frame in the row's ink.
+    if (row_thumb) {
+      const int bx = W - kRM - sb_reserved - thumb_w;
+      const int by = y + kThumbPad;
+      Thumb t;
+      if (get_item_thumb(i, t) && t.bits && t.w > 0 && t.h > 0) {
+        const int tx = bx + (thumb_w - t.w) / 2;
+        const int ty = by + (thumb_box_h - t.h) / 2;
+        buf.blit_1bit(tx, ty, t.bits, t.w, t.h, (t.w + 7) / 8);
+      } else {
+        buf.fill_rect(bx, by, thumb_w, 1, sel);
+        buf.fill_rect(bx, by + thumb_box_h - 1, thumb_w, 1, sel);
+        buf.fill_rect(bx, by, 1, thumb_box_h, sel);
+        buf.fill_rect(bx + thumb_w - 1, by, 1, thumb_box_h, sel);
+      }
+    }
+
+    // Full-width per-book divider. The last row has nothing below it to be
+    // divided from, so it gets none — nor does a row followed by a section
+    // hairline, which would otherwise draw two rules a few pixels apart.
+    if (i != n - 1 && !is_separator(i + 1))
+      buf.fill_rect(0, y + slot_h - 1, W, 1, false);
+    y += slot_h;
   }
 
-  // ── Scrollbar ─────────────────────────────────────────────────────────────
-  if (n > visible) {
-    const int sb_w = 4;
-    const int sb_x = (buf.rotation() == Rotation::Deg0) ? 8 : W - 12;
-    const int sb_top = items_y;
-    // total_h = N*line_h - kItemSpacing (trailing gap removed), so the bottom
-    // pixel of the last item's glyph is exactly items_y + total_h.
-    const int sb_bottom = items_y + total_h;
-    const int sb_total_h = sb_bottom - sb_top;
-    const int thumb_min = 20;
-    const int thumb_h = std::max(sb_total_h * visible / n, thumb_min);
-    const int track = sb_total_h - thumb_h;
+  // Scrollbar
+  if (has_scrollbar) {
+    const int sb_x = W - 4;
+    const int thumb_h = std::max(available_h * visible / n, 16);
+    const int track = available_h - thumb_h;
     const int max_scroll = n - visible;
-    const int thumb_y = sb_top + (max_scroll > 0 ? track * scroll_offset_ / max_scroll : 0);
-
-    buf.fill_rect(sb_x + 1, thumb_y, sb_w - 2, 1, false);                // top cap
-    buf.fill_rect(sb_x, thumb_y + 1, sb_w, thumb_h - 2, false);          // body
-    buf.fill_rect(sb_x + 1, thumb_y + thumb_h - 1, sb_w - 2, 1, false);  // bottom cap
+    const int thumb_y = header_h + (max_scroll > 0 ? track * scroll_offset_ / max_scroll : 0);
+    buf.fill_rect(sb_x, thumb_y, 3, thumb_h, false);
   }
 }
 

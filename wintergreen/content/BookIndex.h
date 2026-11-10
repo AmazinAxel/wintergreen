@@ -29,6 +29,20 @@ static constexpr uint32_t INDEX_FORMAT_VERSION = 2;
 // sort never-opened books identically.
 bool ci_less(std::string_view a, std::string_view b);
 
+// Name of the folder holding `path` ("…/the odyssey/book.wgb" → "the odyssey"),
+// or "" when the file has no folder of its own.
+std::string book_folder_name(const std::string& path);
+
+// The title to show: the WGB's own, unless it is empty or the converter's
+// literal "none" (an EPUB with no usable metadata), in which case the folder
+// name — which the converter takes from the original filename. Every screen
+// goes through this so none of them can disagree about a book's name.
+std::string book_title_fallback(const std::string& title, const std::string& path);
+
+// Title (via book_title_fallback) and author from the WGB header. False when
+// the book does not open.
+bool read_book_meta(const std::string& path, std::string& title, std::string& author);
+
 class BookIndex {
  public:
   static BookIndex& instance();
@@ -39,7 +53,7 @@ class BookIndex {
   bool load(const std::string& index_file);
   bool save(const std::string& index_file) const;
 
-  // Recursively scan root_dir for EPUBs and rebuild the index.
+  // Recursively scan root_dir for .wgb books and rebuild the index.
   void build_index(const std::string& root_dir);
 
   const std::vector<BookIndexEntry>& entries() const { return entries_; }
@@ -89,7 +103,7 @@ class BookIndex {
   // No-op if not found. Call save() to persist.
   void remove_entry(std::string_view path);
 
-  // Open path as an EPUB, upsert its index entry, and save to index_path.
+  // Open path as a WGB, upsert its index entry, and save to index_path.
   // Reloads from disk first if entries_ is empty, to avoid truncating the .dat.
   bool index_file(const std::string& path, const std::string& index_path);
 

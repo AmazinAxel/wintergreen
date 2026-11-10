@@ -141,15 +141,6 @@ struct Paragraph {
 };
 
 // ---------------------------------------------------------------------------
-// Chapter
-// ---------------------------------------------------------------------------
-
-struct Chapter {
-  std::optional<std::string> title;
-  std::vector<Paragraph> paragraphs;
-};
-
-// ---------------------------------------------------------------------------
 // EPUB metadata
 // ---------------------------------------------------------------------------
 
@@ -176,7 +167,11 @@ struct SpineItem {
 
 struct TocEntry {
   StringRef label{};
+#ifndef ESP_PLATFORM
+  // The converter resolves the href fragment to para_index; the device only
+  // ever reads para_index, so it does not carry the field.
   StringRef fragment{};  // empty => no fragment
+#endif
   uint16_t file_idx = 0;
   uint8_t depth = 0;        // nesting depth in NCX (0 = top-level)
   uint16_t para_index = 0;  // paragraph index within chapter (stored in WGB v6+)
@@ -186,17 +181,16 @@ struct TableOfContents {
   std::vector<TocEntry> entries;
   StringPool pool;
 
-  std::string_view label_view(const TocEntry& e) const { return e.label.view(pool); }
-  std::string_view fragment_view(const TocEntry& e) const { return e.fragment.view(pool); }
-  // Convenience overloads for legacy call sites that only have an index.
-  std::string_view label_view(size_t idx) const { return entries[idx].label.view(pool); }
-
   // Add an entry during parsing; uses the pool to store strings.
   void add_entry(std::string_view label, uint16_t file_idx, uint8_t depth, std::string_view fragment = {},
                  uint16_t para_index = 0) {
     TocEntry te;
     te.label = pool.add(label);
+#ifndef ESP_PLATFORM
     te.fragment = pool.add(fragment);
+#else
+    (void)fragment;
+#endif
     te.file_idx = file_idx;
     te.depth = depth;
     te.para_index = para_index;

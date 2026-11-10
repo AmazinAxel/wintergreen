@@ -12,17 +12,6 @@
 #define MINIZ_NO_ZLIB_APIS
 #include "miniz.h"
 
-#ifdef ESP_PLATFORM
-#include "esp_heap_caps.h"
-// Returns largest contiguous free block on ESP32; always passes on desktop.
-static bool heap_can_alloc(size_t bytes) {
-  return heap_caps_get_largest_free_block(MALLOC_CAP_8BIT) >= bytes + 2048;  // 2 KB overhead margin
-}
-#else
-static inline bool heap_can_alloc(size_t) {
-  return true;
-}
-#endif
 
 namespace wintergreen {
 
@@ -146,8 +135,6 @@ ZipError ZipReader::open(IZipFile& file) {
   const int64_t cd_start = eocd.central_dir_offset;
   file.seek(cd_start, SEEK_SET);
 
-  if (!heap_can_alloc(cd_size))
-    return ZipError::OutOfMemory;
   std::vector<uint8_t> cd_buf(cd_size);
   uint8_t* cd_ptr = cd_buf.data();
   if (file.read(cd_ptr, cd_size) != cd_size)
@@ -169,8 +156,6 @@ ZipError ZipReader::open(IZipFile& file) {
     }
   }
 
-  if (!heap_can_alloc(total_name_bytes))
-    return ZipError::OutOfMemory;
   name_blob_.resize(total_name_bytes);
 
   // Second pass: build entries, copy names into contiguous blob.
@@ -387,21 +372,13 @@ bool StdioZipFile::is_open() const {
 bool StdioZipFile::seek(int64_t offset, int whence) {
   if (!fp_)
     return false;
-#ifdef _WIN32
-  return _fseeki64(static_cast<FILE*>(fp_), offset, whence) == 0;
-#else
   return fseek(static_cast<FILE*>(fp_), static_cast<long>(offset), whence) == 0;
-#endif
 }
 
 int64_t StdioZipFile::tell() {
   if (!fp_)
     return -1;
-#ifdef _WIN32
-  return _ftelli64(static_cast<FILE*>(fp_));
-#else
   return ftell(static_cast<FILE*>(fp_));
-#endif
 }
 
 size_t StdioZipFile::read(void* buf, size_t size) {

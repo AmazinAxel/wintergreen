@@ -24,16 +24,6 @@ struct IFont {
 
   // Distance from top of line to baseline (where text sits, above descenders)
   virtual uint16_t baseline(uint8_t size_pct = 100) const = 0;
-
-  // Distance below baseline to underline top (pixels, positive = below baseline)
-  virtual int8_t underline_pos(uint8_t size_pct = 100) const {
-    return 1;
-  }
-
-  // Underline height in pixels (>= 1)
-  virtual uint8_t underline_thickness(uint8_t size_pct = 100) const {
-    return 1;
-  }
 };
 
 // ---------------------------------------------------------------------------

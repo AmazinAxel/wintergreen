@@ -18,26 +18,17 @@ Format notes that are not in WgfFormat.h and were recovered from the
 shipped Literata:
 
   * advance_width is in QUARTER-pixels, not pixels.
-  * Antialiasing is 5 levels across the three planes, encoded as (bw, msb, lsb):
-        white (1,0,0)  light (1,0,1)  mid (0,1,0)  dark (0,1,1)  black (0,0,0)
-    The BW plane draws where its bit is CLEAR; the gray planes draw where their
-    bit is SET. So (msb,lsb) is a lightening modifier, not a magnitude.
-  * Untouched BW bits must be 1 (white); untouched gray bits 0.
+  * The BW plane draws where its bit is CLEAR; untouched BW bits must be 1.
+    The format's two gray planes are always written absent (offset 0).
 
 Rendering choices, for quality:
 
-  * FT_LOAD_TARGET_LIGHT — vertical-only hinting. Full hinting would round every
-    advance to a whole pixel and distort letterforms; light hinting snaps stems
-    to the pixel grid vertically while leaving horizontal metrics linear, so the
-    quarter-pixel advances this format supports are actually meaningful.
-  * The 5 levels are nearest-neighbour bins of coverage (boundaries at 1/8, 3/8,
-    5/8, 7/8), which is the correct rounding for evenly spaced output levels.
-  * --mono switches to FT_LOAD_TARGET_MONO and emits no gray planes. That is the
-    right choice when the consumer only ever draws GrayPlane::BW, as the reader
-    now does: thresholding an AA render leaves stems straddling pixel boundaries
+  * FT_LOAD_TARGET_MONO, BW plane only. The device draws nothing else, and
+    thresholding an antialiased render left stems straddling pixel boundaries
     (blurry and uneven), where mono hinting snaps them to the grid. It also drops
     two thirds of the bitmap data. The cost is integer advances — the hinter
-    rounds them — so the quarter-pixel field carries whole pixels.
+    rounds them — so the quarter-pixel field carries whole pixels. The old
+    5-level gray path is gone; `--mono` is still accepted and changes nothing.
   * Class kerning is extracted from GPOS (and the legacy kern table) and packed
     losslessly: glyphs with identical kerning rows share a class.
 """
@@ -81,34 +72,14 @@ RANGE_SIZE = 8
 GLYPH_SIZE = 10
 STYLE_SECTION_SIZE = 8
 
-# Coverage -> level. Level 4 is solid black, 0 is untouched background.
-LEVEL_THRESHOLDS = (32, 96, 160, 224)
-
-# level -> (bw_bit, msb_bit, lsb_bit)
-LEVEL_BITS = {
-    0: (1, 0, 0),
-    1: (1, 0, 1),
-    2: (0, 1, 0),
-    3: (0, 1, 1),
-    4: (0, 0, 0),
-}
-
-
 def codepoints():
     for first, count in RANGES:
         for i in range(count):
             yield first + i
 
 
-def level_for(coverage):
-    for level, t in enumerate(LEVEL_THRESHOLDS):
-        if coverage < t:
-            return level
-    return 4
-
-
 class Glyph:
-    __slots__ = ("advance_q", "width", "height", "x_off", "y_off", "bw", "lsb", "msb")
+    __slots__ = ("advance_q", "width", "height", "x_off", "y_off", "bw")
 
     def __init__(self):
         self.advance_q = 0
@@ -117,13 +88,11 @@ class Glyph:
         self.x_off = 0
         self.y_off = 0
         self.bw = b""
-        self.lsb = b""
-        self.msb = b""
 
 
-LOAD_FLAGS = freetype.FT_LOAD_RENDER | freetype.FT_LOAD_TARGET_LIGHT
+# Always hinted 1-bit: the device draws only the BW plane, and the gray-plane
+# path that once lived here (FT_LOAD_TARGET_LIGHT + 5-level binning) is gone.
 MONO_LOAD_FLAGS = freetype.FT_LOAD_RENDER | freetype.FT_LOAD_TARGET_MONO
-MONO = False  # set from --mono
 
 
 def glyph_index(face, cp):
@@ -135,11 +104,11 @@ def glyph_index(face, cp):
 
 
 def render_glyph(face, cp):
-    """Rasterize one codepoint into the three planes. Returns None if absent."""
+    """Rasterize one codepoint into the BW plane. Returns None if absent."""
     gi = glyph_index(face, cp)
     if gi == 0:
         return None
-    face.load_glyph(gi, MONO_LOAD_FLAGS if MONO else LOAD_FLAGS)
+    face.load_glyph(gi, MONO_LOAD_FLAGS)
     slot = face.glyph
     bmp = slot.bitmap
 
@@ -156,37 +125,15 @@ def render_glyph(face, cp):
 
     stride = (g.width + 7) // 8
 
-    if MONO:
-        # FreeType hands back a bit-packed, MSB-first plane where 1 = ink; the
-        # BW plane wants 0 = ink, and its padding bits white. Inverting does
-        # both, since FreeType leaves the padding clear.
-        bw = bytearray(stride * g.height)
-        for row in range(g.height):
-            src = row * bmp.pitch
-            for i in range(stride):
-                bw[row * stride + i] = ~bmp.buffer[src + i] & 0xFF
-        g.bw, g.lsb, g.msb = bytes(bw), b"", b""
-        return g
-
-    bw = bytearray(b"\xff" * (stride * g.height))
-    lsb = bytearray(stride * g.height)
-    msb = bytearray(stride * g.height)
-
+    # FreeType hands back a bit-packed, MSB-first plane where 1 = ink; the
+    # BW plane wants 0 = ink, and its padding bits white. Inverting does
+    # both, since FreeType leaves the padding clear.
+    bw = bytearray(stride * g.height)
     for row in range(g.height):
         src = row * bmp.pitch
-        dst = row * stride
-        for col in range(g.width):
-            b, m, l = LEVEL_BITS[level_for(bmp.buffer[src + col])]
-            mask = 1 << (7 - (col & 7))
-            idx = dst + (col >> 3)
-            if not b:
-                bw[idx] &= ~mask & 0xFF
-            if m:
-                msb[idx] |= mask
-            if l:
-                lsb[idx] |= mask
-
-    g.bw, g.lsb, g.msb = bytes(bw), bytes(lsb), bytes(msb)
+        for i in range(stride):
+            bw[row * stride + i] = ~bmp.buffer[src + i] & 0xFF
+    g.bw = bytes(bw)
     return g
 
 
@@ -441,11 +388,8 @@ def build_wgf(faces, px, name, kern_sources=None, line_height_pct=None):
         style_offsets[style] = off
         off += STYLE_SECTION_SIZE + table_size + len(kern[style])
 
-    # Bitmap pools. Every style appends into the same pool; a glyph's
-    # bitmap_offset is shared by all three planes.
+    # Bitmap pool. Every style appends into the same pool.
     bw_pool = bytearray()
-    lsb_pool = bytearray()
-    msb_pool = bytearray()
     offsets = {}
     seen = {}  # identical bitmaps (e.g. the same glyph reused) share an offset
     for style in present:
@@ -454,18 +398,15 @@ def build_wgf(faces, px, name, kern_sources=None, line_height_pct=None):
             if g.width == 0 or g.height == 0:
                 offsets[style].append(0)
                 continue
-            key = (g.bw, g.lsb, g.msb)
-            if key not in seen:
-                seen[key] = len(bw_pool)
+            if g.bw not in seen:
+                seen[g.bw] = len(bw_pool)
                 bw_pool += g.bw
-                lsb_pool += g.lsb
-                msb_pool += g.msb
-            offsets[style].append(seen[key])
+            offsets[style].append(seen[g.bw])
 
     bitmap_data_offset = off
-    # 0 = plane absent (BitmapFont::has_grayscale keys off this).
-    gray_lsb_offset = 0 if MONO else bitmap_data_offset + len(bw_pool)
-    gray_msb_offset = 0 if MONO else gray_lsb_offset + len(lsb_pool)
+    # The format's gray-plane offsets; 0 = plane absent, which every font now is.
+    gray_lsb_offset = 0
+    gray_msb_offset = 0
 
     glyph_height = max((g.height for g in styles["regular"]), default=px)
     underline_pos = max(1, px // 10)
@@ -533,8 +474,6 @@ def build_wgf(faces, px, name, kern_sources=None, line_height_pct=None):
 
     assert len(out) == bitmap_data_offset
     out += bw_pool
-    out += lsb_pool
-    out += msb_pool
     return bytes(out)
 
 
@@ -609,8 +548,7 @@ def main():
         p.add_argument(
             "--mono",
             action="store_true",
-            help="hinted 1-bit rendering, no gray planes. For consumers that only draw "
-            "GrayPlane::BW.",
+            help="accepted for compatibility; rendering is always hinted 1-bit.",
         )
 
     b = sub.add_parser("bundle", help="reader font: compressed WGFS bundle")
@@ -628,9 +566,6 @@ def main():
     h.add_argument("--out", required=True)
 
     args = ap.parse_args()
-
-    global MONO
-    MONO = args.mono
 
     faces = {}
     kern_sources = {}

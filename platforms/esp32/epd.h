@@ -2,8 +2,10 @@
 
 // EInkDisplay driver for ESP-IDF (SSD1677).
 
+#include <algorithm>
 #include <cstdint>
 #include <cstring>
+#include <initializer_list>
 
 #include "driver/gpio.h"
 #include "driver/spi_master.h"
@@ -40,8 +42,6 @@
 #define CTRL1_NORMAL 0x00
 #define CTRL1_BYPASS_RED 0x40
 #define CMD_WRITE_TEMP 0x1A
-#define CMD_AUTO_WRITE_BW_RAM 0x46
-#define CMD_AUTO_WRITE_RED_RAM 0x47
 #define CMD_DEEP_SLEEP 0x10
 
 // ---- Refresh modes (internal) ----
@@ -59,9 +59,6 @@ class EInkDisplay : public wintergreen::IDisplay {
   // When begin() let go of RST; finish_begin() waits out the rest of the settle.
   static constexpr uint32_t kResetSettleMs = 20;
   uint32_t reset_released_ms_ = 0;
-  // millis() at MASTER_ACTIVATION of a refresh that was fired without waiting;
-  // 0 = nothing outstanding. Collected by waitWhileBusy().
-  uint32_t pending_refresh_start_ = 0;
 
   bool is_busy() const override {
     return gpio_get_level(EPD_BUSY) == 1;
@@ -233,7 +230,7 @@ class EInkDisplay : public wintergreen::IDisplay {
     delay(20);
     gpio_set_level(EPD_RST, 1);
     delay(200);
-    waitWhileBusy("post-HWRESET");
+    waitWhileBusy();
     initDisplayController();
     inDeepSleep_ = false;
   }
@@ -298,20 +295,13 @@ class EInkDisplay : public wintergreen::IDisplay {
     }
   }
 
-  void waitWhileBusy(const char* comment = nullptr) {
+  void waitWhileBusy() {
     uint32_t start = millis();
     while (gpio_get_level(EPD_BUSY) == 1) {
       vTaskDelay(1);  // 1 tick; pdMS_TO_TICKS(1) rounds to 0 and busy-spins
       if (millis() - start > 10000) {
         break;
       }
-    }
-    // A non-blocking refreshDisplay() left its waveform running; this is where it
-    // gets collected, so report its true duration from the activation timestamp.
-    if (pending_refresh_start_ != 0) {
-      pending_refresh_start_ = 0;
-    }
-    if (comment) {
     }
   }
 
@@ -432,18 +422,14 @@ class EInkDisplay : public wintergreen::IDisplay {
 
     // Powering the screen off happens at the end of the waveform, so those
     // refreshes can never be left outstanding.
-    if (!wait && !turnOffScreen) {
-      pending_refresh_start_ = millis();
-      if (pending_refresh_start_ == 0)
-        pending_refresh_start_ = 1;  // 0 is the "nothing pending" sentinel
+    if (!wait && !turnOffScreen)
       return;
-    }
     waitWhileBusy();
   }
 
   void initDisplayController() {
     sendCommand(CMD_SOFT_RESET);
-    waitWhileBusy("CMD_SOFT_RESET");
+    waitWhileBusy();
 
     sendCommand(CMD_TEMP_SENSOR_CONTROL);
     sendData(0x80);
@@ -465,31 +451,34 @@ class EInkDisplay : public wintergreen::IDisplay {
 
   }
 
+  // A command and its (at most four) parameter bytes: one transaction for the
+  // command and one for all of its data, CS held low across the data as the
+  // bulk RAM writes already do. Byte-at-a-time this was 18 data transactions,
+  // each with its own CS edge and polling round trip, ahead of every refresh.
+  void sendCommandData(uint8_t command, std::initializer_list<uint8_t> data) {
+    sendCommand(command);
+    gpio_set_level(EPD_DC, 1);
+    gpio_set_level(EPD_CS, 0);
+    spi_transaction_t t{};
+    t.length = data.size() * 8;
+    t.flags = SPI_TRANS_USE_TXDATA;
+    std::copy(data.begin(), data.end(), t.tx_data);
+    spi_device_polling_transmit(spi_, &t);
+    gpio_set_level(EPD_CS, 1);
+  }
+
   void setRamArea(uint16_t x, uint16_t y, uint16_t w, uint16_t h) {
     y = DISPLAY_HEIGHT - y - h;
+    const uint16_t x_end = x + w - 1;
+    const uint16_t y_end = y + h - 1;
 
-    sendCommand(CMD_DATA_ENTRY_MODE);
-    sendData(0x01);  // X inc, Y dec
-
-    sendCommand(CMD_SET_RAM_X_RANGE);
-    sendData(x % 256);
-    sendData(x / 256);
-    sendData((x + w - 1) % 256);
-    sendData((x + w - 1) / 256);
-
-    sendCommand(CMD_SET_RAM_Y_RANGE);
-    sendData((y + h - 1) % 256);
-    sendData((y + h - 1) / 256);
-    sendData(y % 256);
-    sendData(y / 256);
-
-    sendCommand(CMD_SET_RAM_X_COUNTER);
-    sendData(x % 256);
-    sendData(x / 256);
-
-    sendCommand(CMD_SET_RAM_Y_COUNTER);
-    sendData((y + h - 1) % 256);
-    sendData((y + h - 1) / 256);
+    sendCommandData(CMD_DATA_ENTRY_MODE, {0x01});  // X inc, Y dec
+    sendCommandData(CMD_SET_RAM_X_RANGE, {static_cast<uint8_t>(x % 256), static_cast<uint8_t>(x / 256),
+                                          static_cast<uint8_t>(x_end % 256), static_cast<uint8_t>(x_end / 256)});
+    sendCommandData(CMD_SET_RAM_Y_RANGE, {static_cast<uint8_t>(y_end % 256), static_cast<uint8_t>(y_end / 256),
+                                          static_cast<uint8_t>(y % 256), static_cast<uint8_t>(y / 256)});
+    sendCommandData(CMD_SET_RAM_X_COUNTER, {static_cast<uint8_t>(x % 256), static_cast<uint8_t>(x / 256)});
+    sendCommandData(CMD_SET_RAM_Y_COUNTER, {static_cast<uint8_t>(y_end % 256), static_cast<uint8_t>(y_end / 256)});
   }
 
   void writeRamBuffer(uint8_t ramBuffer, const uint8_t* data, uint32_t size) {

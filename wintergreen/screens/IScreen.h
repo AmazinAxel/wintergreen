@@ -21,8 +21,6 @@ class IScreen {
     return app_;
   }
 
-  virtual const char* name() const = 0;
-
   // Called once when this screen becomes active.
   // Draws initial content into buf; caller is responsible for buf.refresh().
   virtual void start(DrawBuffer& buf, IRuntime& runtime) = 0;

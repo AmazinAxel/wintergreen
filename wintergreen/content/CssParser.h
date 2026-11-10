@@ -103,46 +103,6 @@ struct CssRule {
     has_width_pct_ = false;
   }
 
-  // Provide minimal std::optional-like interface for getters
-  struct OptAlignment {
-    const CssRule& r;
-    Alignment value_or(Alignment def) const {
-      return r.has_alignment_ ? r.alignment : def;
-    }
-  };
-  struct OptTextTransform {
-    const CssRule& r;
-    TextTransform value_or(TextTransform def) const {
-      return r.has_text_transform_ ? r.text_transform : def;
-    }
-  };
-  struct OptVerticalAlign {
-    const CssRule& r;
-    VerticalAlign value_or(VerticalAlign def) const {
-      return r.has_vertical_align_ ? r.vertical_align : def;
-    }
-  };
-  struct OptBool {
-    bool has;
-    bool val;
-    bool value_or(bool def) const {
-      return has ? val : def;
-    }
-  };
-  struct OptInt16 {
-    bool has;
-    int16_t val;
-    int16_t value_or(int16_t def) const {
-      return has ? val : def;
-    }
-  };
-  struct OptUint8 {
-    bool has;
-    uint8_t val;
-    uint8_t value_or(uint8_t def) const {
-      return has ? val : def;
-    }
-  };
   struct OptUint16 {
     bool has;
     uint16_t val;
@@ -151,55 +111,6 @@ struct CssRule {
     }
   };
 
-  OptAlignment alignment_opt() const {
-    return {*this};
-  }
-  OptTextTransform text_transform_opt() const {
-    return {*this};
-  }
-  OptVerticalAlign vertical_align_opt() const {
-    return {*this};
-  }
-  OptBool italic_opt() const {
-    return {has_italic_, italic};
-  }
-  OptBool bold_opt() const {
-    return {has_bold_, bold};
-  }
-  OptBool is_float_opt() const {
-    return {has_is_float_, is_float};
-  }
-  OptBool is_hidden_opt() const {
-    return {has_is_hidden_, is_hidden};
-  }
-  OptBool page_break_before_opt() const {
-    return {has_page_break_before_, page_break_before};
-  }
-  OptBool page_break_after_opt() const {
-    return {has_page_break_after_, page_break_after};
-  }
-  OptBool list_style_none_opt() const {
-    return {has_list_style_none_, list_style_none};
-  }
-  OptBool font_variant_small_caps_opt() const {
-    return {has_font_variant_small_caps_, font_variant_small_caps};
-  }
-  OptBool border_top_opt() const {
-    return {has_border_top_, border_top};
-  }
-
-  OptInt16 indent_opt() const {
-    return {has_indent_, indent};
-  }
-  OptUint8 font_size_pct_opt() const {
-    return {has_font_size_pct_, font_size_pct};
-  }
-  OptUint8 line_height_pct_opt() const {
-    return {has_line_height_pct_, line_height_pct};
-  }
-  OptUint16 margin_left_opt() const {
-    return {has_margin_left_, margin_left};
-  }
   OptUint16 margin_right_opt() const {
     return {has_margin_right_, margin_right};
   }
@@ -208,9 +119,6 @@ struct CssRule {
   }
   OptUint16 margin_bottom_opt() const {
     return {has_margin_bottom_, margin_bottom};
-  }
-  OptUint8 width_pct_opt() const {
-    return {has_width_pct_, width_pct};
   }
 
   // Setters
@@ -320,9 +228,6 @@ class CssStylesheet {
   CssStylesheet() = default;
   explicit CssStylesheet(const CssConfig& config) : config_(config) {}
 
-  void set_config(const CssConfig& config) {
-    config_ = config;
-  }
   const CssConfig& config() const {
     return config_;
   }
@@ -340,10 +245,6 @@ class CssStylesheet {
   CssRule get(const char* element, size_t element_len, const char* id, size_t id_len, const char* cls,
               size_t cls_len) const;
 
-  size_t rule_count() const {
-    return rules_.size();
-  }
-
   // Internal selector type (public for inline matching in .cpp)
   struct Selector {
     std::string element;
@@ -359,7 +260,6 @@ class CssStylesheet {
   CssConfig config_;
   std::deque<std::pair<Selector, CssRule>> rules_;
 
-  static std::string filter_comments(const char* css, size_t length);
 };
 
 }  // namespace wintergreen

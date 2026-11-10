@@ -41,7 +41,10 @@ build() {
 }
 
 run() {
-  "$BIN" -o "$OUT" "$SRC"
+  local src
+  src=$(realpath "$SRC")
+  mkdir -p "$OUT"
+  (cd "$OUT" && "$BIN" "$src")
 }
 
 if needs_build; then

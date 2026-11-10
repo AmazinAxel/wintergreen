@@ -1,6 +1,7 @@
 #pragma once
 
 #include <cstdint>
+#include <cstring>
 #include <deque>
 #include <string_view>
 #include <vector>
@@ -47,48 +48,43 @@ inline size_t fit_prefix(const IFont& f, const char* text, size_t len, int budge
   return fit;
 }
 
-// Base class for screens that show a titled list of selectable items.
-// Handles drawing (header font for title, UI font for items with selection bar),
-// up/down navigation with wrapping, scrolling for long lists, and font
-// initialization from embedded data.
+// `text` as it should be drawn in max_w: unchanged when it fits, otherwise the
+// longest prefix that leaves room for "..." (via fit_prefix, so whole UTF-8
+// sequences only) with the ellipsis appended, built in `out`. When not even one
+// character fits beside it the ellipsis is drawn alone, so the row still reads
+// as "there is text here". The one truncation routine every screen uses.
+inline std::string_view ellipsize(const IFont& f, const char* text, size_t len, int max_w, char (&out)[260]) {
+  if (static_cast<int>(f.word_width(text, len, FontStyle::Regular)) <= max_w)
+    return {text, len};
+  static constexpr char kEll[] = "...";
+  const size_t fit = fit_prefix(f, text, len, max_w - f.word_width(kEll, 3, FontStyle::Regular));
+  const size_t cp = fit < sizeof(out) - 4 ? fit : sizeof(out) - 4;
+  std::memcpy(out, text, cp);
+  std::memcpy(out + cp, kEll, 3);
+  return {out, cp + 3};
+}
+
+// Base class for screens that show a list of selectable items: the item
+// storage, up/down navigation with wrapping and hold-repeat, scrolling, and the
+// battery header. Its own draw pass is the book list's two-line rows; the home
+// carousel and the quick menu inherit the machinery and draw everything
+// themselves (draw_all_).
 //
 // Subclasses implement:
-//   on_start()      — set title, populate items via add_item()
-//   on_select(index) — handle item selection; return true to stay, false to exit
-//   on_back()       — handle back button; return true to stay, false to exit (default)
+//   on_start()      — populate items via add_item()
+//   on_select(index) — handle item selection
+//   on_back()       — handle back button (default: pop)
 class ListMenuScreen : public IScreen {
  public:
   void start(DrawBuffer& buf, IRuntime& runtime) override;
   void stop() override {}
   void update(const ButtonState& buttons, DrawBuffer& buf, IRuntime& runtime) override;
 
-  int selected_index() const {
-    return selected_;
-  }
-  void set_initial_selection(int index) {
-    initial_selection_ = index;
-  }
-
  protected:
-  const char* title_ = nullptr;
-  const char* title2_ = nullptr;
-
-  std::string subtitle_;
-  std::string subtitle2_;
-
-  // Two-line rows (title + subtitle, full-width divider, right-hand column) instead of
-  // the default centred single-line rows. Set by book-list style screens.
-  bool detail_list_ = false;
-  // Title lines a detail row reserves. With 2 the title word-wraps onto a second
-  // line and the row keeps that height even for a one-line title, so every book
-  // row is the same size and its cover gets the room. Set by MainMenu.
+  // Title lines a row reserves. With 2 the title word-wraps onto a second line
+  // and the row keeps that height even for a one-line title, so every book row
+  // is the same size and its cover gets the room. Set by MainMenu.
   int detail_title_lines_ = 1;
-
-  // Plain chrome: centred title header and the battery/nav-glyph footer, instead of the
-  // standard "wintergreen" status bar and labelled nav boxes. Used by overlay-style
-  // screens (chapter select, links) that appear on top of the reader.
-  bool plain_list_ = false;
-
 
   void add_item(const std::string& label, int indent = 0) {
     owned_strings_.push_back(label);
@@ -101,12 +97,6 @@ class ListMenuScreen : public IScreen {
     labels_.push_back(label);
     indents_.push_back(indent);
   }
-  void set_item_label(int index, const std::string& label) {
-    if (index >= 0 && index < static_cast<int>(labels_.size())) {
-      owned_strings_.push_back(label);
-      labels_[index] = std::string_view(owned_strings_.back());
-    }
-  }
   void clear_items() {
     labels_.clear();
     owned_strings_.clear();
@@ -115,8 +105,7 @@ class ListMenuScreen : public IScreen {
     scroll_offset_ = 0;
   }
   // Free all item storage without touching selected_/scroll_offset_.
-  // Call from stop() to release RAM while preserving the cursor position
-  // for the fallback path in ListMenuScreen::start().
+  // Call from stop() to release RAM while preserving the cursor position.
   void free_items_storage() {
     { std::vector<std::string_view> tmp; labels_.swap(tmp); }
     { std::deque<std::string> tmp; owned_strings_.swap(tmp); }
@@ -128,21 +117,20 @@ class ListMenuScreen : public IScreen {
     selected_ = index;
     on_start_set_selection_ = true;
   }
-  // No screen inserts separator items any more; MainMenu overrides this to mark
-  // the hairline divider it derives from its own entry list.
+  // MainMenu overrides this to mark the hairline dividers it derives from its
+  // own entry list.
   virtual bool is_separator(int) const {
     return false;
   }
   // Returns true if the cursor may land on this item. Default: not a separator.
-  // Override to additionally exclude theme-irrelevant items.
   virtual bool is_item_focusable(int index) const { return !is_separator(index); }
   // A row that never has a subtitle (MainMenu's Sync action) and is therefore
   // one line tall instead of two. Two-line rows are the default.
   virtual bool is_single_line_row(int) const { return false; }
 
-  // Separator geometry, shared by every list in the tree — the book list, the
-  // book-details list and QuickmenuScreen's own draw pass — so a hairline
-  // sits in the same gap wherever it appears. Do not re-declare a local kSepH.
+  // Separator geometry, shared by every list in the tree — the book list and
+  // QuickmenuScreen's own draw pass — so a hairline sits in the same gap
+  // wherever it appears. Do not re-declare a local kSepH.
   static constexpr int kSeparatorH = 14;
   static void draw_separator_(DrawBuffer& buf, int W, int y) {
     buf.fill_rect(0, y + kSeparatorH / 2, W, 1, false);
@@ -163,15 +151,13 @@ class ListMenuScreen : public IScreen {
     return {};
   }
 
-  // secondary line below the item label (e.g. author, read time, setting value).
-  // Default returns empty (no subtitle). Override per screen.
+  // Second line below the item label (the author). Default: none.
   virtual std::string_view get_item_subtitle(int index) const { return {}; }
 
-  // detail_list_ rows: right-aligned text on the title line (e.g. read time, "–").
-  // Default returns empty (no right column). Override per screen.
+  // Right-aligned text on the subtitle line (the reading percentage).
   virtual std::string_view get_item_right(int index) const { return {}; }
 
-  // detail_list_ rows: a 1 bpp image at the right-hand end (MainMenu's covers).
+  // A 1 bpp image at the right-hand end of a row (MainMenu's covers).
   // MSB first, bit clear = ink, rows (w + 7) / 8 bytes apart.
   struct Thumb {
     const uint8_t* bits = nullptr;
@@ -186,15 +172,7 @@ class ListMenuScreen : public IScreen {
   // frame in its place.
   virtual bool get_item_thumb(int index, Thumb& out) const { return false; }
 
-  // left side of the top bar header (e.g. "X books", "Settings").
-  // Default returns title_ if set. Override per screen.
-  virtual std::string wintergreen_header_left() const { return title_ ? title_ : ""; }
-
-  // section title drawn in header_font_ below the status bar.
-  // Empty = no section title row. Override in screens that need a page heading.
-  virtual std::string wintergreen_section_title() const { return {}; }
-
-  // Called during start(). Set title_ and call add_item() to populate the list.
+  // Called during start(). Call add_item() to populate the list.
   virtual void on_start() = 0;
 
   // Called when user presses select on an item.
@@ -203,11 +181,8 @@ class ListMenuScreen : public IScreen {
   // Called when user presses back.
   virtual void on_back();
 
- protected:
-  BitmapFont ui_font_;
-  BitmapFont header_font_;
-  BitmapFont subtitle_font_;   // always small; used for item subtitles and tight labels
-  BitmapFont section_font_;    // one step below ui_font_; use for APPEARANCE/NAVIGATE etc.
+  BitmapFont ui_font_;       // the 32 px header face: list rows and titles
+  BitmapFont section_font_;  // one step below ui_font_: authors, percentages, the battery
 
   // The battery percentage, top right. Every screen calls this — the position is
   // fixed here rather than per-screen so the header does not shift by a pixel
@@ -218,25 +193,15 @@ class ListMenuScreen : public IScreen {
 
   // Height the battery row occupies, from the top of the panel.
   int battery_row_h_() const {
-    const BitmapFont& bf = section_font_.valid() ? section_font_ : ui_font_;
-    return kBatteryPadY + (bf.valid() ? bf.y_advance() : 0);
+    return kBatteryPadY + section_font_.y_advance();
   }
 
   void request_redraw() {
     force_redraw_ = true;
   }
 
-  // Re-run start() to rebuild items with updated settings (e.g. after font change).
-  void restart() {
-    if (buf_ && runtime_)
-      start(*buf_, *runtime_);
-  }
-
   virtual void draw_all_(DrawBuffer& buf, std::optional<uint8_t> battery_pct = std::nullopt) const;
   virtual void ensure_visible_();
-  void set_scroll_offset_(int v) { scroll_offset_ = v; }
-  int current_height_() const { return buf_ ? buf_->height() : 0; }
-  Rotation current_rotation_() const { return buf_ ? buf_->rotation() : Rotation::Deg90; }
   void set_buf_rotation_(Rotation r) { if (buf_) buf_->set_rotation(r); }
   void center_on_selected_();
 
@@ -251,7 +216,6 @@ class ListMenuScreen : public IScreen {
 
   int selected_ = 0;
   int scroll_offset_ = 0;
-  int initial_selection_ = -1;
   HoldRepeat hold_up_;
   HoldRepeat hold_down_;
   int hold_reps_up_ = 0;    // repeats fired so far this hold; drives the step size
@@ -261,17 +225,11 @@ class ListMenuScreen : public IScreen {
   bool force_redraw_ = false;
 
   DrawBuffer* buf_ = nullptr;
-  IRuntime* runtime_ = nullptr;
 
-  // Computes the header height (title + subtitles) without drawing anything.
-  // Used by ensure_visible_() and center_on_selected_() before a draw pass.
-  int compute_header_h_() const;
+  // Header height: the battery row and its gap. draw_all_ and the scroll maths
+  // both use this, so they cannot disagree about where the list starts.
+  int header_h_() const;
 
-  // 1. Draws title, title2, and subtitles. Returns the header height (pixels from y=0 to
-  //    where list items may start).
-  int draw_header_(DrawBuffer& buf, int W, int H, std::optional<uint8_t> battery_pct = {}) const;
-
-  // height of one list item slot (title + subtitle + padding + divider).
   // Height of one item slot. Pass a row index for a per-row height (single-line
   // rows are shorter); -1 gives the two-line default.
   int wintergreen_slot_h_(int index = -1) const;
@@ -280,13 +238,8 @@ class ListMenuScreen : public IScreen {
   // Accounts for separator items being shorter than regular slots.
   int wintergreen_visible_from_(int scroll_off, int available_h) const;
 
-  // 2. Draws the battery bar and button-hint glyphs at the bottom of the screen.
-  //    Returns the height reserved at the bottom (list items must stay above this).
-  int draw_bottom_(DrawBuffer& buf, int W, int H, std::optional<uint8_t> battery_pct) const;
-
-  // 3. Draws the scrollable item list, scrollbar, and area-boundary indicator lines,
-  //    given the already-known header and bottom heights.
-  void draw_list_(DrawBuffer& buf, int W, int H, int header_h, int bottom_h) const;
+  // Draws the scrollable item list and scrollbar below header_h.
+  void draw_list_(DrawBuffer& buf, int W, int H, int header_h) const;
 };
 
 }  // namespace wintergreen

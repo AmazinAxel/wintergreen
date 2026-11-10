@@ -99,28 +99,16 @@ static bool convert_one(const fs::path& epub, const fs::path& out_dir, bool verb
 }
 
 int main(int argc, char** argv) {
-  std::vector<fs::path> inputs;
-  fs::path out_dir = ".";
-  bool verbose = true;
-
-  for (int i = 1; i < argc; ++i) {
-    const std::string a = argv[i];
-    if (a == "-o" && i + 1 < argc) {
-      out_dir = argv[++i];
-    } else if (a == "-q") {
-      verbose = false;
-    } else if (a == "-h" || a == "--help") {
-      std::fprintf(stderr,
-                   "usage: epub2wgb [-o OUTDIR] [-q] <file.epub | directory> ...\n"
-                   "  Writes OUTDIR/<book name>/book.wgb for each input EPUB.\n");
-      return 0;
-    } else {
-      inputs.push_back(a);
-    }
-  }
+  // No flags: every argument is an input, output always lands in the current
+  // directory. preprocess.fish is the only intended caller.
+  const fs::path out_dir = ".";
+  const bool verbose = true;
+  const std::vector<fs::path> inputs(argv + 1, argv + argc);
 
   if (inputs.empty()) {
-    std::fprintf(stderr, "epub2wgb: no input. Try --help.\n");
+    std::fprintf(stderr,
+                 "usage: epub2wgb <file.epub | directory> ...\n"
+                 "  Writes ./<epub stem>/book.wgb for each input EPUB.\n");
     return 2;
   }
 

@@ -2,7 +2,6 @@
 
 #include <cstdint>
 
-#include "FontManager.h"
 #include "Input.h"
 #include "Runtime.h"
 #include "ScreenManager.h"
@@ -45,11 +44,10 @@ enum class ScreenId : uint8_t {
 // lower than what is measured here.
 inline constexpr uint16_t kLowBatteryCutoffMv = 3200;
 
-// Two orientations only. The reversed ones (Deg270/Deg180) were dropped: they
-// are the same physical hold as their counterparts, so they earned a settings
-// toggle that did nothing a user could see except confuse the paging maps —
-// portrait is Deg90 *or* Deg270 and landscape is Deg0 *or* Deg180, and code that
-// checked for one exact value behaved wrongly in the reversed case.
+// Two orientations only. The reversed ones were dropped, and with them every
+// drawing branch for them: they are the same physical hold as their
+// counterparts, so they earned a settings toggle that did nothing a user could
+// see except confuse the paging maps.
 inline Rotation rotation_from_setting(uint8_t v) {
   return v == 1 ? Rotation::Deg0 : Rotation::Deg90;
 }
@@ -104,19 +102,16 @@ class Application {
     reader_font_ = fonts;
     reader_.set_fonts(fonts);
   }
-  void set_font_manager(FontManager* fm) {
-    font_manager_ = fm;
-  }
-  FontManager* font_manager() const {
-    return font_manager_;
+  // Null only when the font partition is missing, in which case no book opens.
+  const BitmapFontSet* reader_font() const {
+    return reader_font_;
   }
 
   ReaderScreen* reader() {
     return &reader_;
   }
-  // Returns true when the Reader is the top/active screen — used by the main
-  // loop to decide whether scratch-needing index ops (Add/Rename) must be
-  // deferred to avoid corrupting display buffers the Reader is rendering to.
+  // Returns true when the Reader is the top/active screen. The main loop defers
+  // serial Add/Rename index ops while it is, and the clicker swaps its keys.
   bool is_reader_active() const {
     return screen_mgr_.top() == &reader_;
   }
@@ -128,9 +123,6 @@ class Application {
   }
   MainMenu* main_menu() {
     return &menu_;
-  }
-  HomeScreen* home_screen() {
-    return &home_;
   }
 
   // Only the reader has an orientation setting (the in-book quick menu flips
@@ -275,7 +267,6 @@ class Application {
   int pending_pop_count_ = 0;
 
   const BitmapFontSet* reader_font_ = nullptr;
-  FontManager* font_manager_ = nullptr;
 
   IScreen* screen_for_(ScreenId id);
 };

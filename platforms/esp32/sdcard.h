@@ -49,7 +49,3 @@ inline bool sd_init() {
 
   return true;
 }
-
-inline bool sd_mounted() {
-  return sd_card_ != nullptr;
-}

@@ -86,12 +86,9 @@ one physical control whose ends swap places when the device is turned, so
 Front buttons are fixed to the panel: Button2 next, Button3 previous, both
 orientations.
 
-Portrait is `Deg90` **or** `Deg270`, landscape `Deg0` **or** `Deg180` — the reversed
-orientations are the same physical hold, so a check written as `rotation() == Deg0`
-leaves flipped-landscape behaving like portrait. That bug was present in the reader's
-layout padding and is fixed. The reversed orientations are no longer reachable
-(`rotate_reader` is 0 or 1, and both setter and loader clamp), but the `Rotation` enum
-keeps all four values for the panel driver, so the hazard applies to any new check.
+`Rotation` has two values: `Deg90` (portrait) and `Deg0` (landscape). The reversed
+orientations were the same physical hold and are gone from the enum along with every
+drawing branch for them, so `rotation() == Deg0` is a complete landscape test.
 
 5 ms button sampling (`input.h`) under a 25 ms UI frame (`main.cpp`). **An input edge
 ends the frame wait early** (`ui_wake.h`: the sampler and the clicker give a binary
@@ -140,7 +137,7 @@ only yields, so any wait loop using it spins the CPU flat out. `epd.h`'s
 ## The power button
 
 GPIO3, the only non-ADC key, handled entirely in `Application::update`, not by any
-screen. Held for `kPowerHoldSleepMs` it sleeps; released sooner it is forwarded to the
+screen. Held for `kHoldDelayMs` it sleeps; released sooner it is forwarded to the
 top screen as a synthetic `Button1` (Confirm), so "select" and "open the quick menu"
 come for free. `power_confirm_` marks that frame's Confirm as the power key so the
 reader can open its quick menu on the top setting for it and on the current chapter

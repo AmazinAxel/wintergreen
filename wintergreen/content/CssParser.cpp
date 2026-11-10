@@ -558,28 +558,6 @@ uint32_t CssStylesheet::Selector::specificity() const {
 // CssStylesheet
 // ---------------------------------------------------------------------------
 
-std::string CssStylesheet::filter_comments(const char* css, size_t length) {
-  std::string result;
-  result.reserve(length);
-  size_t i = 0;
-  while (i < length) {
-    if (i + 1 < length && css[i] == '/' && css[i + 1] == '*') {
-      i += 2;
-      while (i + 1 < length) {
-        if (css[i] == '*' && css[i + 1] == '/') {
-          i += 2;
-          break;
-        }
-        ++i;
-      }
-    } else {
-      result += css[i];
-      ++i;
-    }
-  }
-  return result;
-}
-
 void CssStylesheet::extend_from_sheet(const char* css, size_t length) {
   std::string sheet_copy(css, length);
   extend_from_mut_sheet(sheet_copy.data(), sheet_copy.size());

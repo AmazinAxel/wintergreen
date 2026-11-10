@@ -56,24 +56,10 @@ class Book {
     return epub_.chapter_count();
   }
 
-  EpubError load_chapter(size_t index, Chapter& out);
-
   // Stream-parse a chapter: paragraphs emitted via callback, ~37KB working memory.
   // id_sink (optional): called for each element with id="" in the XHTML source.
   EpubError load_chapter_streaming(size_t index, ParagraphSink sink, void* sink_ctx, uint8_t* work_buf,
                                    uint8_t* xml_buf, IdSink id_sink = nullptr, void* id_sink_ctx = nullptr);
-
-  // Extract and decode an image from the EPUB (by zip entry index).
-  // Returns the 1-bit dithered bitmap. The caller owns the memory.
-  // max_w/max_h: maximum output dimensions (0 = no limit).
-  // work_buf: optional caller-provided scratch (>= ZipEntryInput::kMinWorkBufSize).
-  //   On ESP32, pass queue.scratch_buf1() to avoid a 45 KB heap allocation.
-  //   If nullptr (or too small), the buffer is heap-allocated internally.
-  ImageError decode_image(uint16_t entry_index, DecodedImage& out, uint16_t max_w = 0, uint16_t max_h = 0,
-                          uint8_t* work_buf = nullptr, size_t work_buf_size = 0);
-
-  // Extract raw image data (for format detection, etc).
-  ZipError extract_entry(uint16_t entry_index, std::vector<uint8_t>& out);
 
   // Read only the image dimensions (width/height) without decoding.
   // work_buf/work_size: optional pre-allocated scratch (must be >= ~45 KB, see kWorkSize).

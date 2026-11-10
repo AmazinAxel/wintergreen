@@ -1,7 +1,5 @@
 #pragma once
 
-#include <cstdio>
-
 #include "display/DrawBuffer.h"
 #include "screens/IScreen.h"
 
@@ -75,10 +73,6 @@ class ScreenManager {
     }
   }
 
-  void pop(DrawBuffer& buf, IRuntime& runtime) {
-    pop(1, buf, runtime);
-  }
-
   IScreen* top() const {
     return depth_ > 0 ? stack_[depth_ - 1] : nullptr;
   }
@@ -90,9 +84,6 @@ class ScreenManager {
   }
   int depth() const {
     return depth_;
-  }
-  bool empty() const {
-    return depth_ == 0;
   }
 
  private:

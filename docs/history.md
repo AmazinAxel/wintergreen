@@ -207,3 +207,20 @@ read. One tree walk now, with `iterate_books` templated on its callback rather t
 
 **The 3-second post-flash boot delay** on `ESP_RST_SW`, which existed so a serial monitor could
 attach. There is no serial monitor output any more.
+
+**The /optimize pass (2026-10-25)**, dead or duplicated code only unless noted:
+`Rotation::Deg180`/`Deg270` and every draw branch for them; the gray-plane plumbing
+(`GrayPlane`, `GlyphData::gray_*`, `has_grayscale`) and `IFont::underline_*`;
+`ListMenuScreen`'s plain header, book-details card, centred rows and footer, with
+`title_`/`title2_`/`subtitle_`/`subtitle2_`/`plain_list_`/`detail_list_` and the 14 px
+`ui_font_small.h`; `IScreen::name()`; the reader's `FixedFont` fallback and
+"Failed to open book" path (no font = the book does not open); every empty-state string;
+`verify_ota()` (rollback is disabled, so nothing is ever PENDING_VERIFY); serial `SIMG` and
+`Z` (nothing reads `/sdcard/sleep/`); the BSSID/channel NVS hint; `stb_image.h` and the
+buffer `decode_image()` / `floyd_steinberg_dither` it served. The glyph and blit code moved
+out of `DrawBuffer.h` into `DrawBuffer.cpp`, where it had been cloned into four TUs, and
+both rotations now blit a byte at a time.
+Second pass (2026-10-26): serial `L` reads the index file only (it read `BookIndex` from the
+serial task, a data race); `Application::font_manager()` and `kFontSizeNames`; the reserved
+chapter-table words and the device-side TOC `fragment`; make_font.py's 5-level gray path
+(`--mono` now a no-op). The home cover moved from a heap vector into the spare framebuffer.

@@ -175,14 +175,6 @@ std::string Epub::resolve_path(const std::string& base_dir, const std::string& h
   return dir + path;
 }
 
-int Epub::find_entry_index(const std::string& path) const {
-  for (size_t i = 0; i < zip_.entry_count(); ++i) {
-    if (zip_.entry(i).name == path)
-      return static_cast<int>(i);
-  }
-  return -1;
-}
-
 // ---------------------------------------------------------------------------
 // Container.xml parsing
 // ---------------------------------------------------------------------------
@@ -1896,80 +1888,6 @@ static EpubError parse_xhtml_events(XmlReader& reader, const CssStylesheet* inli
     }
   }
 
-  return EpubError::Ok;
-}
-
-EpubError parse_xhtml_body(const uint8_t* data, size_t size, const CssStylesheet* inline_css,
-                           const CssStylesheet* extern_css, const std::string& base_dir, const ZipReader& zip,
-                           std::vector<Paragraph>& out) {
-  MemoryXmlInput input(data, size);
-  // Use a buffer large enough for the full XHTML to avoid streaming boundary issues.
-  std::vector<uint8_t> buf(std::max(size + 1, size_t(4096)));
-  XmlReader reader;
-  if (reader.open(input, buf.data(), buf.size()) != XmlError::Ok) {
-    return EpubError::XmlError;
-  }
-
-  BodyParser parser;
-  EpubError err = parse_xhtml_events(reader, inline_css, extern_css, nullptr, base_dir, zip, parser);
-  if (err != EpubError::Ok)
-    return err;
-
-  out = parser.finish();
-  return EpubError::Ok;
-}
-
-// ---------------------------------------------------------------------------
-// Epub::parse_chapter
-// ---------------------------------------------------------------------------
-
-EpubError Epub::parse_chapter(IZipFile& file, size_t index, Chapter& out) const {
-  if (index >= spine_.size())
-    return EpubError::InvalidData;
-
-  auto& spine_item = spine_[index];
-  auto& entry = zip_.entry(spine_item.file_idx);
-
-  // Find title from TOC
-  out.title.reset();
-  for (auto& toc_entry : toc_.entries) {
-    if (toc_entry.file_idx == spine_item.file_idx) {
-      out.title = toc_entry.label.to_string(toc_.pool);
-      break;
-    }
-  }
-
-  // Extract chapter XHTML
-  std::vector<uint8_t> data;
-  if (zip_.extract(file, entry, data) != ZipError::Ok) {
-    return EpubError::ZipError;
-  }
-
-  // Determine base directory
-  std::string base_dir;
-  auto slash = entry.name.rfind('/');
-  if (slash != std::string_view::npos) {
-    base_dir = entry.name.substr(0, slash + 1);
-  }
-
-  // Allocate a work buffer for CSS extraction (desktop/test — heap is not fragmented here).
-  static constexpr size_t kCssWorkBufSize = ZipEntryInput::kMinWorkBufSize + 1024;
-  std::vector<uint8_t> css_work_buf(kCssWorkBufSize);
-  CssContext ctx{&file, &zip_, &css_cache_, css_config_, &base_dir, css_cache_.current_gen(),
-                 css_work_buf.data(), kCssWorkBufSize};
-
-  MemoryXmlInput input(data.data(), data.size());
-  std::vector<uint8_t> xml_buf_vec(std::max(data.size() + 1, size_t(4096)));
-  XmlReader reader;
-  if (reader.open(input, xml_buf_vec.data(), xml_buf_vec.size()) != XmlError::Ok)
-    return EpubError::XmlError;
-
-  BodyParser parser;
-  EpubError err = parse_xhtml_events(reader, nullptr, nullptr, &ctx, base_dir, zip_, parser);
-  if (err != EpubError::Ok)
-    return err;
-
-  out.paragraphs = parser.finish();
   return EpubError::Ok;
 }
 

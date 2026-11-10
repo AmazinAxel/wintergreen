@@ -1,8 +1,6 @@
 #pragma once
 
 #include <cstdio>
-#include <functional>
-#include <memory>
 #include <string>
 #include <vector>
 
@@ -13,9 +11,8 @@
 
 namespace wintergreen {
 
-// Reads an WGB file.  Loads the chapter table and image refs into RAM on
-// open(), then provides paragraph loading by file offset.  Paragraphs are
-// linked (prev/next offsets) so they can be traversed sequentially.
+// Reads a WGB file. Loads the chapter table and image refs into RAM on
+// open(), then provides paragraph loading by file offset.
 class WgbReader {
  public:
   WgbReader() = default;
@@ -51,12 +48,9 @@ class WgbReader {
   // Sum of char_count across all chapters (0 if not stored, i.e. old WGB file).
   uint64_t total_char_count() const;
 
-  // Load a single paragraph at a given file offset.
-  // On success, fills `out` and sets ok = true.
-  struct LoadResult {
-    bool ok = false;
-  };
-  LoadResult load_paragraph(uint32_t file_offset, Paragraph& out);
+  // Load a single paragraph at a given file offset. False on any read or
+  // format error.
+  bool load_paragraph(uint32_t file_offset, Paragraph& out);
 
   // Image references
   const WgbImageRef& image_ref(uint16_t index) const {
@@ -78,8 +72,6 @@ class WgbReader {
     return toc_;
   }
 
-  // Returns true and sets para_idx if found; returns false if not found.
-
  private:
   FILE* f_ = nullptr;
   WgbHeader header_{};
@@ -88,9 +80,16 @@ class WgbReader {
   EpubMetadata metadata_;
   TableOfContents toc_;
 
+  // Staging for one paragraph body, reused across loads so a page turn that
+  // pulls in new paragraphs does not malloc and free a block per paragraph —
+  // short-lived blocks of varying size are what fragment this heap. Capacity is
+  // monotonic up to kBodyKeepBytes; a rare larger body is released after use.
+  static constexpr size_t kBodyKeepBytes = 8 * 1024;
+  std::vector<uint8_t> body_;
+
   bool read_bytes(void* buf, size_t size);
-  bool read_at(uint32_t offset, void* buf, size_t size);
   std::string read_string();
+  bool parse_paragraph_(uint8_t type, Paragraph& out);
   bool deserialize_text(const uint8_t* data, size_t size, Paragraph& out);
 
   friend class WgbChapterSource;
@@ -100,9 +99,8 @@ class WgbReader {
 // IParagraphSource backed by WgbReader — loads paragraphs on demand
 // for a single chapter, with a sliding-window cache.
 //
-// On construction, scans the chapter's linked list to build a local
-// vector of file offsets (~4 bytes per paragraph).  This replaces the
-// old global paragraph index that was stored in the WGB file.
+// On construction, reads the chapter's paragraph descriptor table into a local
+// vector of file offsets (~4 bytes per paragraph).
 //
 // Only kWindowSize paragraphs are kept in memory at once. When a
 // paragraph outside the window is requested, the window slides to
@@ -170,18 +168,6 @@ class WgbChapterSource : public IParagraphSource {
     return total_chars_;
   }
 
-  // Shrink the live window while a radio holds the heap, freeing the text and
-  // run vectors of every slot above the limit.
-  //
-  // **Only safe between pages**, never mid-layout: LayoutWord::text points into
-  // these slots, so dropping one under a laid-out page leaves dangling
-  // pointers. It is called from Application::release_ram_for_radio(), which
-  // also clears the page and paragraph caches that hold those pointers — the
-  // three have to happen together or not at all.
-  //
-  // The vectors themselves are not resized: that would move the Paragraph
-  // objects and dangle the same pointers by another route. Only the contents
-  // above the limit are released, and find_slot_ stops handing them out.
   // **Do not add a way to shrink this window. It was tried and it corrupts the
   // displayed page.** Freeing slots above a limit — even keeping the current
   // paragraph and its neighbours — produced text drawn from freed memory:
@@ -205,7 +191,7 @@ class WgbChapterSource : public IParagraphSource {
     // Not in window — find a free slot or evict the furthest entry
     size_t slot = find_slot_(index);
     slot_index_[slot] = static_cast<uint32_t>(index);
-    if (!reader_.load_paragraph(offsets_[index], slots_[slot]).ok)
+    if (!reader_.load_paragraph(offsets_[index], slots_[slot]))
       slots_[slot] = Paragraph{};
     return slots_[slot];
   }
@@ -217,7 +203,6 @@ class WgbChapterSource : public IParagraphSource {
   uint32_t total_chars_ = 0;                 // total chars in this chapter
   mutable std::vector<Paragraph> slots_;
   mutable std::vector<uint32_t> slot_index_;  // UINT32_MAX = empty
-  // Slots find_slot_ may hand out; the whole window normally, fewer while a
 
   // Find best slot: prefer empty, then evict the one furthest from `index`
   size_t find_slot_(size_t index) const {
@@ -237,13 +222,6 @@ class WgbChapterSource : public IParagraphSource {
   }
 };
 
-// ---------------------------------------------------------------------------
-// Build an ImageSizeQuery that resolves image dimensions from an WGB file.
-// Fast path: width/height stored in WgbImageRef (from HTML attributes).
-// Slow path: stream the image header from the EPUB local file entry.
-// Scales to fit max_w preserving aspect ratio. Results are cached.
-// Mirrors the logic in ReaderScreen::resolve_image_size_().
-// ---------------------------------------------------------------------------
 // Image dimensions, straight out of the image table.
 //
 // The table is authoritative: the converter rasterised every image to the size

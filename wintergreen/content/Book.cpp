@@ -55,29 +55,9 @@ void Book::close() {
   file_open_ = false;
 }
 
-EpubError Book::load_chapter(size_t index, Chapter& out) {
-  return epub_.parse_chapter(file_, index, out);
-}
-
 EpubError Book::load_chapter_streaming(size_t index, ParagraphSink sink, void* sink_ctx, uint8_t* work_buf,
                                        uint8_t* xml_buf, IdSink id_sink, void* id_sink_ctx) {
   return epub_.parse_chapter_streaming(file_, index, sink, sink_ctx, work_buf, xml_buf, id_sink, id_sink_ctx);
-}
-
-ImageError Book::decode_image(uint16_t entry_index, DecodedImage& out, uint16_t max_w, uint16_t max_h,
-                              uint8_t* work_buf, size_t work_buf_size) {
-  if (entry_index >= epub_.zip().entry_count())
-    return ImageError::UnsupportedFormat;
-
-  auto& entry = epub_.zip().entry(entry_index);
-  return decode_image_from_entry(file_, entry, max_w, max_h, out, work_buf, work_buf_size, /*scale_to_fill=*/true);
-}
-
-ZipError Book::extract_entry(uint16_t entry_index, std::vector<uint8_t>& out) {
-  if (entry_index >= epub_.zip().entry_count())
-    return ZipError::InvalidData;
-  auto& entry = epub_.zip().entry(entry_index);
-  return epub_.zip().extract(file_, entry, out);
 }
 
 bool Book::read_image_size(uint16_t entry_index, uint16_t& w, uint16_t& h, uint8_t* work_buf, size_t work_size) {
@@ -305,16 +285,6 @@ bool Book::write_sleep_cover_bin(const char* cover_path, int W, int H,
   std::fclose(f);
   if (!ok) { std::remove(cover_path); return false; }
   return true;
-}
-
-static std::string epub_stem_(const char* epub_path) {
-  const char* p = epub_path;
-  const char* slash = nullptr;
-  for (const char* c = p; *c; ++c)
-    if (*c == '/' || *c == '\\') slash = c;
-  const char* name = slash ? slash + 1 : p;
-  const char* dot = std::strrchr(name, '.');
-  return dot ? std::string(name, static_cast<size_t>(dot - name)) : std::string(name);
 }
 
 }  // namespace wintergreen

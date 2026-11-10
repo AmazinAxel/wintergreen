@@ -39,6 +39,7 @@ unit blank_para_test $LAYOUT
 unit book_index_test wintergreen/content/BookIndex.cpp $READER
 # shellcheck disable=SC2086
 unit stretch_lut_test $DECODE
+unit blit_test wintergreen/display/DrawBuffer.cpp $LAYOUT
 
 books=()
 epubs=()
@@ -59,7 +60,10 @@ if ((${#epubs[@]})); then
     -DCMAKE_CXX_FLAGS="$SAN" -DCMAKE_C_FLAGS="-fsanitize=address" \
     -DCMAKE_EXE_LINKER_FLAGS="$SAN" >/dev/null
   cmake --build "$WORK/epub2wgb" -j "$(nproc)" >/dev/null
-  if "$WORK/epub2wgb/epub2wgb" -o "$WORK/books" "${epubs[@]}" >"$WORK/convert.log" 2>&1; then
+  abs=()
+  for e in "${epubs[@]}"; do abs+=("$(realpath "$e")"); done
+  mkdir -p "$WORK/books"
+  if (cd "$WORK/books" && "$WORK/epub2wgb/epub2wgb" "${abs[@]}") >"$WORK/convert.log" 2>&1; then
     echo "  ok   epub2wgb"
   else
     echo "  FAIL epub2wgb"; sed 's/^/       /' "$WORK/convert.log" | tail -20; fail=1

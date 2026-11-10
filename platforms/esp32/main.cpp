@@ -5,7 +5,6 @@
 #include "driver/usb_serial_jtag.h"
 #include "epd.h"
 #include "esp_heap_caps.h"
-#include "esp_ota_ops.h"
 #include "esp_sleep.h"
 #include "esp_system.h"
 #include "esp_timer.h"
@@ -27,19 +26,21 @@
 // milliseconds of each wake spent on UART output nobody reads. This suppresses
 // it for the next wake only, which is why it is set on each entry. A cold power-on
 // still prints, so a device on the bench still says what it is.
+//
+// Wake is the power button, level-triggered on LOW.
+static constexpr gpio_num_t kPowerPin = GPIO_NUM_3;
+
 [[noreturn]] static void deep_sleep_now_() {
+  esp_sleep_enable_gpio_wakeup_on_hp_periph_powerdown(1ULL << kPowerPin, ESP_GPIO_WAKEUP_GPIO_LOW);
   esp_deep_sleep_disable_rom_logging();
   esp_deep_sleep_start();
 }
 
-static void verify_ota() {
-  const esp_partition_t* running = esp_ota_get_running_partition();
-  esp_ota_img_states_t ota_state;
-  if (esp_ota_get_state_partition(running, &ota_state) == ESP_OK) {
-    if (ota_state == ESP_OTA_IMG_PENDING_VERIFY) {
-      esp_ota_mark_app_valid_cancel_rollback();
-    }
-  }
+// The wake source is level-triggered on LOW, so sleeping with the power button
+// still down would wake straight back up. Bounded, in case the pin is stuck.
+static void wait_power_release_() {
+  for (uint32_t waited = 0; waited < 5000 && gpio_get_level(kPowerPin) == 0; waited += 10)
+    vTaskDelay(pdMS_TO_TICKS(10));
 }
 
 // When the device boots on battery (no USB), require the power button to be
@@ -47,7 +48,6 @@ static void verify_ota() {
 // A brief accidental touch goes back to sleep immediately without any display
 // activity, just like the original wintergreen firmware.
 // Exception: software resets (e.g. after esptool flash) boot immediately.
-static constexpr gpio_num_t kPowerPin = GPIO_NUM_3;
 static constexpr uint32_t kPowerWakeupMs = 50;
 
 // True when a USB host is attached.
@@ -99,11 +99,8 @@ static void verify_wakeup_press() {
   }
 
   // Short press — go back to sleep; wake again on power button press.
-  esp_sleep_enable_gpio_wakeup_on_hp_periph_powerdown(1ULL << kPowerPin, ESP_GPIO_WAKEUP_GPIO_LOW);
   deep_sleep_now_();
 }
-
-
 
 // Refuse to come up on a flat cell.
 //
@@ -138,7 +135,6 @@ static void verify_battery(const Esp32Runtime& runtime) {
   }
   if (sum / 8 >= wintergreen::kLowBatteryCutoffMv)
     return;
-  esp_sleep_enable_gpio_wakeup_on_hp_periph_powerdown(1ULL << kPowerPin, ESP_GPIO_WAKEUP_GPIO_LOW);
   deep_sleep_now_();
 }
 
@@ -185,7 +181,8 @@ static constexpr size_t kOomReserveBytes = 12 * 1024;
 //
 // The BT controller wants a contiguous allocation out of the single ~50 KB
 // internal DRAM pool this device has (see the note in bluetooth_clicker.h).
-// Reserving 28 KB of that pool at boot left too little for it: the connect
+// Reserving 28 KB of that pool at boot (the first size tried) left too little
+// for it: the connect
 // worker could not start, toggle() cleared g_state back to Disconnected, and the
 // row looked like the button had done nothing — it never even said "Connecting".
 //
@@ -220,7 +217,6 @@ extern "C" void app_main(void) {
   // come out of internal RAM. Never read; it is a rope for reclaim_on_oom_.
   g_oom_reserve = heap_caps_malloc(kOomReserveBytes, MALLOC_CAP_INTERNAL);
   std::set_new_handler(reclaim_on_oom_);
-  verify_ota();
   verify_wakeup_press();
 
   static Esp32InputSource input;
@@ -256,11 +252,7 @@ extern "C" void app_main(void) {
   if (!sd_ok) {
     buf.show_sleep_image_embedded();
     buf.deep_sleep();
-    // Wake is level-triggered on LOW; sleeping with the button still down would
-    // wake us straight back up.
-    for (uint32_t waited = 0; waited < 5000 && gpio_get_level(kPowerPin) == 0; waited += 10)
-      vTaskDelay(pdMS_TO_TICKS(10));
-    esp_sleep_enable_gpio_wakeup_on_hp_periph_powerdown(1ULL << kPowerPin, ESP_GPIO_WAKEUP_GPIO_LOW);
+    wait_power_release_();
     deep_sleep_now_();
   }
   // State lives in two dotfiles at the card root — see set_state_root.
@@ -268,8 +260,7 @@ extern "C" void app_main(void) {
   app.set_state_root("/sdcard");
 
   static FontManager font_mgr(app);
-  font_mgr.init();
-  app.set_font_manager(&font_mgr);
+  font_mgr.init();  // hands the reader font to the app
 
   // The runtime's start_sync() reaches neither of these, and a sync needs both:
   // the app for the book index and card paths, the buffer to stay off SPI2
@@ -298,19 +289,18 @@ extern "C" void app_main(void) {
     // is the producer, this loop is the consumer.
     //
     // Deferral rules:
-    //   (A) Add/Rename ops use scratch buffers (Book::open) — defer when
-    //       Reader is the top screen (it owns those buffers for rendering).
-    //   (C) ALL ops do SD card I/O (fopen/fprintf in save/load) which shares
+    //   (A) Add/Rename open the book to read its metadata and may reload the
+    //       ~30 KB index — defer while the reader is the top screen, which is
+    //       using the heap for its own caches.
+    //   (B) ALL ops do SD card I/O (fopen/fprintf in save/load) which shares
     //       SPI2_HOST with the display. Defer when the EPD hardware is
-    //       mid-refresh (DMA reading from framebuffer). This prevents SPI
-    //       contention that corrupts the display during SD card writes.
+    //       mid-refresh. This prevents SPI contention that corrupts the
+    //       display during SD card writes.
     if (g_index_op != SerialIndexOp::None) {
       const SerialIndexOp op = g_index_op;
       std::atomic_thread_fence(std::memory_order_acquire);
-      const bool needs_scratch = (op == SerialIndexOp::Add || op == SerialIndexOp::Rename);
-      const bool reader_active = app.is_reader_active();
-      const bool epd_busy = epd.is_busy();
-      const bool defer = (needs_scratch && reader_active) || epd_busy;
+      const bool opens_book = (op == SerialIndexOp::Add || op == SerialIndexOp::Rename);
+      const bool defer = (opens_book && app.is_reader_active()) || epd.is_busy();
 
       if (defer) {
         // Leave the slot occupied; retry next iteration. The main loop
@@ -377,7 +367,7 @@ extern "C" void app_main(void) {
     // fires, so without this it would rescue exactly one allocation per boot.
     //
     // Re-claim the reserve too, but only when the heap has recovered enough that
-    // taking 28 KB back cannot itself cause the shortage it exists to prevent.
+    // taking it back cannot itself cause the shortage it exists to prevent.
     // Without this the rope is single-use: the first rescue spends it and every
     // later page turn is unprotected again.
     //
@@ -407,13 +397,7 @@ extern "C" void app_main(void) {
     runtime.wait_next_frame();
   }
 
-  // Hold-to-sleep leaves the power button still down, and the wake source is
-  // level-triggered on LOW — sleeping now would wake instantly. Wait for the
-  // release (bounded, in case the pin is stuck).
-  for (uint32_t waited = 0; waited < 5000 && gpio_get_level(kPowerPin) == 0; waited += 10)
-    vTaskDelay(pdMS_TO_TICKS(10));
-
-  // Enter deep sleep; wake on power button press (active LOW, GPIO 3).
-  esp_sleep_enable_gpio_wakeup_on_hp_periph_powerdown(1ULL << kPowerPin, ESP_GPIO_WAKEUP_GPIO_LOW);
+  // Hold-to-sleep leaves the power button still down.
+  wait_power_release_();
   deep_sleep_now_();
 }

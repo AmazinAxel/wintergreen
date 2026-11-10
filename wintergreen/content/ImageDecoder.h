@@ -148,12 +148,6 @@ struct ToneHistogram {
   uint32_t bins[256] = {};
 };
 
-// Decode an image to 1-bit dithered bitmap.
-// Input: raw image data (JPEG or PNG).
-// Output: DecodedImage with packed 1-bit pixels.
-// max_w/max_h: maximum output dimensions (image is scaled to fit).
-ImageError decode_image(const uint8_t* data, size_t size, uint16_t max_w, uint16_t max_h, DecodedImage& out);
-
 // Decode a JPEG image by streaming directly from a ZIP entry.
 // work_buf must be >= ZipEntryInput::kMinWorkBufSize for deflate entries;
 // if nullptr (or too small), a buffer is heap-allocated internally.
@@ -188,10 +182,5 @@ ImageError decode_image_from_entry(IZipFile& file, const ZipEntry& entry, uint16
                                    bool scale_to_fill = false, ImageRowSink* sink = nullptr,
                                    ImagePixelSink* pixel_sink = nullptr,
                                    ToneLut tone_lut = nullptr, ToneHistogram* tone_hist = nullptr);
-
-// Floyd-Steinberg dither a grayscale buffer to 1-bit packed bitmap.
-// grayscale: width*height bytes, 0=black, 255=white.
-// out: pre-allocated packed bitmap, (width+7)/8 * height bytes.
-void floyd_steinberg_dither(const uint8_t* grayscale, int width, int height, uint8_t* out);
 
 }  // namespace wintergreen

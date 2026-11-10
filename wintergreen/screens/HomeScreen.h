@@ -2,7 +2,6 @@
 
 #include <cstdint>
 #include <string>
-#include <vector>
 
 #include "ListMenuScreen.h"
 
@@ -17,8 +16,6 @@ namespace wintergreen {
 class HomeScreen final : public ListMenuScreen {
  public:
   HomeScreen() = default;
-
-  const char* name() const override { return "Home"; }
 
   void draw_all_(DrawBuffer& buf, std::optional<uint8_t> battery_pct = std::nullopt) const override;
   int get_visible_count_(int H, int scroll_off) const override { return count(); }
@@ -48,17 +45,19 @@ class HomeScreen final : public ListMenuScreen {
   // Cover of the selected book only — loaded on demand from draw_all_(), so it
   // is ready in the same frame the selection changes.
   //
-  // There is exactly ONE of these, deliberately. A second cache for the
-  // neighbouring book was tried and is why: at 424x479 a cover is ~25 KB, and
-  // std::vector::assign reallocates when the size differs, holding the old and
-  // new blocks at once. Three live covers is ~74 KB transiently against ~165 KB
-  // of free heap — the device ran out of memory and restarted while cycling the
-  // carousel. See "Investigated and rejected" in docs/history.md.
-  mutable std::vector<uint8_t> cover_data_;
+  // It lives in DrawBuffer's spare framebuffer (claim_spare_cache), not on the
+  // heap: a cover is ~26 KB, and a heap copy of it sat resident for as long as
+  // the home screen did. Trusted only while spare_cache_valid(cover_gen_) — the
+  // book list's thumbnails, the reader, the sleep path, a radio and the OOM
+  // handler can all take the spare, and the next draw then reloads. With a radio
+  // up there is no spare and the placeholder frame is drawn instead.
+  //
+  // There is exactly ONE cover, deliberately: preloading the neighbour was tried
+  // and removed. See "Investigated and rejected" in docs/history.md.
+  mutable const uint8_t* cover_bits_ = nullptr;
+  mutable uint32_t cover_gen_ = 0;
   mutable uint16_t cover_w_ = 0, cover_h_ = 0;
-  mutable int cover_slot_ = -1;  // slot cover_data_ belongs to; -1 = nothing loaded
-
-  BitmapFont author_font_;
+  mutable int cover_slot_ = -1;  // slot the cover belongs to; -1 = nothing loaded
 
   // Wall time, not frames — see "Input and holds" in docs/power-and-input.md.
   //
@@ -77,11 +76,14 @@ class HomeScreen final : public ListMenuScreen {
   // still down; this stops the release from also opening the list.
   bool back_consumed_    = false;
 
-  // Reads the slot's cover_home.bin into cover_data_. The converter renders it to
+  // Reads the slot's cover_home.bin into the spare. The converter renders it to
   // fit the box (kHomeCoverW x kHomeCoverH), so this is a header and one fread —
-  // no scaling on the device. A file larger than the box, or a book without one,
-  // leaves cover_data_ empty and draws the placeholder frame.
-  void load_cover_(int slot_idx, int box_w, int box_h) const;
+  // no scaling on the device. A file larger than the box, a book without one,
+  // or no spare to read into leaves no cover and draws the placeholder frame.
+  void load_cover_(DrawBuffer& buf, int slot_idx, int box_w, int box_h) const;
+  bool have_cover_(const DrawBuffer& buf) const {
+    return cover_bits_ && cover_w_ > 0 && buf.spare_cache_valid(cover_gen_);
+  }
 
   // Up↔Down and the two front nav keys, swapped: see update().
   static Button swap_updown_(Button b) {

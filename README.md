@@ -45,18 +45,18 @@ Paste and fill the following settings into the `WintergreenConfig.h` file in you
 
 #include <cstdint>
 #define WG_BLUETOOTH_PAGE_TURNER "7B:70:25:80:D8:27" // you need a mac address like this one!
-//#define WG_WIFI_SYNC // if you want wifi sync you need to uncomment this!
+#define WG_WIFI_SYNC // comment this out to build without wifi sync
 
 namespace wintergreen::config {
   inline constexpr const char* kWifiName = "";
   inline constexpr const char* kWifiPassword = "";
-  inline constexpr const char* syncServer = "";
+  inline constexpr const char* syncServer = ""; // an IP, a hostname, or a .local name
 
   inline constexpr bool kSunlightFadingFix = false;
-  inline constexpr uint8_t kAutoSleepMinutes = 2;
+  inline constexpr uint8_t kAutoSleepMinutes = 1;
 
-  inline constexpr bool kResumeOnePageBack = true;
-  inline constexpr uint32_t kHoldDelayMs = 300;
+  inline constexpr bool kResumeOnePageBack = false;
+  inline constexpr uint32_t kHoldDelayMs = 250;
   inline constexpr uint32_t kHoldRepeatMs = 100;
   inline constexpr int kHoldAccelStep = 0;
 }

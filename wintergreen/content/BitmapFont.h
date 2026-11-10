@@ -23,8 +23,6 @@ namespace wintergreen {
 // Result of a glyph lookup — points into the WGF data buffer.
 struct GlyphData {
   const uint8_t* bits;           // pointer to 1-bit BW packed bitmap (nullptr if no bitmap)
-  const uint8_t* gray_lsb_bits;  // pointer to grayscale LSB plane (nullptr if absent)
-  const uint8_t* gray_msb_bits;  // pointer to grayscale MSB plane (nullptr if absent)
   uint8_t bitmap_width;          // bitmap width in pixels
   uint8_t bitmap_height;         // bitmap height in pixels
   uint8_t advance_width;         // horizontal cursor advance
@@ -45,8 +43,6 @@ class BitmapFont : public IFont {
     size_ = 0;
     header_ = nullptr;
     bitmaps_ = nullptr;
-    gray_lsb_bitmaps_ = nullptr;
-    gray_msb_bitmaps_ = nullptr;
     for (auto& s : styles_)
       s = {};
 
@@ -68,12 +64,6 @@ class BitmapFont : public IFont {
     size_ = size;
     header_ = hdr;
     bitmaps_ = data + hdr->bitmap_data_offset;
-
-    // Grayscale planes (optional)
-    if (hdr->gray_lsb_offset != 0 && hdr->gray_lsb_offset < size)
-      gray_lsb_bitmaps_ = data + hdr->gray_lsb_offset;
-    if (hdr->gray_msb_offset != 0 && hdr->gray_msb_offset < size)
-      gray_msb_bitmaps_ = data + hdr->gray_msb_offset;
 
     // Regular style (always present)
     styles_[0].ranges = reinterpret_cast<const WgfRange*>(data + ranges_start);
@@ -107,9 +97,7 @@ class BitmapFont : public IFont {
 
   uint16_t char_width(char32_t ch, FontStyle style, uint8_t /*size_pct*/ = 100) const override {
     const StyleData& sd = resolve_style_(style);
-    int idx = find_glyph_index_in(sd, ch);
-    if (idx < 0)
-      idx = sd.fallback_glyph_idx;
+    const int idx = glyph_index_in_(sd, ch);
     if (idx < 0)
       return header_ ? (header_->default_advance + 2) / 4 : 0;
     return (sd.glyphs[idx].advance_width + 2) / 4;
@@ -123,20 +111,8 @@ class BitmapFont : public IFont {
     int prev_idx = -1;
 
     while (p < end) {
-      char32_t cp = decode_utf8(p, end);
-      int idx = find_glyph_index_in(sd, cp);
-      if (idx < 0)
-        idx = sd.fallback_glyph_idx;
-
-      if (prev_idx >= 0 && idx >= 0 && sd.kerning_matrix) {
-        uint8_t lc = sd.l_class_map[prev_idx];
-        uint8_t rc = sd.r_class_map[idx];
-        uint8_t max_lc = sd.kerning->num_l_classes_minus_1;
-        uint8_t max_rc = sd.kerning->num_r_classes_minus_1;
-        if (lc <= max_lc && rc <= max_rc) {
-          w_q += sd.kerning_matrix[lc * (max_rc + 1) + rc];
-        }
-      }
+      const int idx = glyph_index_in_(sd, decode_utf8(p, end));
+      w_q += kerning_in_(sd, prev_idx, idx);
 
       if (idx < 0) {
         w_q += header_ ? header_->default_advance : 0;
@@ -160,74 +136,47 @@ class BitmapFont : public IFont {
     return header_ ? header_->baseline : 0;
   }
 
-  int8_t underline_pos(uint8_t /*size_pct*/ = 100) const override {
-    return header_ ? header_->underline_pos : 1;
-  }
-
-  uint8_t underline_thickness(uint8_t /*size_pct*/ = 100) const override {
-    return header_ ? std::max<uint8_t>(1, header_->underline_thickness) : 1;
-  }
-
   // ── Glyph data access (for rendering) ───────────────────────────────────
+  //
+  // The draw loop works in glyph indices, exactly as word_width() does: one
+  // range lookup per character, with the previous index carried for kerning.
+  // Looking kerning up by codepoint cost two more searches per character and,
+  // unlike word_width(), skipped the U+FFFD fallback, so drawn and measured
+  // widths could disagree around a missing glyph. The style is resolved once
+  // per string (styled()), not once per call.
+  class Styled;
+  Styled styled(FontStyle style) const;
 
-  int8_t get_kerning_q(char32_t left, char32_t right, FontStyle style = FontStyle::Regular) const {
-    const StyleData& sd = resolve_style_(style);
-    if (!sd.kerning_matrix)
+  // Decode one UTF-8 codepoint, advance p.
+  static char32_t decode_utf8(const char*& p, const char* end) {
+    if (p >= end)
       return 0;
-
-    int l_idx = find_glyph_index_in(sd, left);
-    int r_idx = find_glyph_index_in(sd, right);
-    if (l_idx < 0 || r_idx < 0)
-      return 0;
-
-    uint8_t lc = sd.l_class_map[l_idx];
-    uint8_t rc = sd.r_class_map[r_idx];
-    uint8_t max_lc = sd.kerning->num_l_classes_minus_1;
-    uint8_t max_rc = sd.kerning->num_r_classes_minus_1;
-    if (lc <= max_lc && rc <= max_rc) {
-      return sd.kerning_matrix[lc * (max_rc + 1) + rc];
+    uint8_t b = static_cast<uint8_t>(*p);
+    if (b < 0x80) {
+      ++p;
+      return b;
     }
-    return 0;
-  }
-
-  GlyphData glyph_data(char32_t ch, FontStyle style = FontStyle::Regular) const {
-    const StyleData& sd = resolve_style_(style);
-    int idx = find_glyph_index_in(sd, ch);
-    if (idx < 0)
-      idx = sd.fallback_glyph_idx;
-    if (idx < 0)
-      return {nullptr, nullptr, nullptr, 0, 0, header_ ? header_->default_advance : static_cast<uint8_t>(0), 0, 0};
-
-    const WgfGlyph& g = sd.glyphs[idx];
-    const uint8_t* bits = nullptr;
-    const uint8_t* lsb = nullptr;
-    const uint8_t* msb = nullptr;
-    if (g.bitmap_width > 0 && g.bitmap_height > 0) {
-      const size_t row_bytes = static_cast<size_t>((g.bitmap_width + 7) / 8);
-      const size_t needed = row_bytes * static_cast<size_t>(g.bitmap_height);
-      if (bitmaps_ && g.bitmap_offset + needed <= size_) {
-        bits = bitmaps_ + g.bitmap_offset;
-        if (gray_lsb_bitmaps_)
-          lsb = gray_lsb_bitmaps_ + g.bitmap_offset;
-        if (gray_msb_bitmaps_)
-          msb = gray_msb_bitmaps_ + g.bitmap_offset;
-      } else {
-        corrupt_ = true;
-      }
+    if (b < 0xE0 && p + 1 < end) {
+      char32_t cp = (static_cast<char32_t>(b & 0x1F) << 6) | (static_cast<uint8_t>(p[1]) & 0x3F);
+      p += 2;
+      return cp;
     }
-    return {bits, lsb, msb, g.bitmap_width, g.bitmap_height, g.advance_width, g.x_offset, g.y_offset};
-  }
-
-  bool is_corrupt() const {
-    return corrupt_;
-  }
-
-  bool has_style(FontStyle style) const {
-    return styles_[static_cast<uint8_t>(style)].ranges != nullptr;
-  }
-
-  bool has_grayscale() const {
-    return gray_lsb_bitmaps_ != nullptr;
+    if (b < 0xF0 && p + 2 < end) {
+      char32_t cp = (static_cast<char32_t>(b & 0x0F) << 12) |
+                    (static_cast<char32_t>(static_cast<uint8_t>(p[1]) & 0x3F) << 6) |
+                    (static_cast<uint8_t>(p[2]) & 0x3F);
+      p += 3;
+      return cp;
+    }
+    if (b < 0xF8 && p + 3 < end) {
+      char32_t cp =
+          (static_cast<char32_t>(b & 0x07) << 18) | (static_cast<char32_t>(static_cast<uint8_t>(p[1]) & 0x3F) << 12) |
+          (static_cast<char32_t>(static_cast<uint8_t>(p[2]) & 0x3F) << 6) | (static_cast<uint8_t>(p[3]) & 0x3F);
+      p += 4;
+      return cp;
+    }
+    ++p;
+    return 0xFFFD;
   }
 
   uint16_t nominal_size() const {
@@ -260,10 +209,57 @@ class BitmapFont : public IFont {
   size_t size_ = 0;
   const WgfHeader* header_ = nullptr;
   const uint8_t* bitmaps_ = nullptr;
-  const uint8_t* gray_lsb_bitmaps_ = nullptr;
-  const uint8_t* gray_msb_bitmaps_ = nullptr;
   StyleData styles_[4] = {};  // indexed by FontStyle enum value
-  mutable bool corrupt_ = false;
+
+  static int glyph_index_in_(const StyleData& sd, char32_t cp) {
+    const int idx = find_glyph_index_in(sd, cp);
+    return idx >= 0 ? idx : sd.fallback_glyph_idx;
+  }
+
+  static int kerning_in_(const StyleData& sd, int l_idx, int r_idx) {
+    if (l_idx < 0 || r_idx < 0 || !sd.kerning_matrix)
+      return 0;
+    const uint8_t lc = sd.l_class_map[l_idx];
+    const uint8_t rc = sd.r_class_map[r_idx];
+    const uint8_t max_lc = sd.kerning->num_l_classes_minus_1;
+    const uint8_t max_rc = sd.kerning->num_r_classes_minus_1;
+    if (lc > max_lc || rc > max_rc)
+      return 0;
+    return sd.kerning_matrix[lc * (max_rc + 1) + rc];
+  }
+
+  GlyphData glyph_at_(const StyleData& sd, int idx) const {
+    if (idx < 0)
+      return {nullptr, 0, 0, header_ ? header_->default_advance : static_cast<uint8_t>(0), 0, 0};
+    const WgfGlyph& g = sd.glyphs[idx];
+    const uint8_t* bits = nullptr;
+    if (g.bitmap_width > 0 && g.bitmap_height > 0) {
+      const size_t row_bytes = static_cast<size_t>((g.bitmap_width + 7) / 8);
+      const size_t needed = row_bytes * static_cast<size_t>(g.bitmap_height);
+      if (bitmaps_ && g.bitmap_offset + needed <= size_)
+        bits = bitmaps_ + g.bitmap_offset;
+    }
+    return {bits, g.bitmap_width, g.bitmap_height, g.advance_width, g.x_offset, g.y_offset};
+  }
+
+ public:
+  // A font with one style already resolved, for the per-character draw loop.
+  class Styled {
+   public:
+    // Glyph table index for `ch` (U+FFFD when missing), or -1.
+    int glyph_index(char32_t ch) const { return glyph_index_in_(*sd_, ch); }
+    // Kerning in quarter pixels between two glyph indices; 0 if either is -1.
+    int kerning_q(int left_idx, int right_idx) const { return kerning_in_(*sd_, left_idx, right_idx); }
+    GlyphData glyph_data_at(int idx) const { return font_->glyph_at_(*sd_, idx); }
+
+   private:
+    friend class BitmapFont;
+    Styled(const BitmapFont* font, const StyleData* sd) : font_(font), sd_(sd) {}
+    const BitmapFont* font_;
+    const StyleData* sd_;
+  };
+
+ private:
 
   // Resolve a FontStyle to its StyleData, falling back to Regular.
   const StyleData& resolve_style_(FontStyle style) const {
@@ -324,39 +320,11 @@ class BitmapFont : public IFont {
     }
     return -1;
   }
-
-  // Decode one UTF-8 codepoint, advance p.
-  static char32_t decode_utf8(const char*& p, const char* end) {
-    if (p >= end)
-      return 0;
-    uint8_t b = static_cast<uint8_t>(*p);
-    if (b < 0x80) {
-      ++p;
-      return b;
-    }
-    if (b < 0xE0 && p + 1 < end) {
-      char32_t cp = (static_cast<char32_t>(b & 0x1F) << 6) | (static_cast<uint8_t>(p[1]) & 0x3F);
-      p += 2;
-      return cp;
-    }
-    if (b < 0xF0 && p + 2 < end) {
-      char32_t cp = (static_cast<char32_t>(b & 0x0F) << 12) |
-                    (static_cast<char32_t>(static_cast<uint8_t>(p[1]) & 0x3F) << 6) |
-                    (static_cast<uint8_t>(p[2]) & 0x3F);
-      p += 3;
-      return cp;
-    }
-    if (b < 0xF8 && p + 3 < end) {
-      char32_t cp =
-          (static_cast<char32_t>(b & 0x07) << 18) | (static_cast<char32_t>(static_cast<uint8_t>(p[1]) & 0x3F) << 12) |
-          (static_cast<char32_t>(static_cast<uint8_t>(p[2]) & 0x3F) << 6) | (static_cast<uint8_t>(p[3]) & 0x3F);
-      p += 4;
-      return cp;
-    }
-    ++p;
-    return 0xFFFD;
-  }
 };
+
+inline BitmapFont::Styled BitmapFont::styled(FontStyle style) const {
+  return Styled(this, &resolve_style_(style));
+}
 
 // ---------------------------------------------------------------------------
 // BitmapFontSet — manages multiple dynamically loaded fonts.
@@ -381,10 +349,6 @@ class BitmapFontSet : public IFont {
     }
   }
 
-  int base_size_index() const {
-    return base_idx_;
-  }
-
   int num_fonts() const {
     return num_fonts_;
   }
@@ -401,13 +365,6 @@ class BitmapFontSet : public IFont {
 
   bool valid() const {
     return num_fonts_ > 0 && fonts_[base_idx_] != nullptr && fonts_[base_idx_]->valid();
-  }
-
-  bool has_grayscale() const {
-    if (!valid())
-      return false;
-    auto* f = fonts_[base_idx_];
-    return f && f->has_grayscale();
   }
 
   // ── IFont interface ─────────────────────────────────────────────────────
@@ -428,23 +385,6 @@ class BitmapFontSet : public IFont {
   uint16_t baseline(uint8_t size_pct = 100) const override {
     const BitmapFont* best = resolve_(size_pct);
     return best ? best->baseline(100) : 0;
-  }
-
-  int8_t underline_pos(uint8_t size_pct = 100) const override {
-    const BitmapFont* best = resolve_(size_pct);
-    return best ? best->underline_pos(100) : 1;
-  }
-
-  uint8_t underline_thickness(uint8_t size_pct = 100) const override {
-    const BitmapFont* best = resolve_(size_pct);
-    return best ? best->underline_thickness(100) : 1;
-  }
-
-  // ── Glyph data (for rendering) ─────────────────────────────────────────
-
-  GlyphData glyph_data(char32_t ch, FontStyle style, uint8_t size_pct = 100) const {
-    const BitmapFont* best = resolve_(size_pct);
-    return best ? best->glyph_data(ch, style) : GlyphData{};
   }
 
  private:

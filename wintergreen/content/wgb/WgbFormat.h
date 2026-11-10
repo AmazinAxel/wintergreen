@@ -6,10 +6,10 @@
 //
 // File layout (all values little-endian):
 //
-//   [Header 24 bytes]
+//   [Header 20 bytes]
 //   [Paragraph data — variable, written sequentially]   ← no prev/next links
 //   [Per-chapter descriptor tables — paragraph_count × 8 bytes each]
-//   [Chapter table  — chapter_count  × 16 bytes]
+//   [Chapter table  — chapter_count  × 10 bytes]
 //   [Image ref table— image_count    × 12 bytes]
 //   [Metadata blob  — variable]
 //   [TOC blob       — variable]
@@ -28,20 +28,6 @@
 namespace wintergreen {
 
 // ---------------------------------------------------------------------------
-// Magic
-// ---------------------------------------------------------------------------
-//
-// There is no version field. The magic *is* the version: any incompatible change
-// to the layout changes these four bytes, so a stale file is rejected by the
-// existing magic check instead of being misparsed by a reader that trusted a
-// version number it did not understand. Bump the digit when the layout changes.
-// Deliberately *not* bumped for paragraph splitting. The on-disk layout is
-// unchanged — splitting only alters how many paragraphs a chapter holds — so an
-// older file parses correctly. It keeps the oversized paragraphs, so it stays
-// exposed to the heap abort until it is re-converted, but it opens and reads.
-static constexpr uint8_t kWgbMagic[4] = {'W', 'G', 'B', '2'};
-
-// ---------------------------------------------------------------------------
 // Image raster box
 // ---------------------------------------------------------------------------
 //
@@ -57,11 +43,14 @@ static constexpr uint16_t kWgbImageBoxW = 480;
 static constexpr uint16_t kWgbImageBoxH = 772;
 
 // ---------------------------------------------------------------------------
-// Header (24 bytes, fixed)
+// Header (20 bytes, fixed)
 // ---------------------------------------------------------------------------
+//
+// No magic and no version. WgbReader::open instead requires the image ref table
+// to end exactly at meta_offset, which a stale or non-WGB file fails. Any layout
+// change means re-converting the library.
 
 struct WgbHeader {
-  uint8_t magic[4];  // "WGB2"
   uint32_t paragraph_count;
   uint16_t chapter_count;
   uint16_t image_count;
@@ -69,20 +58,18 @@ struct WgbHeader {
   uint32_t image_offset;    // file offset of image ref table
   uint32_t meta_offset;     // file offset of metadata blob
 };
-static_assert(sizeof(WgbHeader) == 24, "WgbHeader must be 24 bytes");
+static_assert(sizeof(WgbHeader) == 20, "WgbHeader must be 20 bytes");
 
 // ---------------------------------------------------------------------------
-// Chapter table entry (16 bytes each)
+// Chapter table entry (10 bytes each on disk, serialised field by field)
 // ---------------------------------------------------------------------------
 
 struct WgbChapterEntry {
   uint32_t para_table_offset;  // file offset of the paragraph descriptor table for this chapter
-  uint32_t reserved;           // unused
+  uint32_t char_count;         // total UTF-8 bytes of text in this chapter
   uint16_t paragraph_count;
-  uint16_t reserved1;
-  uint32_t char_count;  // total UTF-8 bytes of text in this chapter
 };
-static_assert(sizeof(WgbChapterEntry) == 16, "WgbChapterEntry must be 16 bytes");
+static constexpr size_t kWgbChapterEntrySize = 10;  // para_table_offset(4) paragraph_count(2) char_count(4)
 
 // ---------------------------------------------------------------------------
 // Image reference entry (12 bytes each)
@@ -156,9 +143,6 @@ static constexpr uint8_t kWgbHrWidthDefault = 0xFF;
 // Little-endian serialization helpers
 // ---------------------------------------------------------------------------
 
-inline void wgb_write_u8(uint8_t* dst, uint8_t v) {
-  dst[0] = v;
-}
 inline void wgb_write_u16(uint8_t* dst, uint16_t v) {
   dst[0] = static_cast<uint8_t>(v);
   dst[1] = static_cast<uint8_t>(v >> 8);

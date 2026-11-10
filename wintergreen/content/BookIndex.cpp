@@ -1,5 +1,8 @@
 #include "BookIndex.h"
 
+#include <dirent.h>
+#include <strings.h>
+
 #include <algorithm>
 #include <cctype>
 #include <cstdio>
@@ -8,25 +11,13 @@
 #include <string>
 #include <vector>
 
-#include "../display/DrawBuffer.h"
 #include "wgb/WgbReader.h"
-
-#ifdef ESP_PLATFORM
-#include <dirent.h>
-#else
-#include <filesystem>
-namespace fs = std::filesystem;
-#endif
 
 namespace wintergreen {
 
 bool ci_less(std::string_view a, std::string_view b) {
   size_t min_len = std::min(a.size(), b.size());
-#ifdef _WIN32
-  int cmp = _strnicmp(a.data(), b.data(), min_len);
-#else
   int cmp = strncasecmp(a.data(), b.data(), min_len);
-#endif
   if (cmp != 0) return cmp < 0;
   return a.size() < b.size();
 }
@@ -54,13 +45,29 @@ static bool has_book_extension(const char* name, size_t name_len) {
   return ends_with_ci(name, name_len, ".wgb", 4);
 }
 
-// Name of the directory containing `path`, used as a title fallback.
-static std::string folder_name_of(const std::string& path) {
+std::string book_folder_name(const std::string& path) {
   const size_t last = path.find_last_of('/');
   if (last == std::string::npos || last == 0)
-    return path;
+    return {};
   const size_t prev = path.find_last_of('/', last - 1);
-  return path.substr(prev == std::string::npos ? 0 : prev + 1, last - (prev == std::string::npos ? 0 : prev + 1));
+  const size_t start = prev == std::string::npos ? 0 : prev + 1;
+  return path.substr(start, last - start);
+}
+
+std::string book_title_fallback(const std::string& title, const std::string& path) {
+  if (!title.empty() && title != "none")
+    return title;
+  std::string folder = book_folder_name(path);
+  return folder.empty() ? path : folder;
+}
+
+bool read_book_meta(const std::string& path, std::string& title, std::string& author) {
+  WgbReader r;
+  if (!r.open(path.c_str()))
+    return false;
+  title = book_title_fallback(r.metadata().title, path);
+  author = r.metadata().author.value_or("");
+  return true;
 }
 
 bool BookIndex::is_wgb_path(const char* path) {
@@ -230,20 +237,8 @@ void BookIndex::ensure_loaded_(const std::string& index_path) {
 
 bool BookIndex::index_file(const std::string& path, const std::string& index_path) {
   std::string title, author;
-  {
-    WgbReader r;
-    if (!r.open(path.c_str())) {
-      return false;
-    }
-    title = r.metadata().title;
-    author = r.metadata().author.value_or("");
-    r.close();
-    // A book whose EPUB had no usable title would otherwise show as an empty
-    // row; fall back to the folder name, which the converter takes from the
-    // original filename.
-    if (title.empty() || title == "none")
-      title = folder_name_of(path);
-  }
+  if (!read_book_meta(path, title, author))
+    return false;
   ensure_loaded_(index_path);
   remove_entry(path);
   add_entry(path, title, author);
@@ -337,27 +332,12 @@ void BookIndex::build_index(const std::string& root_dir) {
   if (!old_stats.empty())
     entries_.reserve(old_stats.size());
   // Process books as we find them to avoid storing all paths in memory.
-  int done = 0;
-
   auto process_path = [&](const std::string& path) {
     if (static_cast<int>(entries_.size()) >= MAX_BOOKS)
       return;
 
     std::string title, author;
-    bool ok = false;
-    {
-      WgbReader r;
-      if (r.open(path.c_str())) {
-        title = r.metadata().title;
-        author = r.metadata().author.value_or("");
-        r.close();
-        if (title.empty() || title == "none")
-          title = folder_name_of(path);
-        ok = true;
-      }
-    }
-
-    if (ok) {
+    if (read_book_meta(path, title, author)) {
       add_entry(path, title, author);
       const std::string key = title + '\x01' + author;
       for (const auto& old : old_stats) {
@@ -368,7 +348,6 @@ void BookIndex::build_index(const std::string& root_dir) {
         }
       }
     }
-    done++;
   };
 
   // Single iterator helper: calls `cb(path)` for each book found
@@ -390,7 +369,6 @@ void BookIndex::build_index(const std::string& root_dir) {
           cb(fullpath);
       };
 
-#ifdef ESP_PLATFORM
       DIR* dir = opendir(current_dir.c_str());
       if (!dir) continue;
       struct dirent* ent;
@@ -399,16 +377,6 @@ void BookIndex::build_index(const std::string& root_dir) {
         visit(ent->d_name, ent->d_type == DT_DIR, fullpath);
       }
       closedir(dir);
-#else
-      try {
-        for (const auto& entry : fs::directory_iterator(current_dir, fs::directory_options::skip_permission_denied)) {
-          std::string fullpath = entry.path().string();
-          for (char& c : fullpath) if (c == '\\') c = '/';
-          std::string fname = entry.path().filename().string();
-          visit(fname.c_str(), entry.is_directory(), fullpath);
-        }
-      } catch (...) {}
-#endif
     }
   };
 

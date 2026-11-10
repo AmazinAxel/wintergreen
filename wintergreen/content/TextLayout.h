@@ -68,7 +68,6 @@ struct PageLine {
 struct LayoutOptions {
   uint16_t width = 300;  // available line width in pixels
   uint16_t first_line_extra_indent = 0;  // extra left indent for inline images on first line
-  HyphenationLang hyphenation_lang = HyphenationLang::None;
 
   LayoutOptions() = default;
   explicit LayoutOptions(uint16_t w) : width(w) {}
@@ -143,11 +142,6 @@ struct PageContent {
   PagePosition start;
   PagePosition end;  // one-past-end position
   bool at_chapter_end = false;
-
-  // Typed accessors — O(n) filter; prefer iterating items with std::visit in hot paths.
-  std::vector<PageTextItem> text_items() const;
-  std::vector<PageImageItem> image_items() const;
-  std::vector<PageHrItem> hr_items() const;
 };
 
 struct PageOptions {
@@ -274,10 +268,6 @@ class TextLayout {
   // well as capping. 2 is the floor that still lets a single page's paragraphs
   // stay resident; a backward turn re-lays out more often, which is the trade
   // against rebooting.
-  size_t cache_limit() const {
-    return cache_limit_;
-  }
-
   void set_cache_limit(size_t slots) {
     cache_limit_ = slots < 1 ? 1 : (slots > kCacheCapacity ? kCacheCapacity : slots);
     for (size_t i = cache_limit_; i < kCacheCapacity; ++i)
@@ -301,9 +291,6 @@ class TextLayout {
     cache_valid_ = false;
     ++epoch_;
   }
-
-  // Break a single paragraph into lines using the stored font.
-  std::vector<LayoutLine> layout_paragraph(const LayoutOptions& opts, const TextParagraph& para) const;
 
   // Layout the page starting at position(). Does not change position().
   PageContent layout() const;
@@ -468,7 +455,3 @@ class TextLayout {
 };
 
 }  // namespace wintergreen
-
-#ifdef ESP_PLATFORM
-// Per-page layout sub-timings (microseconds). Reset by TextLayout::layout(); read after it returns.
-#endif

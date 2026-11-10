@@ -82,18 +82,11 @@ class IRuntime {
     return false;
   }
 
-  // Free heap, for callers deciding whether to do optional work. The reader
-  // uses it to skip its speculative next-page layout when the margin is too
-  // thin — that layout is what tips a long-paragraph book into an abort.
-  // UINT32_MAX on a host build, where the question does not arise.
-  virtual uint32_t free_memory_bytes() const {
-    return UINT32_MAX;
-  }
-
-  // Largest single allocation the heap can currently satisfy.
+  // Largest single allocation the heap can currently satisfy. The reader uses it
+  // to skip its speculative next-page layout when the margin is too thin.
   //
-  // **This, not free_memory_bytes(), is what a guard before allocating must
-  // use.** IDF's own header says so: total free size says nothing about whether
+  // **This, not total free heap, is what a guard before allocating must use.**
+  // IDF's own header says so: total free size says nothing about whether
   // one block of that size exists, because the heap fragments. Guarding on the
   // total let a page layout through with 24 KB "free" and then abort on a
   // 1,416-byte request — reproducibly, on an ordinary forward page turn.

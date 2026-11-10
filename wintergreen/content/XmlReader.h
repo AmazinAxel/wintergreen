@@ -97,8 +97,7 @@ struct XmlEvent {
 // Streaming XML reader. Uses a fixed-size internal buffer.
 //
 // Usage:
-//   MemoryXmlInput input(xml_str, xml_len);
-//   XmlReader reader;
+//   XmlReader reader;   // input: any IXmlInput, e.g. a ZipEntryInput
 //   if (reader.open(input, buf, buf_size) == XmlError::Ok) {
 //     XmlEvent event;
 //     while (reader.next_event(event) == XmlError::Ok) {
@@ -149,9 +148,6 @@ class XmlReader {
   // Find a byte in the current view. Returns offset or SIZE_MAX if not found.
   size_t find_byte(char c) const;
 
-  // Find a needle in the current view. Returns offset or SIZE_MAX if not found.
-  size_t find_str(const char* needle, size_t needle_len) const;
-
   // Parse the block between start/end delimiters as a specific event type.
   XmlError parse_delimited(const char* start_delim, size_t start_len,
                            const char* end_delim, size_t end_len,
@@ -165,16 +161,6 @@ class XmlReader {
   static void trim_start(const char*& data, size_t& length);
   static void trim_end(const char*& data, size_t& length);
   static void trim(const char*& data, size_t& length);
-};
-
-// IXmlInput backed by a memory buffer.
-class MemoryXmlInput : public IXmlInput {
- public:
-  MemoryXmlInput(const void* data, size_t size) : data_(static_cast<const uint8_t*>(data)), remaining_(size) {}
-  size_t read(void* buf, size_t max_size) override;
- private:
-  const uint8_t* data_;
-  size_t remaining_;
 };
 
 }  // namespace wintergreen

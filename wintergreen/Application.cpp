@@ -1,23 +1,10 @@
 #include "Application.h"
 
 #include <cstdio>
-#include <cstdlib>
 #include <cstring>
 
 #include "content/CoverPaths.h"
 #include "content/BookIndex.h"
-
-#ifdef ESP_PLATFORM
-#include <dirent.h>
-#include <sys/stat.h>
-#else
-#include <filesystem>
-#endif
-
-
-#ifndef ESP_PLATFORM
-namespace fs = std::filesystem;
-#endif
 
 namespace wintergreen {
 
@@ -33,10 +20,6 @@ static_assert(kSleepCoverH == DrawBuffer::kHeight, "sleep cover must be panel he
 void Application::start(DrawBuffer& buf, IRuntime& runtime) {
   started_ = true;
   running_ = true;
-
-
-  if (reader_font_)
-    reader_.set_fonts(reader_font_);
 
   // All of the possible menus!! There's only four, pretty much the bare minimum!
   home_.set_app(this);
@@ -94,9 +77,6 @@ void Application::start(DrawBuffer& buf, IRuntime& runtime) {
 
 void Application::auto_open_book(const char* epub_path, DrawBuffer& buf, IRuntime& runtime) {
   reader_.set_path(epub_path);
-  if (reader_font_)
-    reader_.set_fonts(reader_font_);
-
   screen_mgr_.push(&reader_, buf, runtime);
 }
 
@@ -137,8 +117,7 @@ static bool show_book_cover_sleep_(DrawBuffer& buf, const char* data_dir, const 
       return false;  // truncated: nothing has been drawn yet, so the caller's fallback is clean
     }
     std::fclose(f);
-    for (int y = 0; y < H; ++y)
-      buf.blit_1bit_row(0, y, scratch + static_cast<size_t>(y) * stride, W);
+    buf.blit_1bit(0, 0, scratch, W, H, stride);
   } else {
     uint8_t row[(kSleepCoverW + 7) / 8];
     if (stride > static_cast<int>(sizeof(row))) { std::fclose(f); return false; }
@@ -147,7 +126,7 @@ static bool show_book_cover_sleep_(DrawBuffer& buf, const char* data_dir, const 
         std::fclose(f);
         return false;  // truncated: whatever reached the buffer is discarded unrefreshed
       }
-      buf.blit_1bit_row(0, y, row, W);
+      buf.blit_1bit(0, y, row, W, 1, sizeof(row));
     }
     std::fclose(f);
   }
@@ -182,8 +161,11 @@ void Application::do_sleep_(DrawBuffer& buf, bool wordmark_image) {
   // The cover shows only while a book is actually open, and never for a hidden
   // one — the sleep screen is on display while the device sits around, so a
   // hidden book must not be advertised by it. Anything else gets the wordmark.
+  // Sleeping from the quick menu also shows the wordmark (a deliberate "hide the
+  // cover" gesture); the reader is still on the stack, so boot resumes the book.
   std::string cover_book;
-  if (!wordmark_image && screen_mgr_.contains(&reader_) && reader_.has_path()) {
+  if (!wordmark_image && screen_mgr_.top() != &quickmenu_ && screen_mgr_.contains(&reader_) &&
+      reader_.has_path()) {
     const std::string p = reader_.get_path();
     if (p.find("/.hidden/") == std::string::npos)
       cover_book = p;

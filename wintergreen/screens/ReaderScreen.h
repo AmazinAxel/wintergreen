@@ -1,6 +1,5 @@
 #pragma once
 
-#include <functional>
 #include <memory>
 
 #include "../Input.h"
@@ -14,36 +13,27 @@
 
 namespace wintergreen {
 
-// Simple EPUB page viewer.
+// The WGB page viewer.
 class ReaderScreen final : public IScreen {
  public:
-  // Get the current book path
-  std::string get_path() {
+  // The current book path
+  const std::string& get_path() const {
     return path_;
   }
   ReaderScreen() = default;
-  explicit ReaderScreen(std::string epub_path) : path_(std::move(epub_path)) {}
 
-  void set_path(std::string epub_path) {
-    path_ = std::move(epub_path);
+  void set_path(std::string wgb_path) {
+    path_ = std::move(wgb_path);
   }
   bool has_path() const {
     return !path_.empty();
   }
-  // Set the proportional bitmap font for rendering. If null, falls back to
-  // the builtin 8×8 bitmap font at 2× scale. The font data must outlive
-  // this screen.
-  void set_font(const BitmapFont* font) {}
 
-  // Set the full font set (Small/Normal/Large). Font data must outlive this screen.
+  // The reader font set (one face, several sizes). Font data must outlive this
+  // screen. Without it no book opens: there is no fallback face.
   void set_fonts(const BitmapFontSet* fonts) {
     ext_font_set_ = fonts;
   }
-
-  // Export helpers.
-  bool render_current_page(DrawBuffer& buf);
-  bool next_page_and_render(DrawBuffer& buf);
-  bool is_open_ok() const;
 
   // Drop every cache that exists only to make a page turn fast: the laid-out
   // page and the layout engine's paragraph cache. Called when a radio comes up,
@@ -73,18 +63,6 @@ class ReaderScreen final : public IScreen {
     layout_engine_.set_cache_limit(TextLayout::kCacheCapacity);
   }
 
-  size_t current_chapter_index() const;
-
-  // Test accessors — expose internal state so tests can drive the real screen
-  // without duplicating its logic.
-  const WgbReader& test_wgb() const {
-    return wgb_;
-  }
-
-  const char* name() const override {
-    return "Reader";
-  }
-
   void start(DrawBuffer& buf, IRuntime& runtime) override;
   void stop() override;
   // pause(): freeze session timer while a child screen (options/chapter) is active.
@@ -93,17 +71,8 @@ class ReaderScreen final : public IScreen {
   void resume(DrawBuffer& buf, IRuntime& runtime) override;
   void update(const ButtonState& buttons, DrawBuffer& buf, IRuntime& runtime) override;
 
-  // Layout constants exposed so tests and tools can build matching PageOptions
-  static constexpr int kScale = 2;
-  static constexpr int kGlyphW = 8;
-  static constexpr int kGlyphH = 8;
   static constexpr int kPaddingTop = 0;
-  static constexpr int kPaddingLeft = 12;
   static constexpr int kParaSpacing = 8;
-
-  static FixedFont make_fixed_font() {
-    return FixedFont(kGlyphW * kScale, kGlyphH * kScale + 4);
-  }
 
   // Build PageOptions matching the reader's layout configuration. Margins are
   // fixed (see ReaderSettings), so this is fully determined by the page size.
@@ -118,8 +87,7 @@ class ReaderScreen final : public IScreen {
   }
 
  private:
-  BitmapFontSet font_set_;                       // owned set (for single-font set_font() path)
-  const BitmapFontSet* ext_font_set_ = nullptr;  // external set (from set_fonts())
+  const BitmapFontSet* ext_font_set_ = nullptr;  // from set_fonts()
   std::string path_;
   std::string wgb_path_;
   std::string pos_path_;       // <book dir>/book.pos, beside the book itself
@@ -178,7 +146,6 @@ class ReaderScreen final : public IScreen {
   HoldRepeat hold_prev_;
 
   bool open_ok_ = false;
-  bool buf_was_touched_ = false;
 
   // Low-battery reminder bar, drawn along the bottom of a reading page only.
   // Sampled from the runtime at the entry points that have one and cached here,
@@ -207,9 +174,6 @@ class ReaderScreen final : public IScreen {
   PagePosition saved_page_pos_;
 
   ImageSizeQuery image_size_fn_;
-
-  // Returns the filename stem of path_ (no directory, no extension).
-  std::string book_stem_() const;
 
   // The book's title as it should be shown. Falls back to the containing folder
   // name when the WGB has no usable title — a converted EPUB whose metadata said
@@ -320,12 +284,6 @@ class ReaderScreen final : public IScreen {
   void load_position_();
 
  public:
-  bool is_open() const { return open_ok_; }
-
-  std::string book_title() const { return wgb_.metadata().title; }
-  uint16_t chapter_index() const { return static_cast<uint16_t>(chapter_idx_); }
-  uint16_t chapter_count() const { return wgb_.chapter_count(); }
-
   // Access to user-adjustable display settings (read/write by Application for persistence).
   ReaderSettings& reader_settings() {
     return reader_settings_;
