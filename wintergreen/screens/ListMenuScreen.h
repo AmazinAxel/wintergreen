@@ -64,6 +64,19 @@ inline std::string_view ellipsize(const IFont& f, const char* text, size_t len, 
   return {out, cp + 3};
 }
 
+// Border outline around a rectangle, `t` pixels thick, growing inwards. The
+// selection mark on the home carousel and the quick menu's chapter grid: a frame
+// changes far fewer pixels than an inverted fill, so the move refreshes cleaner.
+inline void draw_outline(DrawBuffer& buf, int x, int y, int w, int h, int t = 1) {
+  if (w <= 0 || h <= 0) return;
+  if (t > w) t = w;
+  if (t > h) t = h;
+  buf.fill_rect(x,         y,         w, t, false);
+  buf.fill_rect(x,         y + h - t, w, t, false);
+  buf.fill_rect(x,         y,         t, h, false);
+  buf.fill_rect(x + w - t, y,         t, h, false);
+}
+
 // Base class for screens that show a list of selectable items: the item
 // storage, up/down navigation with wrapping and hold-repeat, scrolling, and the
 // battery header. Its own draw pass is the book list's two-line rows; the home
@@ -171,6 +184,8 @@ class ListMenuScreen : public IScreen {
   // The image for row `index`, already fitted to the box. False draws an empty
   // frame in its place.
   virtual bool get_item_thumb(int index, Thumb& out) const { return false; }
+  // After the last get_item_thumb of a draw: release anything held for it.
+  virtual void end_thumbs() const {}
 
   // Called during start(). Call add_item() to populate the list.
   virtual void on_start() = 0;
@@ -215,6 +230,7 @@ class ListMenuScreen : public IScreen {
   std::vector<int> indents_;
 
   int selected_ = 0;
+  int undo_selected_ = -1;  // cursor before the last press move; Button::Undo returns to it
   int scroll_offset_ = 0;
   HoldRepeat hold_up_;
   HoldRepeat hold_down_;

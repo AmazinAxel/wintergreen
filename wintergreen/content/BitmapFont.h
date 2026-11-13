@@ -28,6 +28,7 @@ struct GlyphData {
   uint8_t advance_width;         // horizontal cursor advance
   int8_t x_offset;               // offset from cursor to bitmap left edge
   int8_t y_offset;               // offset from baseline to bitmap top (negative = above)
+  const uint8_t* cols;           // same bitmap column-major (see WgfFormat.h), or nullptr
 };
 
 class BitmapFont : public IFont {
@@ -43,6 +44,7 @@ class BitmapFont : public IFont {
     size_ = 0;
     header_ = nullptr;
     bitmaps_ = nullptr;
+    cols_ = nullptr;
     for (auto& s : styles_)
       s = {};
 
@@ -50,8 +52,6 @@ class BitmapFont : public IFont {
       return;
 
     auto* hdr = reinterpret_cast<const WgfHeader*>(data);
-    if (hdr->magic != kWgfMagic)
-      return;
 
     // Validate Regular style data
     const size_t ranges_start = sizeof(WgfHeader);
@@ -87,6 +87,29 @@ class BitmapFont : public IFont {
     load_style_(data, size, hdr->bold_offset, styles_[1]);
     load_style_(data, size, hdr->italic_offset, styles_[2]);
     load_style_(data, size, hdr->bold_italic_offset, styles_[3]);
+
+    // Column bitmaps: one index for all styles, in header order.
+    if (hdr->col_bitmap_offset && hdr->col_index_offset && hdr->col_bitmap_offset < size) {
+      uint32_t base = 0;
+      const uint32_t style_offsets[4] = {sizeof(WgfHeader), hdr->bold_offset, hdr->italic_offset,
+                                         hdr->bold_italic_offset};
+      for (int s = 0; s < 4; ++s) {
+        if (!style_offsets[s])
+          continue;
+        uint32_t n = hdr->num_glyphs;
+        if (s > 0) {
+          if (style_offsets[s] + sizeof(WgfStyleSection) > size)
+            break;
+          n = reinterpret_cast<const WgfStyleSection*>(data + style_offsets[s])->num_glyphs;
+        }
+        if (hdr->col_index_offset + 4ull * (base + n) > size)
+          break;
+        if (styles_[s].glyphs && styles_[s].num_glyphs == n)
+          styles_[s].col_index = data + hdr->col_index_offset + 4ull * base;
+        base += n;
+      }
+      cols_ = data + hdr->col_bitmap_offset;
+    }
   }
 
   bool valid() const {
@@ -199,6 +222,7 @@ class BitmapFont : public IFont {
     const uint8_t* l_class_map = nullptr;
     const uint8_t* r_class_map = nullptr;
     const int8_t* kerning_matrix = nullptr;
+    const uint8_t* col_index = nullptr;  // u32 per glyph into cols_
     uint32_t kerning_length = 0;
     uint16_t num_ranges = 0;
     uint16_t num_glyphs = 0;
@@ -209,6 +233,7 @@ class BitmapFont : public IFont {
   size_t size_ = 0;
   const WgfHeader* header_ = nullptr;
   const uint8_t* bitmaps_ = nullptr;
+  const uint8_t* cols_ = nullptr;
   StyleData styles_[4] = {};  // indexed by FontStyle enum value
 
   static int glyph_index_in_(const StyleData& sd, char32_t cp) {
@@ -230,16 +255,24 @@ class BitmapFont : public IFont {
 
   GlyphData glyph_at_(const StyleData& sd, int idx) const {
     if (idx < 0)
-      return {nullptr, 0, 0, header_ ? header_->default_advance : static_cast<uint8_t>(0), 0, 0};
+      return {nullptr, 0, 0, header_ ? header_->default_advance : static_cast<uint8_t>(0), 0, 0, nullptr};
     const WgfGlyph& g = sd.glyphs[idx];
     const uint8_t* bits = nullptr;
+    const uint8_t* cols = nullptr;
     if (g.bitmap_width > 0 && g.bitmap_height > 0) {
       const size_t row_bytes = static_cast<size_t>((g.bitmap_width + 7) / 8);
       const size_t needed = row_bytes * static_cast<size_t>(g.bitmap_height);
       if (bitmaps_ && g.bitmap_offset + needed <= size_)
         bits = bitmaps_ + g.bitmap_offset;
+      if (sd.col_index) {
+        const uint8_t* e = sd.col_index + 4 * static_cast<size_t>(idx);
+        const size_t off = e[0] | (e[1] << 8) | (e[2] << 16) | (static_cast<size_t>(e[3]) << 24);
+        const size_t col_bytes = static_cast<size_t>((g.bitmap_height + 7) / 8) * g.bitmap_width;
+        if (static_cast<size_t>(cols_ - data_) + off + col_bytes <= size_)
+          cols = cols_ + off;
+      }
     }
-    return {bits, g.bitmap_width, g.bitmap_height, g.advance_width, g.x_offset, g.y_offset};
+    return {bits, g.bitmap_width, g.bitmap_height, g.advance_width, g.x_offset, g.y_offset, cols};
   }
 
  public:

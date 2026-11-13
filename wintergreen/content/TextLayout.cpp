@@ -570,12 +570,8 @@ const TextLayout::LaidOutParagraph& TextLayout::get_laid_out_(size_t pi) const {
   // any entry that is not the one being built invalidates those, and the page
   // is then assembled from freed memory. Only the ring's own eviction is safe,
   // because a page never spans more than the ring holds.
-  //
-  // Ring over cache_limit_, not kCacheCapacity: the limit is lowered while a
-  // radio is up, and wrapping on the full capacity would let the cache refill
-  // past it a few page turns later.
   LaidOutParagraph& slot = para_cache_[cache_next_];
-  cache_next_ = (cache_next_ + 1) % cache_limit_;
+  cache_next_ = (cache_next_ + 1) % kCacheCapacity;
 
   const IFont& font = *font_;
   const PageOptions& opts = opts_;
@@ -586,7 +582,7 @@ const TextLayout::LaidOutParagraph& TextLayout::get_laid_out_(size_t pi) const {
   slot = LaidOutParagraph{};
   slot.para_idx = static_cast<uint16_t>(pi);
   slot.type = para.type;
-  if (pi == 0 && para.spacing_before.has_value() && *para.spacing_before > 0)
+  if (pi == 0 && source_->starts_unit() && para.spacing_before.has_value() && *para.spacing_before > 0)
     slot.leading_spacer = *para.spacing_before;
 
   switch (para.type) {
@@ -1306,6 +1302,26 @@ std::optional<Collected> TextLayout::LaidOutParagraph::collect_backward(size_t e
 // Every item is charged its full height, in both directions — see the note on
 // require_full_height in LaidOutParagraph::collect — so `used` is simply the sum
 // of what has been placed.
+// Text offset of the line at collect-index `idx`. The index space is not the
+// line index: a leading spacer takes index 0 and a promoted inline image's
+// pixel rows come before the lines. Using idx as a line index directly gave a
+// page starting mid-paragraph a text offset of 0 (or another line's).
+static uint32_t text_offset_at(const LaidOut& lp, size_t idx) {
+  if (lp.type != ParagraphType::Text)
+    return 0;
+  if (lp.leading_spacer > 0) {
+    if (idx == 0)
+      return 0;
+    --idx;
+  }
+  if (lp.inline_img.promoted && lp.promoted_h > 0) {
+    if (idx < lp.promoted_h)
+      return 0;
+    idx -= lp.promoted_h;
+  }
+  return idx < lp.lines.size() ? lp.lines[idx].text_offset : 0;
+}
+
 static size_t collect_para_items(const LaidOut& lp, size_t start_idx, uint16_t spc, uint16_t ph, uint16_t& used,
                                  bool& has_content, bool& page_full, bool& pending_page_break,
                                  PagePosition& boundary, std::vector<PageItem>& items) {
@@ -1323,8 +1339,7 @@ static size_t collect_para_items(const LaidOut& lp, size_t start_idx, uint16_t s
           boundary = {static_cast<uint16_t>(lp.para_idx + 1), 0, 0};
           pending_page_break = has_content;
         } else {
-          uint32_t to = (lp.type == ParagraphType::Text && idx < lp.lines.size()) ? lp.lines[idx].text_offset : 0;
-          boundary = {lp.para_idx, static_cast<uint16_t>(idx), to};
+          boundary = {lp.para_idx, static_cast<uint16_t>(idx), text_offset_at(lp, idx)};
           page_full = true;
         }
       }
@@ -1395,9 +1410,7 @@ TextLayout::CollectResult TextLayout::collect_page_items(PagePosition pos) const
     if (!page_full && !items.empty()) {
       auto probe = lp.collect(break_idx, ph);
       if (probe && probe->item.kind != PageItem::PageBreak) {
-        uint32_t to =
-            (lp.type == ParagraphType::Text && break_idx < lp.lines.size()) ? lp.lines[break_idx].text_offset : 0;
-        boundary = {static_cast<uint16_t>(pi), static_cast<uint16_t>(break_idx), to};
+        boundary = {static_cast<uint16_t>(pi), static_cast<uint16_t>(break_idx), text_offset_at(lp, break_idx)};
         page_full = true;
       }
     }
@@ -1711,8 +1724,10 @@ PagePosition TextLayout::next_page_start(PagePosition start, PagePosition end) c
   PagePosition next = end;
   if (next.offset > 0 && source_ && next.paragraph < source_->paragraph_count() &&
       start.paragraph != next.paragraph) {
-    if (source_->paragraph(next.paragraph).type == ParagraphType::Image || is_mid_promoted_image(next))
+    if (source_->paragraph(next.paragraph).type == ParagraphType::Image || is_mid_promoted_image(next)) {
       next.offset = 0;
+      next.text_offset = 0;
+    }
   }
   return next;
 }

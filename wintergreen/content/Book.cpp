@@ -116,12 +116,19 @@ bool Book::write_cover_bin(const char* cover_path, int max_w, int max_h,
       img.height = static_cast<uint16_t>(bot - top + 1);
     }
   }
+  // Column-major for the portrait screens (CoverPaths.h).
+  const size_t stride = img.stride();
+  const size_t col_bytes = (static_cast<size_t>(img.height) + 7) / 8;
+  std::vector<uint8_t> cols(cover_cols_bytes(img.width, img.height), 0xFF);
+  for (int y = 0; y < img.height; ++y)
+    for (int x = 0; x < img.width; ++x)
+      if (!((img.data[static_cast<size_t>(y) * stride + (x >> 3)] >> (7 - (x & 7))) & 1))
+        cols[static_cast<size_t>(x) * col_bytes + (y >> 3)] &= static_cast<uint8_t>(~(0x80u >> (y & 7)));
   FILE* f = std::fopen(cover_path, "wb");
   if (!f)
     return false;
   uint16_t le[2] = {img.width, img.height};
-  const bool ok = (std::fwrite(le, 2, 2, f) == 2) &&
-                  (std::fwrite(img.data.data(), 1, img.data.size(), f) == img.data.size());
+  const bool ok = (std::fwrite(le, 2, 2, f) == 2) && (std::fwrite(cols.data(), 1, cols.size(), f) == cols.size());
   std::fclose(f);
   if (!ok) { std::remove(cover_path); return false; }
   return true;
@@ -276,12 +283,22 @@ bool Book::write_sleep_cover_bin(const char* cover_path, int W, int H,
     }
   }
 
+  // The panel's own frame (CoverPaths.h): the device reads it into the draw
+  // buffer with one fread and no blit.
+  if (W != kSleepCoverW || H != kSleepCoverH)
+    return false;
+  std::vector<uint8_t> frame(kSleepFrameBytes, 0xFF);
+  for (int y = 0; y < H; ++y)
+    for (int x = 0; x < W; ++x)
+      if (!((out[static_cast<size_t>(y) * out_stride + (x >> 3)] >> (7 - (x & 7))) & 1)) {
+        const int bit = kSleepFrameOffX + y;
+        frame[static_cast<size_t>(kSleepFrameRows - 1 - x) * kSleepFrameStride + (bit >> 3)] &=
+            static_cast<uint8_t>(~(0x80u >> (bit & 7)));
+      }
   FILE* f = std::fopen(cover_path, "wb");
   if (!f)
     return false;
-  const uint16_t le[2] = {static_cast<uint16_t>(W), static_cast<uint16_t>(H)};
-  const bool ok = (std::fwrite(le, 2, 2, f) == 2) &&
-                  (std::fwrite(out.data(), 1, out.size(), f) == out.size());
+  const bool ok = std::fwrite(frame.data(), 1, frame.size(), f) == frame.size();
   std::fclose(f);
   if (!ok) { std::remove(cover_path); return false; }
   return true;

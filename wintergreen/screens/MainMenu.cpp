@@ -94,24 +94,32 @@ void MainMenu::update(const ButtonState& buttons, DrawBuffer& buf, IRuntime& run
   // A sync that downloaded books bumps the generation (wifi_sync.h) while this
   // screen is visible; without this they don't appear until you navigate away
   // and back.
-  if (cached_generation_ != BookIndex::instance().generation()) {
+  //
+  // One repaint per change, holding everything final. The sync worker bumps the
+  // generation a moment before it sets its end state, so while it still reads
+  // Working the new books wait; the frame that sees the end state shows the
+  // books and the row's final label together. Painting each as it came drew
+  // the books under "Syncing", then a second refresh for the label.
+  sync_runtime_ = &runtime;
+  const SyncState sync_now = runtime.sync_state();
+  const bool syncing = has_sync_ && sync_now == SyncState::Working;
+  const bool books_changed = !syncing && cached_generation_ != BookIndex::instance().generation();
+  // Repaint when the Sync row's text changes too: a sync that finds nothing new
+  // never bumps the generation, and the row would sit on "Syncing" forever.
+  const bool label_changed = has_sync_ && sync_now != sync_shown_;
+  if (books_changed) {
     cached_generation_ = BookIndex::instance().generation();
     forget_thumbs_();  // a sync or upload may have replaced a book in place
     populate_list_();
-    draw_all_(buf, runtime.battery_percentage());
-    buf.full_refresh();
   }
-
-  sync_runtime_ = &runtime;
-
-  // Repaint when the Sync row's text changes. The index generation above covers
-  // books arriving, but a sync that finds nothing new never bumps it — without
-  // this the row would sit on "Syncing..." forever.
-  const SyncState sync_now = runtime.sync_state();
-  if (has_sync_ && sync_now != sync_shown_) {
+  if (label_changed)
     sync_shown_ = sync_now;
+  if (books_changed || label_changed) {
     draw_all_(buf, runtime.battery_percentage());
-    buf.refresh();
+    if (books_changed)
+      buf.full_refresh();
+    else
+      buf.refresh();
   }
 
   ListMenuScreen::update(buttons, buf, runtime);
@@ -178,6 +186,7 @@ void MainMenu::stop() {
   // Revealing hidden books lasts only as long as the screen does — leaving and
   // coming back means performing the gesture again.
   show_hidden_ = false;
+  end_thumbs();
   { std::vector<BookEntry> tmp; hidden_.swap(tmp); }
   { std::vector<BookEntry> tmp; entries_.swap(tmp); }
   // The shared BookIndex is deliberately NOT cleared. It is ~30 KB against
@@ -211,6 +220,8 @@ void MainMenu::scan_hidden_() {
   hidden_.clear();
   if (!books_dir_)
     return;
+  if (buf_)
+    buf_->wait_panel_idle();  // the card shares SPI2 with the panel
 
   std::vector<std::string> paths;
   std::queue<std::string> q;
@@ -232,13 +243,56 @@ void MainMenu::scan_hidden_() {
     closedir(d);
   }
 
+  // Titles come from `.hidden/.wintergreen-index` (path|title|author lines,
+  // written here only when the set of hidden books changed), so a reveal opens
+  // no WGB except for a book added since. The folder walk above stays: it is
+  // what notices books added or removed by hand.
+  const std::string cache_path = std::string(books_dir_) + "/.hidden/.wintergreen-index";
+  struct Cached {
+    std::string path, title, author;
+  };
+  std::vector<Cached> cached;
+  if (FILE* f = std::fopen(cache_path.c_str(), "rb")) {
+    char line[1024];
+    while (std::fgets(line, sizeof(line), f)) {
+      line[std::strcspn(line, "\r\n")] = '\0';
+      char* s1 = std::strchr(line, '|');
+      char* s2 = s1 ? std::strchr(s1 + 1, '|') : nullptr;
+      if (!s2)
+        continue;
+      *s1 = *s2 = '\0';
+      cached.push_back({line, s1 + 1, s2 + 1});
+    }
+    std::fclose(f);
+  }
+  bool changed = cached.size() != paths.size();
   for (auto& p : paths) {
     BookEntry e;
-    if (!read_book_meta(p, e.title_own, e.author_own))
-      continue;
+    auto hit = std::find_if(cached.begin(), cached.end(), [&](const Cached& c) { return c.path == p; });
+    if (hit != cached.end()) {
+      e.title_own = std::move(hit->title);
+      e.author_own = std::move(hit->author);
+    } else {
+      changed = true;
+      if (!read_book_meta(p, e.title_own, e.author_own))
+        continue;
+    }
     e.path_own = std::move(p);
     e.hidden = true;
     hidden_.push_back(std::move(e));
+  }
+  if (changed) {
+    const std::string tmp = cache_path + ".tmp";
+    if (FILE* f = std::fopen(tmp.c_str(), "wb")) {
+      for (const BookEntry& e : hidden_)
+        std::fprintf(f, "%s|%s|%s\n", e.path_own.c_str(), e.title_own.c_str(), e.author_own.c_str());
+      if (std::fclose(f) == 0) {
+        std::remove(cache_path.c_str());
+        std::rename(tmp.c_str(), cache_path.c_str());
+      } else {
+        std::remove(tmp.c_str());
+      }
+    }
   }
 
   {
@@ -325,8 +379,10 @@ void MainMenu::populate_list_() {
   const StringPool& bpool = BookIndex::instance().pool();
   detail_title_lines_ = 2;
   entries_.reserve(BookIndex::instance().entries().size() + (show_hidden_ ? hidden_.size() : 0));
+  int pos = 0;
   for (const auto& idx : BookIndex::instance().entries()) {
     BookEntry e;
+    e.index_pos = pos++;
     e.path_ref = idx.path;
     e.title_ref = idx.title;
     e.author_ref = idx.author;
@@ -392,11 +448,44 @@ void MainMenu::populate_list_() {
 
 // ── Cover thumbnails ────────────────────────────────────────────────────────
 
-uint32_t MainMenu::thumb_key_(std::string_view path) {
-  uint32_t key = 2166136261u;
-  for (const char c : path)
-    key = (key ^ static_cast<uint8_t>(c)) * 16777619u;
-  return key;
+void MainMenu::end_thumbs() const {
+  if (pack_)
+    std::fclose(pack_);
+  pack_ = nullptr;
+  pack_tried_ = false;
+}
+
+// The book's slot in the thumbnail pack (BookIndex.h). False when there is no
+// pack or the slot belongs to another book; the caller then reads the book's
+// own cover_list.bin. The pack stays open until end_thumbs(), so a page of
+// rows costs one directory walk, not one per row.
+bool MainMenu::load_packed_thumb_(int index_pos, uint32_t key, uint8_t* dst, ThumbSlot& slot) const {
+  if (index_pos < 0 || !app_)
+    return false;
+  if (!pack_ && !pack_tried_) {
+    pack_tried_ = true;
+    pack_ = std::fopen(thumb_pack_path(app_->index_path()).c_str(), "rb");
+  }
+  if (!pack_)
+    return false;
+  uint8_t h[8];
+  if (std::fseek(pack_, static_cast<long>(index_pos * thumb_pack_slot_bytes()), SEEK_SET) != 0 ||
+      std::fread(h, 1, 8, pack_) != 8)
+    return false;
+  const uint32_t k = h[0] | (h[1] << 8) | (h[2] << 16) | (static_cast<uint32_t>(h[3]) << 24);
+  const int w = h[4] | (h[5] << 8), hh = h[6] | (h[7] << 8);
+  if (k != key)
+    return false;
+  if (w == 0 || hh == 0)
+    return true;  // the book has no cover: slot.w stays 0
+  if (w > thumb_w_ || hh > thumb_h_ || !buf_ || !buf_->spare_cache_valid(thumb_gen_))
+    return false;
+  const size_t body = cover_cols_bytes(w, hh);
+  if (std::fread(dst, 1, body, pack_) != body)
+    return false;
+  slot.w = static_cast<uint8_t>(w);
+  slot.h = static_cast<uint8_t>(hh);
+  return true;
 }
 
 bool MainMenu::thumb_cache_ready_(int w, int h) const {
@@ -430,8 +519,8 @@ MainMenu::ThumbSlot* MainMenu::find_thumb_(uint32_t key) const {
 }
 
 bool MainMenu::get_item_thumb(int index, Thumb& out) const {
-  // spare_cache_valid() and not just thumb_bits_: the OOM handler can release
-  // the spare from inside any allocation, this draw's included.
+  // spare_cache_valid() and not just thumb_bits_: another claim (reader,
+  // snapshot, a sync's loan) may have taken the spare since.
   if (!thumb_bits_ || thumb_slots_n_ == 0 || !buf_ || !buf_->spare_cache_valid(thumb_gen_) ||
       is_separator(index) || is_action_row_(index))
     return false;
@@ -442,7 +531,7 @@ bool MainMenu::get_item_thumb(int index, Thumb& out) const {
   // Keyed by path, not by entries_ index: entries_ is rebuilt on every visit
   // and its order moves whenever a book is opened.
   const std::string_view path = path_of_(entries_[real]);
-  const uint32_t key = thumb_key_(path);
+  const uint32_t key = book_path_key(path);
   ThumbSlot* slot = find_thumb_(key);
   if (!slot) {
     // Least recently drawn slot; empty ones carry stamp 0 and go first. Rows
@@ -454,7 +543,7 @@ bool MainMenu::get_item_thumb(int index, Thumb& out) const {
         slot = &thumb_slots_[i];
     slot->key = key;
     slot->valid = true;
-    load_thumb_(path, thumb_slot_bits_(*slot), *slot);
+    load_thumb_(path, entries_[real].index_pos, thumb_slot_bits_(*slot), *slot);
   }
   slot->used = ++thumb_clock_;
   if (slot->w == 0 || !buf_->spare_cache_valid(thumb_gen_))
@@ -465,24 +554,25 @@ bool MainMenu::get_item_thumb(int index, Thumb& out) const {
   return true;
 }
 
-// cover_list.bin: w, h, then 1 bpp rows (bit clear = ink), already fitted to the
+// cover_list.bin: w, h, then 1 bpp columns (CoverPaths.h), already fitted to the
 // row's box. Read straight into the slot — a header and one fread. Leaves
 // slot.w == 0 when there is no usable file, which is cached like any other
 // answer so a coverless book is not looked up again on every redraw.
-void MainMenu::load_thumb_(std::string_view book_path, uint8_t* dst, ThumbSlot& slot) const {
+void MainMenu::load_thumb_(std::string_view book_path, int index_pos, uint8_t* dst, ThumbSlot& slot) const {
   slot.w = slot.h = 0;
   if (buf_)
     buf_->wait_panel_idle();  // the card shares SPI2 with the panel
+  if (load_packed_thumb_(index_pos, book_path_key(book_path), dst, slot))
+    return;
+  slot.w = slot.h = 0;
   const std::string path = cover_list_bin_path(std::string(book_path).c_str());
   FILE* f = std::fopen(path.c_str(), "rb");
   if (!f)
     return;
   uint16_t hdr[2] = {};
   bool ok = std::fread(hdr, 2, 2, f) == 2 && hdr[0] > 0 && hdr[1] > 0 && hdr[0] <= thumb_w_ && hdr[1] <= thumb_h_;
-  // After the last allocation (newlib takes the FILE buffer on the first fread):
-  // if the OOM handler ran, the spare and dst are gone.
   ok = ok && buf_ && buf_->spare_cache_valid(thumb_gen_);
-  const size_t body = ok ? static_cast<size_t>((hdr[0] + 7) / 8) * hdr[1] : 0;
+  const size_t body = ok ? cover_cols_bytes(hdr[0], hdr[1]) : 0;
   // Exactly the declared size and not a byte more: anything else is not a
   // cover (a truncated download, or an HTML error page saved under the name).
   ok = ok && std::fread(dst, 1, body, f) == body && std::fgetc(f) == EOF;
@@ -494,6 +584,7 @@ void MainMenu::load_thumb_(std::string_view book_path, uint8_t* dst, ThumbSlot& 
 }
 
 void MainMenu::forget_thumbs_() const {
+  end_thumbs();
   for (ThumbSlot& s : thumb_slots_)
     s = ThumbSlot{};
   thumb_clock_ = 0;

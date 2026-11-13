@@ -7,7 +7,7 @@
 #include <cstring>
 
 #include "../content/BitmapFont.h"
-#include "../content/TextLayout.h"
+#include "../content/wgb/WgbPageView.h"
 
 namespace wintergreen {
 
@@ -65,11 +65,18 @@ class IDisplay {
   virtual void wait_idle() {}
 };
 
-// Double-buffered display with simple draw helpers.
+// Framebuffer with simple draw helpers.
 //
 // Uses Deg90 (portrait) rotation: logical 480x793, physical 793x480.
-// The "inactive" buffer is drawn to; "active" is what's currently displayed.
-// refresh() swaps and does a partial hardware refresh.
+// One draw buffer: refresh() sends it to the panel and does not flip. The
+// controller keeps the pixels in its own RAM and the SPI write is synchronous,
+// so the buffer is free to draw into as soon as refresh() returns, and between
+// refreshes it holds the frame on the glass. Every draw path starts from
+// fill() or from a whole-buffer swap, so nothing reads the previous frame.
+// A second host copy of the displayed frame (there used to be one) had no
+// reader: the fast waveform never takes RED RAM from the host, and
+// RefreshMode::Full, the only mode that would, has no caller. A future Full
+// caller must keep its own copy of the old frame.
 //
 // The framebuffers are never loaned out as scratch: image decoding and EPUB
 // conversion, the two things that used to borrow them, are both gone from the
@@ -87,13 +94,11 @@ class DrawBuffer {
   static constexpr size_t kBufSize = DisplayFrame::kPixelBytes;
 
   explicit DrawBuffer(IDisplay& display) : display_(display) {
-    memset(bufs_[0], 0xFF, kBufSize);
-    memset(bufs_[1], 0xFF, kBufSize);
+    memset(buf_, 0xFF, kBufSize);
   }
 
   ~DrawBuffer() {
-    std::free(bufs_[0]);
-    std::free(bufs_[1]);
+    std::free(buf_);
     std::free(spare_);
   }
 
@@ -130,7 +135,7 @@ class DrawBuffer {
   // -- Draw helpers (logical coordinates)
   // ----------------------------------------
 
-  // Fill the entire inactive buffer.
+  // Fill the entire draw buffer.
   void fill(bool white = true) {
     memset(draw_(), white ? 0xFF : 0x00, kBufSize);
   }
@@ -152,6 +157,22 @@ class DrawBuffer {
   // the same transpose the glyph path does.
   void blit_1bit(int lx, int ly, const uint8_t* data, int w, int h, size_t stride);
 
+  // Same, from column-major data: logical column c is ceil(h / 8) bytes of its h
+  // pixels, top first. In portrait each column is one physical row, so this is
+  // a shifted byte copy. Home and list covers are baked this way.
+  void blit_1bit_cols(int lx, int ly, const uint8_t* cols, int w, int h);
+
+  // One 8-row band of a reader image (WgbFormat.h, portrait copy): w bytes, each
+  // the band's 8 pixels of one column, top MSB. Top-left at (lx, ly); only band
+  // rows [keep_lo, keep_hi) are drawn.
+  void blit_1bit_bands(int lx, int ly, const uint8_t* band, int w, int keep_lo, int keep_hi);
+
+  // The draw target as the panel's own frame (kStride bytes per physical row,
+  // kBufSize bytes): a baked full-screen frame is read straight into it.
+  uint8_t* frame() {
+    return draw_();
+  }
+
   // -- Text & Glyph rendering --
 
   // Draw proportional text using a BitmapFont. Cursor starts at (x, baseline_y)
@@ -166,15 +187,16 @@ class DrawBuffer {
     return draw_text_proportional(x, baseline_y, text, text ? strlen(text) : 0, font, white, style);
   }
 
-  // Render all words of a laid-out line, each in its own size and style.
-  void draw_layout_line(int x_offset, int baseline_y, const PageLine& line, const BitmapFontSet& fonts, bool white);
+  // Render all words of a baked line (see WgbFormat.h), each in its own font
+  // and style. `end` bounds the display list the line lives in.
+  void draw_baked_line(const WgbLine& line, const uint8_t* end, const BitmapFontSet& fonts, bool white);
 
   void set_sunlight_fading_fix(bool v) { sunlight_fading_fix_ = v; }
 
   // -- Display operations
   // --------------------------------------------------
 
-  // Swap active<->inactive and push the new frame to the panel.
+  // Push the draw buffer to the panel. No flip: see the class comment.
   //
   // **There is no periodic full-refresh flush**, and this is the third and final
   // position on that question. A run of fast partial waveforms is not
@@ -196,17 +218,13 @@ class DrawBuffer {
   // bring it back, count here and call full_refresh(RefreshMode::Full) from
   // wherever the interruption is acceptable — but read "Panel health" first.
   void refresh() {
-    display_.partial_refresh(inactive_());
-    active_idx_ = 1 - active_idx_;
+    display_.partial_refresh(buf_);
   }
 
-  // Call full hardware refresh using the current inactive buffer, then sync both.
-  // The active buffer is what is on the glass, which RefreshMode::Full needs as
-  // its starting state.
+  // Full hardware refresh of the draw buffer. No previous frame is passed: no
+  // host copy of it exists (class comment), and Half ignores it anyway.
   void full_refresh(RefreshMode mode = RefreshMode::Half, bool turnOffScreen = false) {
-    display_.full_refresh(inactive_(), active_(), mode, turnOffScreen || sunlight_fading_fix_);
-    memcpy(bufs_[active_idx_], bufs_[1 - active_idx_], kBufSize);
-    active_idx_ = 1 - active_idx_;
+    display_.full_refresh(buf_, nullptr, mode, turnOffScreen || sunlight_fading_fix_);
   }
 
 
@@ -231,67 +249,43 @@ class DrawBuffer {
   // clobber this.
   enum class Spare : uint8_t { None, Snapshot, Offscreen, Cache };
 
-  // Hand the spare framebuffer back to the heap, and take it again afterwards.
-  //
-  // This exists for one caller: the Wi-Fi sync. Two static framebuffers are
-  // 96 KB of BSS and the spare is another 48 KB of heap, which on a 320 KB part
-  // left ~20 KB free — and esp_wifi_init() needs roughly 50 KB, so it failed
-  // outright with no clue why (see docs/sync.md).
-  //
-  // Safe because the spare is **purely an optimisation**: without it a quick
-  // menu dismiss re-renders and a page turn re-draws, which is what happened
-  // before it existed. Both claim paths already null-check it.
-  //
-  // spare_use_ must be reset here: has_snapshot()/has_offscreen() test only that
-  // enum, so leaving it set would let restore_snapshot() memcpy from a freed
-  // pointer.
-  void release_spare() {
-    std::free(spare_);
-    spare_ = nullptr;
-    spare_use_ = Spare::None;
-    // draw_() resolves through draw_target_; if an offscreen draw was in
-    // progress the target must go back to a real buffer.
-    draw_target_ = nullptr;
-  }
+  // The spare is claimed at construction and never given back, radios
+  // included. The null checks below only cover a boot-time malloc failure.
 
-  // Best-effort: staying without it costs latency, not correctness.
-  void reacquire_spare() {
-    if (!spare_)
-      spare_ = static_cast<uint8_t*>(std::malloc(kBufSize));
-  }
-
-  // Lend the spare as a plain scratch buffer, for a caller that needs kBufSize
-  // bytes and is not drawing. Only used by the sleep path, which reads the whole
-  // cover file in one fread instead of one per row: 793 rows is 793 FATFS + SPI
-  // round trips on a 20 MHz card, and the spare is idle at sleep time.
-  //
-  // Whatever the spare held is destroyed, hence the invalidate — the snapshot and
-  // the pre-drawn page are both meaningless once the device is going to sleep.
-  // Returns null when the spare has been released (Wi-Fi sync); the caller must
-  // then fall back to reading row by row.
-  uint8_t* borrow_spare_scratch() {
+  // Lend the spare to another task until return_spare(): the sync's download
+  // buffers (wifi_sync.h). The caller is not on the UI thread, so every other
+  // claim (cache, snapshot, pre-draw)
+  // refuses while it is out, and the screens draw without it: the book list
+  // shows no thumbnails until it comes back. Both calls happen on the UI thread
+  // (wg_sync::poll), so the flag needs no lock. What the spare held is lost.
+  uint8_t* lend_spare() {
+    if (!spare_ || spare_lent_)
+      return nullptr;
     spare_use_ = Spare::None;
+    spare_lent_ = true;
     return spare_;
+  }
+  void return_spare() {
+    spare_lent_ = false;
   }
 
   // Lend the spare as a cache that may outlive the screen using it: the book
   // list keeps its cover thumbnails here. Nothing draws into it while the list
   // is up, so the reader's two uses never overlap it. Like them it is
-  // invalidated by any other claim — a snapshot, a pre-draw, the sleep path, a
-  // release.
+  // invalidated by any other claim — a snapshot, a pre-draw, a sync's loan.
   //
   // Validity is a generation, not just the enum: each time the spare *enters*
   // cache use its contents are garbage and the generation moves, so a cache that
   // was displaced and re-claimed cannot mistake its old slots for live ones. The
   // owner trusts what it wrote only while
-  // spare_cache_valid(the generation it wrote under). Null when released.
+  // spare_cache_valid(the generation it wrote under).
   //
   // `owner` distinguishes the two caches that use it — the book list's
   // thumbnails and the home screen's cover — so one claiming it moves the
   // generation and invalidates the other, rather than both trusting slots the
   // other has overwritten.
   uint8_t* claim_spare_cache(const void* owner) {
-    if (!spare_) {
+    if (!spare_ || spare_lent_) {
       spare_use_ = Spare::None;
       return nullptr;
     }
@@ -309,10 +303,13 @@ class DrawBuffer {
     return spare_use_ == Spare::Cache && gen == spare_cache_gen_;
   }
 
+  // The draw buffer holds the displayed frame, so a snapshot is a pointer
+  // swap: the page becomes the spare and the overlay draws into what the spare
+  // held (every draw starts with fill()). No 48 KB copy either way.
   void save_snapshot() {
-    if (!spare_)
+    if (!spare_ || spare_lent_)
       return;
-    memcpy(spare_, active_(), kBufSize);
+    std::swap(buf_, spare_);
     spare_use_ = Spare::Snapshot;
   }
 
@@ -320,31 +317,26 @@ class DrawBuffer {
     return spare_use_ == Spare::Snapshot;
   }
 
-  // Copy the snapshot into the inactive buffer, ready for the caller's refresh().
+  // Swap the snapshot back into the draw buffer, ready for the caller's
+  // refresh(). The spare then holds the overlay's frame, which is garbage.
   bool restore_snapshot() {
     if (spare_use_ != Spare::Snapshot)
       return false;
-    memcpy(inactive_(), spare_, kBufSize);
+    std::swap(buf_, spare_);
+    spare_use_ = Spare::None;
     return true;
   }
 
   // Redirect every draw call into the spare buffer until end_offscreen(). The
-  // displayed frame and the inactive buffer are both untouched meanwhile.
+  // draw buffer (the displayed frame) is untouched meanwhile.
   // Returns false when there is no spare; the caller must then skip the
   // pre-draw entirely rather than drawing into the live buffer.
   bool begin_offscreen() {
-    if (!spare_)
+    if (!spare_ || spare_lent_)
       return false;
     draw_target_ = spare_;
     spare_use_ = Spare::None;  // not usable until end_offscreen says so
     return true;
-  }
-
-  // Whether begin_offscreen() would succeed, without the side effects. Lets a
-  // caller skip speculative work it could not use — the spare is absent
-  // whenever a radio holds the heap.
-  bool can_offscreen() const {
-    return spare_ != nullptr;
   }
 
   void end_offscreen() {
@@ -356,11 +348,11 @@ class DrawBuffer {
     return spare_use_ == Spare::Offscreen;
   }
 
-  // Move the offscreen frame into the inactive buffer, ready for refresh().
+  // Swap the offscreen frame into the draw buffer, ready for refresh().
   bool commit_offscreen() {
     if (spare_use_ != Spare::Offscreen)
       return false;
-    memcpy(inactive_(), spare_, kBufSize);
+    std::swap(buf_, spare_);
     spare_use_ = Spare::None;
     return true;
   }
@@ -392,27 +384,27 @@ class DrawBuffer {
 
  private:
   IDisplay& display_;
-  // **Heap, not BSS, and this is what makes the BLE controller fit.** As a
-  // member array these were 96 KB of .bss, and .bss lands in the one ~50 KB
+  // **Heap, not BSS, and this is what makes the BLE controller fit.** As
+  // member arrays the framebuffers were 96 KB of .bss, and .bss lands in the one ~50 KB
   // contiguous DRAM pool the BT controller must allocate from (the boot log's
   // "At 3FCB3490 len 0000CB70 (50 KiB): RAM" — the other ~123 KB is retention
   // RAM, which .bss does not reach). The controller therefore had nowhere to
   // go and reported "esp_bt_controller_init -4" / ESP_ERR_NO_MEM.
   //
   // On the heap the allocator is free to place them in the retention pool and
-  // leave the scarce region for the radio. Nothing else changes: they are
-  // allocated once at construction and never freed.
-  uint8_t* bufs_[2] = {static_cast<uint8_t*>(std::malloc(kBufSize)),
-                       static_cast<uint8_t*>(std::malloc(kBufSize))};
-  // Heap for the same reason, but also released outright while a radio is up —
-  // see release_spare().
+  // leave the scarce region for the radio. Allocated once at construction and
+  // never freed.
+  uint8_t* buf_ = static_cast<uint8_t*>(std::malloc(kBufSize));
+  // Heap for the same reason, and likewise kept for the whole boot. Snapshot
+  // and offscreen commit swap it with buf_, so neither pointer is tied to one
+  // allocation.
   uint8_t* spare_ = static_cast<uint8_t*>(std::malloc(kBufSize));
   Spare spare_use_ = Spare::None;
+  bool spare_lent_ = false;  // see lend_spare()
   uint32_t spare_cache_gen_ = 0;  // see claim_spare_cache()
   const void* spare_owner_ = nullptr;
   // Non-null while begin_offscreen() is in effect; see draw_().
   uint8_t* draw_target_ = nullptr;
-  int active_idx_ = 0;
   Rotation rotation_ = Rotation::Deg90;
   bool sunlight_fading_fix_ = true;
 
@@ -420,18 +412,11 @@ class DrawBuffer {
   const uint8_t* sleep_img_ = nullptr;
   size_t sleep_img_size_ = 0;
 
-  // Where draw calls land: the inactive buffer normally, the spare while an
+  // Where draw calls land: the draw buffer normally, the spare while an
   // offscreen pass is in effect. Commit paths (refresh, full_refresh,
-  // restore_snapshot) always use inactive_() directly.
+  // restore_snapshot) always use buf_ directly.
   uint8_t* draw_() {
-    return draw_target_ ? draw_target_ : inactive_();
-  }
-
-  uint8_t* inactive_() {
-    return bufs_[1 - active_idx_];
-  }
-  const uint8_t* active_() const {
-    return bufs_[active_idx_];
+    return draw_target_ ? draw_target_ : buf_;
   }
 
   // Fill a physical horizontal span [x1, x2) on physical row `row`. Physical x

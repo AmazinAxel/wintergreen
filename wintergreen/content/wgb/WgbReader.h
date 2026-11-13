@@ -5,14 +5,16 @@
 #include <vector>
 
 #include "../ContentModel.h"
-#include "../IParagraphSource.h"
-#include "../TextLayout.h"
 #include "WgbFormat.h"
 
 namespace wintergreen {
 
-// Reads a WGB file. Loads the chapter table and image refs into RAM on
-// open(), then provides paragraph loading by file offset.
+// Reads a WGB file. open() keeps only the header and the metadata in RAM; page
+// records, display lists, image refs and chapter starts are read from the card
+// when asked for, so nothing here grows with the book.
+//
+// Also opens the bake's intermediate file (empty page section), which is how
+// WgbParagraphs and WgbPaginator get at it.
 class WgbReader {
  public:
   WgbReader() = default;
@@ -29,35 +31,38 @@ class WgbReader {
     return f_ != nullptr;
   }
 
-  // Counts
-  uint32_t paragraph_count() const {
-    return header_.paragraph_count;
-  }
-  uint16_t chapter_count() const {
-    return header_.chapter_count;
+  const WgbHeader& header() const {
+    return header_;
   }
   uint16_t image_count() const {
     return header_.image_count;
   }
-
-  // Chapter navigation
-  uint32_t chapter_para_table_offset(uint16_t chapter_idx) const;
-  uint16_t chapter_paragraph_count(uint16_t chapter_idx) const;
-  uint32_t chapter_char_count(uint16_t chapter_idx) const;
-
-  // Sum of char_count across all chapters (0 if not stored, i.e. old WGB file).
-  uint64_t total_char_count() const;
-
-  // Load a single paragraph at a given file offset. False on any read or
-  // format error.
-  bool load_paragraph(uint32_t file_offset, Paragraph& out);
-
-  // Image references
-  const WgbImageRef& image_ref(uint16_t index) const {
-    return images_[index];
+  // Number of reviewed chapters (the quick menu's numbered grid).
+  uint16_t chapter_count() const {
+    return header_.chapter_count;
+  }
+  uint32_t page_count(uint8_t layout) const {
+    return layout < kWgbLayouts ? header_.page_count[layout] : 0;
   }
 
-  // Metadata
+  // Page record `index` of `layout`. False past the end or on a read error.
+  bool page(uint8_t layout, uint32_t index, WgbPage& out);
+
+  // Read the display list of `rec` into `buf` (capacity `cap`). False on a
+  // read error or one larger than `cap`.
+  bool read_page(const WgbPage& rec, uint8_t* buf, size_t cap);
+
+  // The page of `layout` holding the reading position (para_offset,
+  // text_offset): the last page that starts at or before it, by binary search
+  // over the records on the card. 0 for a position before the first page.
+  uint32_t find_page(uint8_t layout, uint32_t para_offset, uint16_t text_offset);
+
+  // The page each chapter starts on in `layout`, chapter_count() entries.
+  bool chapter_pages(uint8_t layout, std::vector<uint32_t>& out);
+
+  // Image ref `index`, one 12-byte read. False past the end or on a read error.
+  bool image_ref(uint16_t index, WgbImageRef& out);
+
   const EpubMetadata& metadata() const {
     return metadata_;
   }
@@ -68,177 +73,16 @@ class WgbReader {
     return f_;
   }
 
-  const TableOfContents& toc() const {
-    return toc_;
-  }
-
  private:
   FILE* f_ = nullptr;
   WgbHeader header_{};
-  std::vector<WgbChapterEntry> chapters_;
-  std::vector<WgbImageRef> images_;
   EpubMetadata metadata_;
-  TableOfContents toc_;
 
-  // Staging for one paragraph body, reused across loads so a page turn that
-  // pulls in new paragraphs does not malloc and free a block per paragraph —
-  // short-lived blocks of varying size are what fragment this heap. Capacity is
-  // monotonic up to kBodyKeepBytes; a rare larger body is released after use.
-  static constexpr size_t kBodyKeepBytes = 8 * 1024;
-  std::vector<uint8_t> body_;
-
+  // File offset of `layout`'s chapter-start table; its page records follow.
+  uint32_t layout_base_(uint8_t layout) const;
+  bool read_at_(uint32_t at, void* buf, size_t size);
   bool read_bytes(void* buf, size_t size);
   std::string read_string();
-  bool parse_paragraph_(uint8_t type, Paragraph& out);
-  bool deserialize_text(const uint8_t* data, size_t size, Paragraph& out);
-
-  friend class WgbChapterSource;
 };
-
-// ---------------------------------------------------------------------------
-// IParagraphSource backed by WgbReader — loads paragraphs on demand
-// for a single chapter, with a sliding-window cache.
-//
-// On construction, reads the chapter's paragraph descriptor table into a local
-// vector of file offsets (~4 bytes per paragraph).
-//
-// Only kWindowSize paragraphs are kept in memory at once. When a
-// paragraph outside the window is requested, the window slides to
-// center on the new access point, evicting old entries.
-// ---------------------------------------------------------------------------
-
-class WgbChapterSource : public IParagraphSource {
- public:
-  static constexpr size_t kWindowSize = 32;
-
-  WgbChapterSource(WgbReader& reader, uint16_t chapter_idx) : reader_(reader) {
-    uint16_t count = reader.chapter_paragraph_count(chapter_idx);
-    if (count == 0)
-      return;
-
-    // Bulk-read the descriptor table: one seek + one fread of N×8 bytes.
-    uint32_t table_off = reader.chapter_para_table_offset(chapter_idx);
-    if (table_off == 0)
-      return;
-
-    offsets_.resize(count);
-    para_char_offsets_.resize(count);
-
-    // One fread for the whole descriptor table, parsed from memory. Reading the
-    // 8-byte entries one at a time cost a FATFS + SPI round trip per paragraph,
-    // and a chapter can have hundreds — it dominated chapter-load time, which is
-    // on the path for every book open and every chapter jump. The staging buffer
-    // is freed before layout begins, so the peak is 8 bytes per paragraph on top
-    // of the two vectors that are kept anyway.
-    {
-      std::vector<uint8_t> table(static_cast<size_t>(count) * 8);
-      fseek(reader.f_, static_cast<long>(table_off), SEEK_SET);
-      if (fread(table.data(), 1, table.size(), reader.f_) != table.size()) {
-        offsets_.clear();
-        para_char_offsets_.clear();
-        return;
-      }
-      for (uint16_t i = 0; i < count; ++i) {
-        const uint8_t* p = table.data() + static_cast<size_t>(i) * 8;
-        offsets_[i] = wgb_read_u32(p);
-        para_char_offsets_[i] = wgb_read_u32(p + 4);
-      }
-    }
-    total_chars_ = reader.chapter_char_count(chapter_idx);
-
-    size_t actual = count < kWindowSize ? count : kWindowSize;
-    slots_.resize(actual);
-    slot_index_.resize(actual, UINT32_MAX);
-  }
-
-  size_t paragraph_count() const override {
-    return offsets_.size();
-  }
-
-  // Cumulative char offset just before paragraph `index` (0-based).
-  // Returns total_chars() when index >= paragraph_count (= chars in whole chapter).
-  uint32_t char_before_para(size_t index) const {
-    if (index >= para_char_offsets_.size())
-      return total_chars_;
-    return para_char_offsets_[index];
-  }
-
-  // Total chars in this chapter (sum of all run text lengths).
-  uint32_t total_chars() const {
-    return total_chars_;
-  }
-
-  // **Do not add a way to shrink this window. It was tried and it corrupts the
-  // displayed page.** Freeing slots above a limit — even keeping the current
-  // paragraph and its neighbours — produced text drawn from freed memory:
-  // "?  I   is mos   astonish" in place of the real line, consistently wrong
-  // rather than intermittently.
-  //
-  // Every LayoutWord::text in the laid-out page points into these slots, and so
-  // do the entries of TextLayout's paragraph cache. A page can span more
-  // paragraphs than any "keep the current one" heuristic predicts, and the
-  // caches outlive the page that built them, so there is no safe subset to
-  // free while a book is open. The window is freed wholesale by load_chapter_()
-  // and that is the only safe point.
-
-  const Paragraph& paragraph(size_t index) const override {
-    // Check if already in window
-    for (size_t i = 0; i < slot_index_.size(); ++i) {
-      if (slot_index_[i] == static_cast<uint32_t>(index))
-        return slots_[i];
-    }
-
-    // Not in window — find a free slot or evict the furthest entry
-    size_t slot = find_slot_(index);
-    slot_index_[slot] = static_cast<uint32_t>(index);
-    if (!reader_.load_paragraph(offsets_[index], slots_[slot]))
-      slots_[slot] = Paragraph{};
-    return slots_[slot];
-  }
-
- private:
-  WgbReader& reader_;
-  std::vector<uint32_t> offsets_;            // file offsets of each paragraph
-  std::vector<uint32_t> para_char_offsets_;  // cumulative chars before each paragraph
-  uint32_t total_chars_ = 0;                 // total chars in this chapter
-  mutable std::vector<Paragraph> slots_;
-  mutable std::vector<uint32_t> slot_index_;  // UINT32_MAX = empty
-
-  // Find best slot: prefer empty, then evict the one furthest from `index`
-  size_t find_slot_(size_t index) const {
-    size_t best = 0;
-    uint32_t best_dist = 0;
-    for (size_t i = 0; i < slot_index_.size(); ++i) {
-      if (slot_index_[i] == UINT32_MAX)
-        return i;  // empty slot
-      uint32_t d = (slot_index_[i] > index) ? static_cast<uint32_t>(slot_index_[i] - index)
-                                            : static_cast<uint32_t>(index - slot_index_[i]);
-      if (d > best_dist) {
-        best_dist = d;
-        best = i;
-      }
-    }
-    return best;
-  }
-};
-
-// Image dimensions, straight out of the image table.
-//
-// The table is authoritative: the converter rasterised every image to the size
-// it will be drawn at, so there is nothing to scale and nothing to sniff. This
-// used to fall back to streaming the embedded JPEG/PNG header to recover
-// dimensions the EPUB markup had not declared, and then scale them to the page —
-// all of which now happens on the build machine.
-inline ImageSizeQuery make_image_size_query(const WgbReader& wgb) {
-  const WgbReader* r = &wgb;
-  return [r](uint16_t key, uint16_t& w, uint16_t& h) -> bool {
-    if (key >= r->image_count())
-      return false;
-    const auto& ref = r->image_ref(key);
-    w = ref.width;
-    h = ref.height;
-    return w != 0 && h != 0;
-  };
-}
 
 }  // namespace wintergreen

@@ -16,6 +16,9 @@ namespace wintergreen {
 // cover ever appeared.
 static_assert(kSleepCoverW == DrawBuffer::kWidth, "sleep cover must be panel width");
 static_assert(kSleepCoverH == DrawBuffer::kHeight, "sleep cover must be panel height");
+static_assert(kSleepFrameBytes == DrawBuffer::kBufSize && kSleepFrameStride == DisplayFrame::kStride &&
+                  kSleepFrameRows == DisplayFrame::kPhysicalHeight && kSleepFrameOffX == DisplayFrame::kPanelOffsetX,
+              "sleep frame must be the panel's frame");
 
 void Application::start(DrawBuffer& buf, IRuntime& runtime) {
   started_ = true;
@@ -83,53 +86,21 @@ void Application::auto_open_book(const char* epub_path, DrawBuffer& buf, IRuntim
 // Show `book_path`'s cover as the sleep screen. Returns false when the book has
 // no usable cover_sleep.bin, in which case the caller falls back to the wordmark.
 //
-// The file is composed by tools/epub2wgb at exactly panel size, with the
-// artwork already scaled, centred and its letterbox bars already toned, so
-// there is nothing left to do here but stream it onto the panel a row at a
-// time. Anything of another size is from an older conversion and is ignored
-// rather than guessed at.
+// The file is composed by `books` (tools/books) as the panel's own frame
+// (CoverPaths.h): artwork scaled, dithered and laid out in physical byte
+// order, so one fread straight into the draw buffer is the whole job. No
+// scratch buffer, no blit. A short file leaves a partial frame, which the
+// caller's wordmark fallback overwrites in full.
 static bool show_book_cover_sleep_(DrawBuffer& buf, const char* data_dir, const std::string& book_path) {
   if (!data_dir || book_path.empty()) return false;
 
   const std::string cpath = cover_sleep_bin_path(book_path.c_str());
   FILE* f = std::fopen(cpath.c_str(), "rb");
   if (!f) return false;
-
-  uint16_t hdr[2] = {};
-  const int W = buf.width(), H = buf.height();
-  if (std::fread(hdr, 2, 2, f) != 2 || hdr[0] != W || hdr[1] != H) {
-    std::fclose(f);
+  const bool ok = std::fread(buf.frame(), 1, kSleepFrameBytes, f) == kSleepFrameBytes && std::fgetc(f) == EOF;
+  std::fclose(f);
+  if (!ok)
     return false;
-  }
-
-  const int stride = (W + 7) / 8;
-  const size_t body = static_cast<size_t>(stride) * H;
-
-  // One fread for the whole image where possible. Row-at-a-time is 793 FATFS +
-  // SPI round trips on a 20 MHz card and dominated the time to show a sleep
-  // cover. The spare framebuffer is idle at sleep time and is big enough, so
-  // this needs no allocation; when it has been released (Wi-Fi sync) fall back
-  // to the row loop rather than growing the heap on the way to sleep.
-  uint8_t* scratch = (body <= DrawBuffer::kBufSize) ? buf.borrow_spare_scratch() : nullptr;
-  if (scratch) {
-    if (std::fread(scratch, 1, body, f) != body) {
-      std::fclose(f);
-      return false;  // truncated: nothing has been drawn yet, so the caller's fallback is clean
-    }
-    std::fclose(f);
-    buf.blit_1bit(0, 0, scratch, W, H, stride);
-  } else {
-    uint8_t row[(kSleepCoverW + 7) / 8];
-    if (stride > static_cast<int>(sizeof(row))) { std::fclose(f); return false; }
-    for (int y = 0; y < H; ++y) {
-      if (std::fread(row, 1, stride, f) != static_cast<size_t>(stride)) {
-        std::fclose(f);
-        return false;  // truncated: whatever reached the buffer is discarded unrefreshed
-      }
-      buf.blit_1bit(0, y, row, W, 1, sizeof(row));
-    }
-    std::fclose(f);
-  }
 
   // Half ignores prev (CTRL1_BYPASS_RED) and paints from `pixels` alone, which
   // is what keeps it to a single pass and makes the sleep screen appear quietly.
@@ -204,6 +175,7 @@ void Application::update(const ButtonState& buttons, uint32_t dt_ms, DrawBuffer&
     start(buf, runtime);
   if (!running_)
     return;
+  buttons_down_ = buttons.current != 0;
 
   // Dynamic frequency scaling: hold the CPU at 160 MHz while the UI is working,
   // let it idle at 80 MHz otherwise. Page layout and drawing take no PM lock of
@@ -214,7 +186,6 @@ void Application::update(const ButtonState& buttons, uint32_t dt_ms, DrawBuffer&
   // or two of the press; what follows is the waveform, which the CPU only waits
   // out, so holding 160 MHz through it was ~7 mA spent on nothing. 750 ms became
   // 300, still a dozen frames past the last of that work.
-  static constexpr uint32_t kPerfHoldMs = 300;
   if (buttons.current != 0 || buttons.pressed_latch != 0 || has_pending_transition()) {
     perf_idle_ms_ = 0;
     runtime.set_performance_hold(true);
@@ -241,15 +212,14 @@ void Application::update(const ButtonState& buttons, uint32_t dt_ms, DrawBuffer&
   //      shorter than a single e-ink refresh, which is the largest current spike
   //      the device has and drags the rail down with it.
   //   4. It never samples while the panel is mid-refresh, for the same reason.
-  //   5. USB bypasses it, which is the recovery path. That check must be a real
-  //      one — see usb_attached() in main.cpp for how getting it wrong stranded
-  //      the device even while plugged in.
+  //   5. USB does not bypass it (removed on purpose). Recovery is the charger,
+  //      which runs with the SoC asleep; flashing a cut-off device means
+  //      starting the upload and holding power.
   //   6. It samples once a second, not once a frame. The cell cannot move in
   //      25 ms, and an ADC conversion plus its calibration curve is real work to
   //      repeat 40 times a second for an answer that never changes.
-  if (kLowBatteryCutoffMv > 0 && !usb_powered_ && !buf.display().is_busy()) {
+  if (kLowBatteryCutoffMv > 0 && !buf.display().is_busy()) {
     static constexpr int kImplausibleMv = 2500;
-    static constexpr uint32_t kBatteryPollMs = 1000;
     battery_poll_ms_ += dt_ms;
     if (battery_poll_ms_ >= kBatteryPollMs) {
       const uint32_t elapsed = battery_poll_ms_;
@@ -268,9 +238,6 @@ void Application::update(const ButtonState& buttons, uint32_t dt_ms, DrawBuffer&
       }
     }
   }
-  // Cleared every frame; main.cpp re-asserts it via keep_awake() while a host is
-  // attached, so unplugging re-arms both the cutoff and auto-sleep.
-  usb_powered_ = false;
 
   // Inactivity / auto-sleep tracking
   if (buttons.current != 0 || buttons.pressed_latch != 0) {
@@ -321,26 +288,6 @@ void Application::update(const ButtonState& buttons, uint32_t dt_ms, DrawBuffer&
     fwd.press_history_count = n;
   }
 
-  // Track the clicker so the reader's cache cap follows the radio rather than
-  // the quick-menu row. A clicker can drop on its own — it goes out of range,
-  // its battery dies, the peer disconnects — and the cap must lift then too, or
-  // a session pays for a radio that is no longer there.
-  // **Keyed on whether the BLE stack is holding memory, not on whether a
-  // clicker is connected.** Those are different: the NimBLE host and esp_hidh
-  // are initialised once and never torn down (deinit panics on this IDF), so a
-  // disconnect gives back the link but not the heap. Lifting the reader's caps
-  // on Disconnected therefore restored a full-size working set on top of a
-  // stack that still owned its allocation, and the next page turn found 1,640
-  // bytes free.
-  const bool radio_holds_ram = runtime.clicker_holds_ram();
-  if (radio_holds_ram != radio_ram_held_) {
-    if (radio_holds_ram)
-      release_ram_for_radio();
-    else
-      restore_ram_after_radio();
-    radio_ram_held_ = radio_holds_ram;
-  }
-
   IScreen* top = screen_mgr_.top();
   if (top) {
     top->update(fwd, buf, runtime);
@@ -387,6 +334,22 @@ void Application::update(const ButtonState& buttons, uint32_t dt_ms, DrawBuffer&
   if (persist_pending_ && persist_quiet_ms_ >= kPersistQuietMs && !buf.display().is_busy() &&
       !has_pending_transition())
     flush_persist();
+}
+
+uint32_t Application::idle_wait_ms(DrawBuffer& buf) const {
+  if (!started_ || !running_ || buttons_down_ || power_armed_ || perf_idle_ms_ < kPerfHoldMs || persist_pending_ ||
+      has_pending_transition() || buf.display().is_busy())
+    return 0;
+  uint32_t wait = UINT32_MAX;
+  if (kLowBatteryCutoffMv > 0)
+    wait = battery_poll_ms_ < kBatteryPollMs ? kBatteryPollMs - battery_poll_ms_ : 1;
+  if (config::kAutoSleepMinutes > 0) {
+    const uint32_t timeout_ms = static_cast<uint32_t>(config::kAutoSleepMinutes) * 60u * 1000u;
+    const uint32_t left = inactivity_ms_ < timeout_ms ? timeout_ms - inactivity_ms_ : 1;
+    if (left < wait)
+      wait = left;
+  }
+  return wait;
 }
 
 void Application::flush_persist() {
@@ -457,42 +420,6 @@ void Application::save_settings_() {
 }
 
 
-void Application::release_ram_for_radio(bool drop_book_index) {
-  // **The index is only safe to drop when no screen is showing its strings.**
-  // MainMenu::entries_ holds StringRefs into BookIndex's StringPool, so
-  // releasing the pool while the book list is on display leaves every title and
-  // author resolving to an empty string_view — the list stays navigable and
-  // keeps showing reading percentages, because those are uint8_t copies, so it
-  // reads as a drawing glitch rather than a dangling reference.
-  //
-  // The quick menu holds no StringRefs and passes true; the sync runs *from*
-  // the book list and passes false. It loses little: run_sync_() reloads the
-  // index from disk as its first act anyway.
-  if (drop_book_index)
-    BookIndex::instance().release_memory();
-
-  // **The reader's caches go too, and the earlier reasoning for keeping them
-  // was wrong.** It ran: they are what make a page turn a memcpy instead of a
-  // layout, and a clicker exists to turn pages, so releasing them defeats the
-  // feature. What that missed is that the alternative is not a slow page turn,
-  // it is no page turn at all — a backward turn with the radio up threw
-  // std::bad_alloc from assemble_page's word_pool reserve (a 912-byte
-  // allocation; the heap was simply empty) and with exceptions disabled that
-  // aborts and reboots the device mid-book.
-  //
-  // Freed here rather than at each allocation site because the shortage is
-  // global: any screen that allocates while BLE is resident is exposed, and the
-  // reader's caches are the largest thing that can be given back without
-  // losing state.
-  reader_.release_caches();
-}
-
-void Application::restore_ram_after_radio() {
-  // Only the cap is restored; the caches themselves refill on demand. The book
-  // index reloads from disk the next time a screen asks for it.
-  reader_.restore_caches();
-}
-
 void Application::record_book_opened(const std::string& path) {
   // In-memory only. Neither file is written here.
   //
@@ -511,9 +438,8 @@ void Application::record_book_progress(const std::string& path, int pct) {
     return;
   BookIndex& idx = BookIndex::instance();
   // A session that resumed straight into a book never read the index (see
-  // start()), so read it now — once, and never with the radio up, where ~30 KB
-  // is not there to spend. A dropped percentage is the old behaviour there.
-  if (index_deferred_ && idx.entries().empty() && !radio_ram_held_)
+  // start()), so read it now — once.
+  if (index_deferred_ && idx.entries().empty())
     idx.load(index_path_);
   index_deferred_ = false;
   // The index stays resident for the whole session (see MainMenu::stop), so the

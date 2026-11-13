@@ -44,13 +44,24 @@ class Esp32Runtime final : public wintergreen::IRuntime {
     return last_frame_ms_;
   }
 
-  void wait_next_frame() override {
+  uint32_t target_frame_ms() const override {
+    return target_frame_ms_;
+  }
+
+  // B4: idle screens block until their nearest deadline (seconds) instead of
+  // waking 40 times a second to find nothing to do.
+  void wait_next_frame(uint32_t budget_ms) override {
     const uint32_t now = millis();
+    const uint32_t limit = budget_ms ? budget_ms : target_frame_ms_;
     if (frame_start_ms_ != 0) {
       const uint32_t elapsed = now - frame_start_ms_;
-      if (elapsed < target_frame_ms_) {
-        // Ends early on input; see ui_wake.h.
-        const TickType_t wait = pdMS_TO_TICKS(target_frame_ms_ - elapsed);
+      if (elapsed < limit) {
+        // Ends early on input; see ui_wake.h. Ticks round *up*: a deadline
+        // a few ms away must not become a zero-tick wait that spins.
+        const TickType_t wait =
+            limit == UINT32_MAX
+                ? portMAX_DELAY
+                : static_cast<TickType_t>((limit - elapsed + portTICK_PERIOD_MS - 1) / portTICK_PERIOD_MS);
         if (g_ui_wake)
           xSemaphoreTake(g_ui_wake, wait);
         else
@@ -137,12 +148,6 @@ class Esp32Runtime final : public wintergreen::IRuntime {
   }
   void toggle_clicker() override {
     wg_clicker::toggle();
-  }
-  bool clicker_holds_ram() const override {
-    return wg_clicker::holds_ram();
-  }
-  uint32_t largest_free_block_bytes() const override {
-    return static_cast<uint32_t>(heap_caps_get_largest_free_block(MALLOC_CAP_INTERNAL));
   }
   uint8_t clicker_battery_pct() const override {
     return wg_clicker::battery_pct();

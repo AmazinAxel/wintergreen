@@ -9,7 +9,7 @@ A fork of [Nous](https://github.com/unitreign/nous), which is a fork of [Microre
 Some goals:
 
 - Syncs to a scripted NAS server
-  - Because all books have to be converted to a binary format, the NAS server runs a script to convert all of them locally so that the Xteink can pull just the binary files and not the unconverted epubs. This saves space and makes syncing _much_ faster.
+  - Books are converted to a binary format on your computer by the `books` tool (review title, author, cover and chapters, then bake), which copies the results to the NAS. The Xteink pulls just the baked files, never the EPUBs. This saves space and makes syncing _much_ faster.
   - When a book is finished, a Sync deletes it and saves it to a different JSON file with all your finshed books!
 - Bluetooth clicker support (only supports reprogammable clickers with left/right arrow for page navigation)
   - Highly optimized, works great (NOT a beta feature!) and supports back/select keys with page caching!
@@ -59,6 +59,7 @@ namespace wintergreen::config {
   inline constexpr uint32_t kHoldDelayMs = 250;
   inline constexpr uint32_t kHoldRepeatMs = 100;
   inline constexpr int kHoldAccelStep = 0;
+  inline constexpr uint32_t kBluetoothHoldDelayMs = 100;
 }
 ```
 

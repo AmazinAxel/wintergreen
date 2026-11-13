@@ -11,6 +11,7 @@
 #include <string>
 #include <vector>
 
+#include "CoverPaths.h"
 #include "wgb/WgbReader.h"
 
 namespace wintergreen {
@@ -21,6 +22,10 @@ bool ci_less(std::string_view a, std::string_view b) {
   if (cmp != 0) return cmp < 0;
   return a.size() < b.size();
 }
+
+// .wintergreen-index record: u16 path_len, u16 title_len, u16 author_len,
+// u32 last_open_order, u8 progress_pct; little-endian. No magic, no version.
+static constexpr size_t kIndexRecordBytes = 11;
 
 BookIndex& BookIndex::instance() {
   static BookIndex instance;
@@ -38,7 +43,7 @@ static bool ends_with_ci(const char* name, size_t name_len, const char* ext, siz
   return true;
 }
 
-// A book is a .wgb produced by tools/epub2wgb. EPUBs are not recognised: the
+// A book is a .wgb produced by `books` (tools/books). EPUBs are not recognised: the
 // device has no converter, so listing one would only offer a book that cannot
 // be opened.
 static bool has_book_extension(const char* name, size_t name_len) {
@@ -89,7 +94,82 @@ bool BookIndex::add_entry(std::string_view path, std::string_view title, std::st
   entry.last_open_order = last_open_order;
   entries_.push_back(entry);
   dirty_ = true;
+  thumbs_dirty_ = true;
+  fresh_keys_.push_back(book_path_key(path));
   return true;
+}
+
+std::string thumb_pack_path(const std::string& index_file) {
+  const size_t slash = index_file.find_last_of('/');
+  return (slash == std::string::npos ? std::string() : index_file.substr(0, slash + 1)) + ".wintergreen-thumbs";
+}
+
+size_t thumb_pack_slot_bytes() {
+  return 8 + cover_cols_bytes(kListCoverW, kListCoverH);
+}
+
+// Rebuild the pack in entry order. Slots of books already in the old pack are
+// copied from it (one open, sequential-ish reads); only new books open their
+// cover_list.bin. Same tmp + remove + rename as the index.
+void BookIndex::save_thumbs_(const std::string& index_file) const {
+  const std::string path = thumb_pack_path(index_file);
+  const std::string tmp = path + ".tmp";
+  const size_t slot_bytes = thumb_pack_slot_bytes();
+  std::vector<uint8_t> slot(slot_bytes);
+
+  FILE* old = std::fopen(path.c_str(), "rb");
+  std::vector<uint32_t> old_keys;
+  if (old) {
+    uint8_t h[4];
+    for (long at = 0; std::fseek(old, at, SEEK_SET) == 0 && std::fread(h, 1, 4, old) == 4;
+         at += static_cast<long>(slot_bytes))
+      old_keys.push_back(h[0] | (h[1] << 8) | (h[2] << 16) | (static_cast<uint32_t>(h[3]) << 24));
+  }
+  FILE* out = std::fopen(tmp.c_str(), "wb");
+  if (!out) {
+    if (old)
+      std::fclose(old);
+    return;
+  }
+  bool ok = true;
+  for (const auto& e : entries_) {
+    const std::string_view p = e.path.view(pool_);
+    const uint32_t key = book_path_key(p);
+    std::fill(slot.begin(), slot.end(), 0xFF);
+    bool have = false;
+    const bool fresh = std::find(fresh_keys_.begin(), fresh_keys_.end(), key) != fresh_keys_.end();
+    for (size_t i = 0; old && !fresh && i < old_keys.size() && !have; ++i)
+      if (old_keys[i] == key)
+        have = std::fseek(old, static_cast<long>(i * slot_bytes), SEEK_SET) == 0 &&
+               std::fread(slot.data(), 1, slot_bytes, old) == slot_bytes;
+    if (!have) {
+      uint16_t wh[2] = {0, 0};
+      FILE* c = std::fopen(cover_list_bin_path(std::string(p).c_str()).c_str(), "rb");
+      if (c) {
+        if (std::fread(wh, 2, 2, c) != 2 || wh[0] == 0 || wh[1] == 0 || wh[0] > kListCoverW || wh[1] > kListCoverH ||
+            std::fread(slot.data() + 8, 1, cover_cols_bytes(wh[0], wh[1]), c) != cover_cols_bytes(wh[0], wh[1]) ||
+            std::fgetc(c) != EOF)
+          wh[0] = wh[1] = 0;
+        std::fclose(c);
+      }
+      std::memcpy(slot.data() + 4, &wh[0], 2);
+      std::memcpy(slot.data() + 6, &wh[1], 2);
+    }
+    for (int b = 0; b < 4; ++b)
+      slot[b] = static_cast<uint8_t>(key >> (8 * b));
+    ok = ok && std::fwrite(slot.data(), 1, slot_bytes, out) == slot_bytes;
+  }
+  if (old)
+    std::fclose(old);
+  if (std::fclose(out) != 0 || !ok) {
+    std::remove(tmp.c_str());
+    return;
+  }
+  std::remove(path.c_str());
+  if (std::rename(tmp.c_str(), path.c_str()) == 0) {
+    thumbs_dirty_ = false;
+    std::vector<uint32_t>().swap(fresh_keys_);
+  }
 }
 
 bool BookIndex::load(const std::string& index_file) {
@@ -105,81 +185,63 @@ bool BookIndex::load(const std::string& index_file) {
   // also allocating chunks, and a vector realloc holds the old and new blocks at
   // once — the same transient spike that threw bad_alloc in build_page_items.
   //
-  // Sized from the file rather than MAX_BOOKS: a 3-book library should not take
-  // 4 KB for 250 slots. One line is a path, a title, an author and two numbers,
-  // so bytes/64 is a floor on the entry count that never over-reserves for a
-  // real index. Off by a little is harmless — this only has to stop the
-  // reallocation chain, not predict exactly.
-  if (std::fseek(f, 0, SEEK_END) == 0) {
-    const long bytes = std::ftell(f);
-    if (bytes > 0) {
-      const size_t est = static_cast<size_t>(bytes) / 64 + 1;
-      entries_.reserve(est > MAX_BOOKS ? MAX_BOOKS : est);
-      pool_.reserve(static_cast<size_t>(bytes));
-    }
-  }
+  // Binary (see kIndexRecordBytes): the record table in one read, then each
+  // string copied straight into the pool. No line splitting, no number
+  // parsing. The sizes must add up to the file exactly, which a file in any
+  // other shape fails; load() then reports no index and the caller rescans.
+  long bytes = -1;
+  if (std::fseek(f, 0, SEEK_END) == 0)
+    bytes = std::ftell(f);
   std::rewind(f);
-
-  char line[1024];
-  bool first_line = true;
-  bool needs_rebuild = false;
-  while (std::fgets(line, sizeof(line), f) && static_cast<int>(entries_.size()) < MAX_BOOKS) {
-    if (first_line) {
-      first_line = false;
-      if (std::strncmp(line, "#wintergreen-index v", 20) == 0) {
-        uint32_t v = static_cast<uint32_t>(std::strtoul(line + 20, nullptr, 10));
-        if (v != INDEX_FORMAT_VERSION)
-          needs_rebuild = true;
-        continue;
-      } else {
-        needs_rebuild = true;
-      }
-    }
-
-    // Remove newline
-    size_t len = std::strlen(line);
-    if (len > 0 && line[len - 1] == '\n') {
-      line[len - 1] = '\0';
-      len--;
-    }
-    if (len > 0 && line[len - 1] == '\r') {
-      line[len - 1] = '\0';
-      len--;
-    }
-
-    // Format: path|title|author[|last_open_order[|progress_pct]]
-    char* sep1 = std::strchr(line, '|');
-    if (!sep1)
-      continue;
-    *sep1 = '\0';
-    char* sep2 = std::strchr(sep1 + 1, '|');
-    if (!sep2)
-      continue;
-    *sep2 = '\0';
-
-    // Optional field 4: last_open_order. Older files appended reading statistics
-    // after it; those are no longer tracked, and strtoul stops at the separator
-    // so the extra columns are simply ignored.
-    uint32_t order = 0;
-    uint32_t pct = 0;
-    char* sep3 = std::strchr(sep2 + 1, '|');
-    if (sep3) {
-      *sep3 = '\0';
-      order = static_cast<uint32_t>(std::strtoul(sep3 + 1, nullptr, 10));
-      // Optional field 5: cached reading percentage. Absent in files written by
-      // older firmware, which simply read back as 0.
-      char* sep4 = std::strchr(sep3 + 1, '|');
-      if (sep4)
-        pct = static_cast<uint32_t>(std::strtoul(sep4 + 1, nullptr, 10));
-    }
-    if (add_entry(line, sep1 + 1, sep2 + 1, order))
-      entries_.back().progress_pct = static_cast<uint8_t>(pct > 100 ? 100 : pct);
-  }
-
-  std::fclose(f);
-  dirty_ = false;
-  if (needs_rebuild)
+  uint8_t hdr[2];
+  if (bytes < 2 || std::fread(hdr, 1, 2, f) != 2) {
+    std::fclose(f);
     return false;
+  }
+  const size_t count = hdr[0] | (hdr[1] << 8);
+  std::vector<uint8_t> recs(count * kIndexRecordBytes);
+  size_t total = 2 + recs.size();
+  bool ok = count <= MAX_BOOKS && std::fread(recs.data(), 1, recs.size(), f) == recs.size();
+  for (size_t i = 0; ok && i < count; ++i) {
+    const uint8_t* r = recs.data() + i * kIndexRecordBytes;
+    total += static_cast<size_t>(r[0] | (r[1] << 8)) + (r[2] | (r[3] << 8)) + (r[4] | (r[5] << 8));
+  }
+  ok = ok && total == static_cast<size_t>(bytes);
+  if (ok) {
+    entries_.reserve(count);
+    pool_.reserve(total);
+  }
+  // One stack buffer (the sync task loads this too), each string pooled as read.
+  char s[1024];
+  for (size_t i = 0; ok && i < count; ++i) {
+    const uint8_t* r = recs.data() + i * kIndexRecordBytes;
+    StringRef refs[3];
+    for (int k = 0; k < 3 && ok; ++k) {
+      const size_t len = r[2 * k] | (r[2 * k + 1] << 8);
+      ok = len < sizeof(s) && std::fread(s, 1, len, f) == len;
+      if (ok)
+        refs[k] = pool_.add(std::string_view(s, len));
+    }
+    if (!ok)
+      break;
+    BookIndexEntry e;
+    e.path = refs[0];
+    e.title = refs[1];
+    e.author = refs[2];
+    e.last_open_order = r[6] | (r[7] << 8) | (r[8] << 16) | (static_cast<uint32_t>(r[9]) << 24);
+    e.progress_pct = r[10] > 100 ? 100 : r[10];
+    entries_.push_back(e);
+  }
+  std::fclose(f);
+  if (!ok) {
+    entries_.clear();
+    pool_.reset();
+    return false;
+  }
+  dirty_ = false;
+  // The pack on the card was written with this index; nothing to rebuild.
+  thumbs_dirty_ = false;
+  std::vector<uint32_t>().swap(fresh_keys_);
   return true;
 }
 
@@ -196,18 +258,30 @@ bool BookIndex::save(const std::string& index_file) const {
   if (!f)
     return false;
 
-  std::fprintf(f, "#wintergreen-index v%lu\n", (unsigned long)INDEX_FORMAT_VERSION);
-
+  // [u16 count][count records][strings: path, title, author per record].
+  const uint8_t hdr[2] = {static_cast<uint8_t>(entries_.size()), static_cast<uint8_t>(entries_.size() >> 8)};
+  bool ok = std::fwrite(hdr, 1, 2, f) == 2;
   for (const auto& entry : entries_) {
-    auto path_v = entry.path.view(pool_);
-    auto title_v = entry.title.view(pool_);
-    auto author_v = entry.author.view(pool_);
-    std::fprintf(f, "%.*s|%.*s|%.*s|%u|%u\n",
-                 static_cast<int>(path_v.size()), path_v.data(),
-                 static_cast<int>(title_v.size()), title_v.data(),
-                 static_cast<int>(author_v.size()), author_v.data(),
-                 static_cast<unsigned>(entry.last_open_order),
-                 static_cast<unsigned>(entry.progress_pct));
+    uint8_t r[kIndexRecordBytes];
+    const StringRef refs[3] = {entry.path, entry.title, entry.author};
+    for (int k = 0; k < 3; ++k) {
+      r[2 * k] = static_cast<uint8_t>(refs[k].len);
+      r[2 * k + 1] = static_cast<uint8_t>(refs[k].len >> 8);
+    }
+    for (int b = 0; b < 4; ++b)
+      r[6 + b] = static_cast<uint8_t>(entry.last_open_order >> (8 * b));
+    r[10] = entry.progress_pct;
+    ok = ok && std::fwrite(r, 1, sizeof(r), f) == sizeof(r);
+  }
+  for (const auto& entry : entries_)
+    for (const StringRef& ref : {entry.path, entry.title, entry.author}) {
+      const std::string_view v = ref.view(pool_);
+      ok = ok && std::fwrite(v.data(), 1, v.size(), f) == v.size();
+    }
+  if (!ok) {
+    std::fclose(f);
+    std::remove(tmp_path.c_str());
+    return false;
   }
 
   if (std::fclose(f) != 0) {
@@ -222,53 +296,12 @@ bool BookIndex::save(const std::string& index_file) const {
   std::remove(index_file.c_str());
   if (std::rename(tmp_path.c_str(), index_file.c_str()) == 0)
     dirty_ = false;
+  // Only when books came or went (sync, rescan): never on a reader close.
+  if (thumbs_dirty_)
+    save_thumbs_(index_file);
   return true;
 }
 
-
-void BookIndex::ensure_loaded_(const std::string& index_path) {
-  if (!entries_.empty()) return;
-  // entries_ is empty (e.g. MainMenu was stopped). Reload from disk so the
-  // upcoming mutation merges with the existing on-disk state instead of
-  // truncating the file. If the file doesn't exist, load() returns false and
-  // entries_ stays empty — the caller's save() will then create it fresh.
-  load(index_path);
-}
-
-bool BookIndex::index_file(const std::string& path, const std::string& index_path) {
-  std::string title, author;
-  if (!read_book_meta(path, title, author))
-    return false;
-  ensure_loaded_(index_path);
-  remove_entry(path);
-  add_entry(path, title, author);
-  ++generation_;
-  return save(index_path);
-}
-
-bool BookIndex::remove_path(const std::string& path, const std::string& index_path) {
-  ensure_loaded_(index_path);
-  auto it = std::find_if(entries_.begin(), entries_.end(),
-                         [&](const BookIndexEntry& e) { return e.path.view(pool_) == path; });
-  if (it == entries_.end())
-    return true;  // not indexed — nothing to do, no save needed
-  entries_.erase(it);
-  dirty_ = true;
-  ++generation_;
-  return save(index_path);
-}
-
-bool BookIndex::rename_in_place(const std::string& src, const std::string& dst, const std::string& index_path) {
-  ensure_loaded_(index_path);
-  auto it = std::find_if(entries_.begin(), entries_.end(),
-                         [&](const BookIndexEntry& e) { return e.path.view(pool_) == src; });
-  if (it == entries_.end())
-    return false;  // src not indexed — caller may fall back to index_file(dst)
-  it->path = pool_.add(dst);
-  dirty_ = true;
-  ++generation_;
-  return save(index_path);
-}
 
 void BookIndex::remove_entry(std::string_view path) {
   auto it = std::find_if(entries_.begin(), entries_.end(),
@@ -276,6 +309,7 @@ void BookIndex::remove_entry(std::string_view path) {
   if (it != entries_.end()) {
     entries_.erase(it);
     dirty_ = true;
+    thumbs_dirty_ = true;
   }
 }
 

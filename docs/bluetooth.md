@@ -4,162 +4,224 @@ Part of the Wintergreen notes; the entry point is `CLAUDE.md`.
 
 ## Bluetooth page-turner
 
-A BLE HID-over-GATT **host** for a clicker, in `platforms/esp32/bluetooth_clicker.h`. Off
-by default, off at every boot, and off after any failure — the radio is the largest
-current draw this firmware can switch on, tens of mA against ~15 mA idle.
+A BLE HID-over-GATT **host** for a clicker, in `platforms/esp32/bluetooth_clicker.h`, on
+raw NimBLE (no `esp_hidh`, since 2026-11-11). Off at every boot and off after any
+failure — the radio is the largest current draw this firmware can switch on, tens of mA
+against ~15 mA idle. Compiled out entirely unless `WG_BLUETOOTH_PAGE_TURNER` is defined.
 
-| Build | pio flash | pio RAM |
-|---|---|---|
-| no BT keys at all | 430,790 | 159,820 |
-| BT keys, MAC undefined (**default**) | 434,580 | 160,216 |
-| MAC defined | 728,888 | 164,128 |
+NimBLE is central + observer only: `ROLE_PERIPHERAL`, `ROLE_BROADCASTER` and
+`GATT_SERVER` are explicitly `=n` (they default on). They were forced on only because
+IDF gates `nimble_hidh.c` behind `CONFIG_BT_NIMBLE_HID_SERVICE`, a peripheral-menu
+option; with `esp_hidh` gone that whole chain went (image 1,218,158 → 1,199,358 B).
 
-The sdkconfig keys cost **3.8 KB of flash and 396 bytes of RAM** in a build that will
-never use them; the stack itself is ~294 KB of flash plus tens of KB of *heap* while the
-radio is on. app0 is 6.4 MB, so none of this is capacity pressure.
+### Connect sequence (all on the one-shot `wg_bt_up` task)
 
-**Three sdkconfig keys look wrong and are not.** IDF guards `nimble_hidh.c` — the HID
-**host** — with `CONFIG_BT_NIMBLE_HID_SERVICE`, which is the HID *device* service option,
-and that option lives in a menu gated on `BT_NIMBLE_GATT_SERVER`, which depends on
-`BT_NIMBLE_ROLE_PERIPHERAL`. A central-only device cannot compile the host without
-nominally enabling the peripheral role. Nothing ever advertises. Drop any of the three and
-the link fails with `undefined reference to esp_ble_hidh_init` — a *link* error naming an
-IDF file, with nothing pointing at the config.
+1. `bringup_stack()` (controller init/enable, NimBLE init once, wait for host sync).
+2. **Bonded: no scan.** `bonded_target_()` takes the bond's identity address (configured
+   MAC preferred when two bonds exist) as `BLE_ADDR_PUBLIC_ID` / `RANDOM_ID`, and
+   `ble_gap_connect` goes straight to it with `kScanMs` as the timeout. The controller
+   matches the clicker's rotating private address through its resolving list (NimBLE
+   loads every bond's IRK at sync, `ble_hs_misc_restore_irks`, and enables resolution).
+   Any failure except a toggle falls through to the scan.
+3. Unbonded (or the direct connect failed): active scan, `kScanMs` = 5 s, 100% duty.
+   Configured MAC wins and ends the scan; else the first device advertising HID 0x1812 is
+   the fallback, taken only when the scan ends. Then `ble_gap_connect` to the address *and
+   type* the scan saw, `kConnectMs` = 10 s.
+4. Both connects use `conn_params_()` (interval 7.5-15 ms, see below) and callback
+   `conn_cb`.
+5. `encrypt_()`: `ble_gap_security_initiate` (bond → key refresh, none → Just Works).
+6. `enable_key_notifications()`: **from the NVS handle cache when this clicker was seen
+   before** (below), else discover HID services → descriptors; then write `01 00` to every
+   CCCD (always, a few tens of ms at this interval).
+7. `read_battery_once()`: read 0x2A19 over the whole handle range; liveness check.
+8. Connected. `ui_wake()` so the row repaints at once; an open quick menu closes itself
+   (`QuickmenuScreen::update`: Connecting → Connected calls `on_back()`), since the next
+   thing after pairing a page-turner is reading.
 
-Design:
+Measured 2026-11-11 (ms since toggle, temporary quick-menu rows):
 
-- **It scans before connecting, and must.** Connecting straight to the configured MAC does
-  not work, for two reasons. A BLE address does not carry its own *type* (public/random),
-  and guessing wrong costs 30 s because `esp_hidh` calls `ble_gap_connect` with that
-  timeout and blocks. And HID devices routinely use a **resolvable private address**,
-  rotating every ~15 minutes — `(addr[5] & 0xC0) == 0x40` identifies one — so a MAC read
-  an hour ago is not that device's address any more. An 8 s active scan yields the address
-  *and* type that are true now. The configured MAC is a filter, not a destination; if
-  nothing matches, anything advertising HID service UUID 0x1812 is taken instead, which is
-  what makes a rotating address work.
-- **No reconnect.** A disconnect, a refused connection or one that never completes all drop
-  to Disconnected. A radio hunting for a device that is not there is the leak this avoids.
-- **No persistence.** Deep-sleep wake is a full boot, so the device always comes up cold.
-  With `kAutoSleepMinutes = 1` that means re-enabling after any pause long enough to
-  sleep — the deliberate trade, since turning pages resets `inactivity_ms_`.
-- **Everything blocking runs on a worker task.** `esp_hidh_dev_open()` blocks for the
-  length of a connection attempt and teardown calls block too, so `toggle()` spawns a
-  one-shot task and returns. `g_busy` makes a second toggle during a transition a no-op.
-- **The HID callback never tears its own stack down.** It sets `g_teardown_request`;
-  `wg_clicker::poll()` spawns the teardown task. Deinitialising a stack from inside its own
-  event callback deadlocks.
+| | scan | link | encrypted | CCCDs | Connected |
+|---|---|---|---|---|---|
+| esp_hidh, toggle | 53 | — | — | 1773 | 1794 |
+| esp_hidh, fresh boot | **fails at 78 ms, every time** | | | | |
+| raw NimBLE, fresh boot | 170 | 407 | 657 | 1447 | 1470 |
+| raw NimBLE, toggle | 1060 | 1268 | 1518 | 2311 | 2334 |
+
+Scan time depends on when the clicker advertises. Post-scan, link → Connected went
+~1741 → ~1280 ms. Descriptor discovery + CCCD writes (~800 ms) was then the largest part,
+which is what the handle cache, the direct connect and the short interval remove.
+`wg_bt_up` peak stack 1,736 B (4,408 B free of 6,144) on that build; it is **5,120** now
+because the cache adds NVS reads/writes on this task (not re-measured).
+
+Owner hardware test of the esp_hidh-free build (2026-11-11): connects first try on every
+fresh boot (esp_hidh never did), toggle off/on, tap and hold in reader and menus, clicker
+switched off → Disconnected, press during Connecting → Disconnected at once. "Never once
+failed or glitched." After the direct connect + cache + interval build: "works great",
+page turns feel faster. **Not measured:** the per-stage times of the direct/cached path
+(the `D path` row was never read off), and the clicker-paired-elsewhere-then-back case.
+
+### Handle cache (NVS `wg_bt` / `hid`)
+
+`HidCache` = peer identity address, HID service ranges, CCCD handles (~56 B), written once
+after a full discovery, keyed by `desc.peer_id_addr`. A reconnect loads it and goes
+straight to the CCCD writes. Any refused write (handles moved, a different device) erases
+the key and rediscovers once. The CCCD writes stay on every connect: a clicker that paired
+elsewhere forgot its subscriptions.
+
+### Connection interval, and the L2CAP crash
+
+`conn_params_()`: interval **7.5-15 ms** (`kItvlMin` 6 / `kItvlMax` 12, units 1.25 ms),
+latency 0 from our side, supervision 4 s, initiator scan 100% duty. A key report waits at
+most one interval for its connection event, so this is the clicker's whole share of
+page-turn latency, and every GATT round trip at connect costs about one interval. NimBLE's
+default was 30-50 ms. Owner's call: lowest latency over radio current while connected.
+
+`conn_cb` accepts a clicker's parameter-update request but caps `itvl_max` at
+`kItvlMax` (and `itvl_min` to match); its slave latency and supervision timeout stay
+(slave latency only lets an idle peripheral skip events; a key still goes out at the next).
+
+**The two update events fill different fields, and getting it wrong rebooted the device on
+every successful connect.** `BLE_GAP_EVENT_CONN_UPDATE_REQ` (LL procedure) hands the app
+`self_params` to edit. `BLE_GAP_EVENT_L2CAP_UPDATE_REQ` leaves `self_params` **null** and
+applies `peer_params` itself after the callback returns 0
+(`ble_l2cap_sig.c`: `ble_gap_rx_l2cap_update_req` → `ble_gap_update_params(conn, &params)`),
+a non-const object behind a const pointer, so the clamp writes through a `const_cast`.
+Found with an RTC_NOINIT breadcrumb (no serial): last stage 9 (inside
+`enable_key_notifications`, the clicker asks right after connecting), last GAP event 5
+(`L2CAP_UPDATE_REQ`), reset reason 4 (panic). Off = no crash, which is why it looked like
+"crashes only when it connects".
+
+**Every wait is on an event, never a poll or our own timer.** Each procedure ends in a
+callback by itself: scan → `DISC_COMPLETE` after `kScanMs`, connect → `CONNECT` with a
+timeout status, GATT → error callback after ATT's 30 s, pairing → `ENC_CHANGE` after SM's
+30 s. Callbacks set bit 1 of `g_evt` and the waiter re-checks its condition. It is an
+**event group, not a semaphore**, so a sync calling `radio_off()` while `connect_task` is
+mid-wait wakes both. A toggle during Connecting sets `g_disconnect_request` and the bit,
+ending the attempt at once (hardware-checked).
+
+### Things that each failed silently on their own
+
+1. **The MAC is byte-reversed.** NimBLE's `ble_addr_t.val` is little-endian: `val[5]` is the
+   leftmost MAC byte (`ble_gap.c` tests `addr[5] & 0xC0`). `parse_mac()` fills `out[5 - i]`.
+   Wrong order looks exactly like a clicker that is switched off.
+2. **It scans before connecting.** An address does not carry its type (public/random), and
+   HID devices advertise a **resolvable private address** rotating every ~15 min
+   (`(addr[5] & 0xC0) == 0x40`). The configured MAC is a filter, not a destination.
+3. **`ble_hs_cfg.sm_*` must be set.** NimBLE defaults `sm_bonding` and both key-dist masks
+   to 0: pairing exchanges no keys, no bond. The ID key (IRK) is what later recognises a
+   rotating address. `CONFIG_BT_NIMBLE_GATTC_AUTO_PAIR=y` stays as a backstop.
+4. **Encrypt before any CCCD write.** HID CCCDs need encryption and the clicker refuses an
+   unencrypted write; nothing retries it. Measured under esp_hidh (which wrote them during
+   open, pre-encryption): link up, encrypted, bonded, battery reads, **0 notifications**
+   over dozens of presses. It had only worked because the clicker remembered
+   "notifications on" from an old bond; pairing it with a PC wiped that.
+5. **Keys are matched by HID service range, not characteristic.**
+   `ble_gattc_disc_all_dscs` over a service range reports the range start as every
+   descriptor's `chr_val_handle`, so CCCD → report cannot be mapped (70 notifications on
+   handle 43 matched none). Any `NOTIFY_RX` inside an HID service range goes to
+   `handle_report`, which scans for Left/Right Arrow (0x50/0x4F; Page Up/Down not matched).
+6. **Never find the connection by address.** After bonding the stack resolves the RPA to
+   the identity address, so `ble_gap_conn_find_by_addr(scanned)` returned `ENOTCONN` on a
+   live link. `g_conn` comes from the `CONNECT` event and is cleared on `DISCONNECT`.
+
+**Stale bond.** If the clicker paired elsewhere it no longer has our key: encryption with
+our bond fails. `encrypt_()` deletes our side of the bond (peer address taken before the
+attempt, since the clicker often hangs up right after rejecting the key) and pairs once
+more; if the link is gone, `connect_task` scans, connects and pairs once over a fresh
+link (`g_bond_deleted`; a peer hang-up sets `g_disconnect_request`, so deliberate aborts
+use `g_user_abort`). Only a completed, failed encryption deletes the bond, never a link
+lost mid-attempt. A clicker that starts pairing itself lands in `REPEAT_PAIRING`, which
+deletes and returns `BLE_GAP_REPEAT_PAIRING_RETRY`.
+
+**Sync during a connect.** `begin_sync()` sets the abort, signals, and waits on
+`kEvTaskDone` until `connect_task` has exited before `radio_off()`. Turning the
+controller off under a running connect used to strand the task (a cancelled scan sends
+no event) and let `end_sync()` start a second one beside it.
+
+### Behaviour
+
+- **No reconnect, no persistence.** A disconnect, a refused or never-completing connection
+  all drop to Disconnected with the radio off. Deep-sleep wake is a full boot, so the
+  device always comes up cold.
+- **The callback never tears its own stack down.** `conn_cb` runs on the NimBLE host task;
+  a peer `DISCONNECT` sets `g_disconnect_request` and `poll()` (UI loop) calls
+  `radio_off()`. `radio_off()`'s own terminate sets `g_closing` so it is not "gone".
 - **NVS is initialised lazily**, in `bringup_stack()` — the bond store is its only user.
-
-Input arrives as **edges only**: `g_clicker_buttons` is merged by
-`Esp32InputSource::poll_buttons` the way `g_serial_buttons` is, and nothing sets
-`current`, so a clicker press can never look held and drive `HoldRepeat`. Reports are
-matched permissively — scan the payload for Left/Right Arrow (0x50/0x4F) or Page Up/Down
-(0x4B/0x4E) rather than parsing the report map, since `esp_hidh` has already done
-discovery and clickers disagree about layout. A `g_last_key` transition check stops a held
-key repeating.
-
-Left advances and right goes back — **the opposite of a presentation remote's
-convention**, intentional. Injected as Button2/Button3, "next" and "previous" in the
-reader in *both* orientations.
-
-**Four things are required together, and each fails silently on its own.** The first
-version had all four wrong and produced one symptom — "Connecting" for a minute, then
-"Disconnected":
-
-1. **The MAC must be byte-reversed.** NimBLE's `ble_addr_t.val` is little-endian: `val[5]`
-   is the byte written leftmost in a MAC, which is why `ble_gap.c` tests `addr[5] & 0xC0`.
-   `esp_hidh_dev_open()` memcpy's the array straight into `ble_addr_t.val`. `parse_mac()`
-   fills `out[5 - i]`. Reversed, the stack hunts for an address that does not exist and
-   times out looking exactly like a clicker that is switched off.
-2. **`CONFIG_BT_NIMBLE_GATTC_AUTO_PAIR=y`.** `esp_hidh`'s NimBLE path never calls
-   `ble_gap_security_initiate`, and HID characteristics need an encrypted link. This is
-   what makes `ble_gattc` retry a read through pairing when the peer answers
-   `INSUFFICIENT_ENC`/`AUTHEN`. Without it the link comes up and reads nothing.
-3. **`ble_hs_cfg.sm_*` must be set in `bringup_stack()`.** NimBLE defaults `BLE_SM_BONDING`
-   and *both* key-distribution masks to `(0)`, so pairing exchanges no keys and there is no
-   bond. The ID key (IRK) is what later lets the stack recognise a rotating address.
-4. **The scan**, above.
-
-**Confirmed working on hardware**: connects reliably, pages turn, stays up.
-
-### The failure codes are gone — here is what they found
-
-The row briefly carried numeric stage codes (`Failed 8003`), a free-heap readout, a GAP
-listener and an `esp_reset_reason()` display. All **removed** — it was scaffolding, and it
-worked. Keep this record instead:
-
-- `8003` / `8011` — sync timed out with 3 KB, then 11 KB, of internal RAM free. This
-  established heap as the binding constraint. Note `esp_nimble_enable` **ignores
-  `xTaskCreatePinnedToCore`'s return and always reports ESP_OK**, so a host task that could
-  not be allocated is indistinguishable from one that started and never synced.
-- The stage split proved a *first* failure could wedge the session.
-- `rst4` plus a backtrace named the real bug: `std::bad_alloc` in
-  `TextLayout::assemble_page`, not in any BLE code.
-
-If a failure needs diagnosing again, the cheapest reconstruction is a `FailStage` enum set
-at each bail-out in `bringup_stack()` and shown after "Failed". Do not leave it in.
-
-`ClickerState` is Unavailable / Disconnected / Connecting / Connected. **Every failure
-reads as Disconnected**: the row is a switch, not a status console, and each of those
-states meant the same thing to the user (press it again).
+- Input arrives as **edges only** via `g_press_queue` (ring, so a burst of clicks is a
+  burst of presses). **The page turns on the press edge**, the moment the report arrives
+  (a release-edge turn added the whole press, ~80-150 ms, to every page). A key still down
+  at `config::kBluetoothHoldDelayMs` (100, owner's setting; separate from the device
+  buttons' `kHoldDelayMs` 250) queues `Button::Undo` then Back (left) / Confirm (right):
+  the screen reverts the step the press made without drawing, then acts, so a hold
+  neither loses a page nor selects the wrong row. Both or neither: queued only when
+  `queue_room() >= 2`. The release is ignored. `hold_wait_ms()` tells the idle main loop
+  exactly when the hold is due (`docs/power-and-input.md` "Idle loop"). A tap held longer
+  than the threshold reads as a hold.
+- **A hold takes ~0.5-0.6 s to show its menu, and that is the panel.** The press already
+  started a ~300 ms waveform, which cannot be cut short; the menu's own ~300 ms waveform
+  follows it. The threshold is not the bottleneck (`docs/display.md`).
+- **One mapping everywhere: right = `Button3`, left = `Button2`** (`kBtnRight` /
+  `kBtnLeft`). In the reader `Button3` is next page (`ReaderScreen` `logical_next_front`,
+  both orientations); in lists right is up, left is down. A reader-only swap
+  (`g_in_reader`) outlived the reader that needed it and turned pages backward; removed
+  2026-11-12 after the owner caught it on device. Holds were never affected (left = Back,
+  right = Confirm).
+- **Fast taps are not lost, they batch** (measured 2026-11-12, temporary counters): 26
+  taps → 52 reports, 26 press edges, 0 queue drops, 0 holds; queue peaked at 5, longest a
+  press waited 428 ms (one waveform: the loop blocks in the next `refresh()` until the
+  panel is idle). The list applies every queued press, so several taps inside one
+  ~430 ms waveform land as one multi-row jump, which reads as "skipped". Only a shorter
+  waveform changes that; owner declined it for menus too (`docs/history.md`). One earlier
+  run counted 20 queue drops out of 20 presses and never reproduced.
+- `ClickerState` is Unavailable / Disconnected / Connecting / Connected. **Every failure
+  reads as Disconnected**: the row is a switch, not a status console.
 
 ### The row shows the clicker's own battery
 
-`ESP_HIDH_BATTERY_EVENT` carries the peer's level, so once connected the row reads `Page
-Turner: 89%`.
+`read_battery_once()` reads Battery Level (0x2A19) by UUID over the whole handle range, after
+the CCCDs, before Connected. Captured once (a percentage that twitches while you read is
+worse than a stale one), cleared by `radio_off()`. **Most clickers notify battery only on
+change**, which is why waiting for a notification showed nothing for hours.
 
-**That event is not enough and waiting for it shows nothing.** `nimble_hidh.c` posts it
-*only* from a `notify_rx`, and most clickers notify only on change — so the row sat on
-"Connected" for hours. `read_battery_once()` does an explicit `ble_gattc_read_by_uuid` of
-the Battery Level characteristic (0x2A19) over the whole handle range, immediately after
-connect and before the state goes Connected. One round trip, no discovery of our own,
-bounded at 2 s so a clicker that ignores the read cannot hang the connect.
+**The read doubles as the liveness check.** A link that came up has been seen delivering no
+reports; a peer that will not answer a GATT read will not send them either, so no answer
+fails the connect. A clicker with no battery service still *answers* ("attribute not
+found") and shows "Connected" with no percentage. `QuickmenuScreen::update` watches the
+percentage as well as the state.
 
-- **Captured once**, then left alone: a percentage that twitches while you read is worse
-  than a slightly stale one. Cleared by `radio_off()`.
-- **Not every clicker has a battery service.** No answer means the row says "Connected".
-- `QuickmenuScreen::update` watches the percentage as well as the state, since a later
-  notification can still update it.
+### The failure codes are gone — here is what they found
 
-**The read doubles as the liveness check.** `ESP_HIDH_OPEN_EVENT` with `status == ESP_OK`
-is not sufficient: it has been seen arriving for a link that then delivers no reports,
-leaving the row on "Connected" with a clicker whose buttons did nothing.
-`read_battery_once()` returns false when the read could not be issued or never completed,
-and `connect_task` treats that as a failed connect. A peer that will not answer a GATT
-read will not send input reports either. This does **not** reject clickers without a
-battery service: those still *answer* ("attribute not found"), so they connect and show
-"Connected" with no percentage.
+Stage codes (`Failed 8003`), free-heap readouts and `esp_reset_reason()` were scaffolding,
+removed. What they established:
 
-**Never find the connection with `ble_gap_conn_find_by_addr(&g_target)` alone.** That was
-the underlying bug. A HID device typically advertises under a resolvable private address,
-and once bonding completes the stack resolves it to the peer's *identity* address — so the
-connection no longer matches the address the scan saw and the lookup returns `ENOTCONN` on
-a live link. `live_conn_handle()` tries the scanned address first and otherwise walks the
-handle range matching `peer_ota_addr` or `peer_id_addr`. Handles are controller-assigned,
-**not** 0-based indices, so iterating `0..CONFIG_BT_NIMBLE_MAX_CONNECTIONS` does not work.
+- `8003` / `8011` — sync timed out with 3 KB, then 11 KB, of internal RAM free: heap is the
+  binding constraint. `esp_nimble_enable` **ignores `xTaskCreatePinnedToCore`'s return and
+  always reports ESP_OK**, so a host task that could not be allocated looks like a sync
+  that never comes.
+- A *first* failure could wedge the session.
+- `rst4` plus a backtrace named the real bug: `std::bad_alloc` in
+  `TextLayout::assemble_page`, not in any BLE code.
 
-### Stack sizes are not the defaults, deliberately
+Cheapest reconstruction if needed again: a stage code set at each bail-out, shown as a
+temporary quick-menu row. Do not leave it in.
 
-`CONFIG_BT_NIMBLE_HOST_TASK_STACK_SIZE` is **6144**, not IDF's 4096, and
-`esp_hidh_config_t::event_stack_size` is 6144 rather than 4096. The NimBLE host task runs
-GATT discovery, the security manager, *and* — because `ble_store_config` persists bonds —
-**NVS writes**, which are stack-hungry. Bonding completes a second or two after a HID
-connect, which is precisely when a device that resets shortly after connecting would do it.
+### Stack sizes
 
-### Never use `p->input.data`
-
-`nimble_hidh.c` allocates one block holding the event struct followed by the report
-payload, points `input.data` at the payload, posts the block to the event loop — which
-**copies** it — and then **frees the original**. The pointer arriving in the callback
-refers to freed heap. The copy has the payload at a known offset, so `hidh_event_cb`
-recomputes it as `(const uint8_t*)p + sizeof(esp_hidh_event_data_t)`. Same applies to
-`feature.data` if that event is ever handled.
+`CONFIG_BT_NIMBLE_HOST_TASK_STACK_SIZE` is **6144**, not IDF's 4096: the host task runs the
+security manager and — because `ble_store_config` persists bonds — **NVS writes**, which are
+stack-hungry, a second or two after connect. `wg_bt_up` is 5,120 (measured peak 1,736 B
+before the handle cache, which adds NVS on this task).
+The `esp_hidh` event task (6 KB) no longer exists. The NimBLE host task's high-water mark
+was never read (`xTaskGetHandle("nimble_host")` found nothing; R8 still open).
+Main task: 13,624 B of 16,384 never touched (2026-11-12, a session with clicker, sync,
+book opens), so `CONFIG_ESP_MAIN_TASK_STACK_SIZE` is now 8192; ran a sync with the clicker
+connected without a fault.
 
 ### The stack comes up once per boot and is NEVER torn down
 
 `bringup_stack()` runs each init at most once, guarded by its **own** flag. Toggling off
 calls `radio_off()`, which closes the link and disables the controller but leaves the
-NimBLE host and esp_hidh initialised for the session.
+NimBLE host initialised for the session.
 
 **One flag for the whole function is not enough**: a bringup that reached
 `esp_nimble_init()` and then failed at sync left a single end-of-function flag false, so
@@ -169,11 +231,9 @@ resume rather than restart.
 **Do not add a deinit path back.** Three attempts were made; the first two each shipped a
 distinct bug:
 
-1. **Unconditional teardown** → a bringup that died at sync still called
-   `esp_hidh_deinit()` on a stack whose host had never started, leaving esp_hidh's
-   `event_loop_handle` non-null. `esp_hidh_init()` returns `ESP_FAIL` ("Already
-   initialised") when it is, so: *first attempt after a boot fails at stage 8, every
-   attempt after that fails at stage 6, permanently, until a power cycle.*
+1. **Unconditional teardown** (esp_hidh era) → a bringup that died at sync still deinited
+   a stack whose host had never started; every attempt after that failed permanently until
+   a power cycle.
 2. **Per-stage tracked teardown** → fixed that, then crashed:
 
    ```
@@ -199,20 +259,45 @@ is what actually stops the radio drawing current. So the flags split:
 |---|---|
 | `g_ctrl_inited` | once per boot |
 | `g_ctrl_enabled` | **cycles** — cleared by `radio_off()` |
-| `g_nimble_up` / `g_hidh_up` / `g_host_task_started` | once per boot |
+| `g_nimble_up` / `g_host_task_started` | once per boot |
 | `g_host_up` | cleared by `radio_off()`, re-waited on each bringup |
 
-`radio_off()` closes the link, waits ~100 ms for the disconnect to reach the peer and the
-CLOSE event to land, then disables the controller. Reached from every path: toggling off,
-a failed connect, and `poll()` acting on the clicker being switched off mid-book.
+`radio_off()` cancels scan and pending connect, terminates the link and waits for its own
+`DISCONNECT` (the controller always delivers one), then disables the controller. Reached
+from every path: toggling off, a failed connect, and `poll()` acting on the clicker being
+switched off mid-book (hardware-checked: row goes to Disconnected).
 
 `g_host_up` must be re-waited after a re-enable: the controller runs a fresh HCI reset when
-it comes back, and no GAP call is legal until the host has synced again. The host task is
-started once and never deleted — `esp_nimble_disable()` is a bare `vTaskDelete` and the
-host is not restartable. A stage-8 failure is no longer terminal: the retry skips to
-`esp_nimble_enable` and waits for sync again.
+it comes back, and no GAP call is legal until the host has synced again (`sync_cb` sets
+`g_evt`). The host task is started once and never deleted — `esp_nimble_disable()` is a
+bare `vTaskDelete` and the host is not restartable.
 
-### Heap is the binding constraint, confirmed twice
+### RAM now: nothing is handed back for the radio (2026-11-11)
+
+Pages are fully baked (`docs/content.md`), so the reader has no layout engine, no
+paragraph cache and no per-page allocation: a page is one display list of a few hundred
+bytes read into `ReaderScreen::page_buf_` (4 KB, claimed at boot). With that gone every
+workaround below was deleted: the clicker no longer releases DrawBuffer's spare (covers,
+thumbnails and the pre-drawn page all stay with the clicker up), the book index is never
+dropped, there is no cache cap, no `largest_free_block` guard, no OOM reserve and no
+`set_new_handler` rescue, and `IRuntime::clicker_holds_ram()` /
+`largest_free_block_bytes()` are gone. Image 1,199,358 → 1,141,052 B.
+
+**Measured on hardware 2026-11-12, passed.** With the clicker connected, a 3-book sync
+(36 MB), the automatic reconnect after it, and page turns, the largest internal block never
+fell below 38,912 B (lowest at `esp_http_client_init`). Total free internal heap bottomed at
+44,604 B, during the sync. Pass mark was 24 KB. That 44 KB is the whole budget for anything
+kept resident: since nothing is released for radios, every permanent buffer comes out of it.
+If the controller reports `esp_bt_controller_init -4` or
+`emi.c 164` again, that is a RAM budget regression: find the allocation, do not start
+releasing buffers again. Next lever if it is short: initialise the controller at boot
+(disabled, no RF current) so its contiguous block is claimed before anything else, or
+`CONFIG_BT_CTRL_RUN_IN_FLASH_ONLY=y` (~19 KB IRAM).
+
+Everything from here to the end of this file is the history of the layout-era heap,
+kept as negative knowledge. None of the mechanisms it describes exist any more.
+
+### Heap is the binding constraint, confirmed twice (layout era, superseded)
 
 The second confirmation names the victim:
 
@@ -372,7 +457,7 @@ Three properties that matter:
   out of the same single ~50 KB internal DRAM pool the BT controller needs a *contiguous*
   block from, and holding it broke the clicker outright. Releasing it in `bringup_stack()`
   was not enough — that runs *inside* the worker, so it cannot help the `xTaskCreate` that
-  allocates the worker's own 6 KB stack. The release is in `toggle()`, immediately before
+  allocates the worker's own 4 KB stack. The release is in `toggle()`, immediately before
   the create.
 
   The symptom is worth recognising: `toggle()` sets Connecting, the create fails, and the

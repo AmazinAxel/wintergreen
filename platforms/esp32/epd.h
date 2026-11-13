@@ -12,6 +12,7 @@
 #include "esp_memory_utils.h"
 #include "esp_timer.h"
 #include "freertos/FreeRTOS.h"
+#include "freertos/semphr.h"
 #include "freertos/task.h"
 #include "wintergreen/display/DrawBuffer.h"
 
@@ -55,6 +56,18 @@ class EInkDisplay : public wintergreen::IDisplay {
   static constexpr uint32_t BUFFER_SIZE = wintergreen::DisplayFrame::kPixelBytes;
 
   bool isScreenOn = false;
+
+  // Given by the BUSY falling edge (end of a waveform). waitWhileBusy() blocks
+  // on it instead of polling the pin once a tick: at FREERTOS_HZ=100 a poll
+  // saw the end of a waveform up to 10 ms late, and every frame chained behind
+  // a waveform (a menu after a page turn, a turn during a turn) paid it.
+  SemaphoreHandle_t busy_done_ = nullptr;
+  static void busy_isr_(void* arg) {
+    BaseType_t woken = pdFALSE;
+    xSemaphoreGiveFromISR(static_cast<EInkDisplay*>(arg)->busy_done_, &woken);
+    if (woken)
+      portYIELD_FROM_ISR();
+  }
   bool inDeepSleep_ = false;
   // When begin() let go of RST; finish_begin() waits out the rest of the settle.
   static constexpr uint32_t kResetSettleMs = 20;
@@ -86,8 +99,14 @@ class EInkDisplay : public wintergreen::IDisplay {
     in_cfg.mode = GPIO_MODE_INPUT;
     in_cfg.pull_up_en = GPIO_PULLUP_DISABLE;
     in_cfg.pull_down_en = GPIO_PULLDOWN_DISABLE;
-    in_cfg.intr_type = GPIO_INTR_DISABLE;
+    in_cfg.intr_type = GPIO_INTR_NEGEDGE;
     gpio_config(&in_cfg);
+    // Flags 0: not IRAM-safe, so the interrupt is held off during flash writes
+    // (NVS, OTA) instead of running from disabled cache; the waiter re-checks
+    // the pin, so a late edge costs nothing.
+    busy_done_ = xSemaphoreCreateBinary();
+    gpio_install_isr_service(0);
+    gpio_isr_handler_add(EPD_BUSY, busy_isr_, this);
 
     gpio_set_level(EPD_CS, 1);
     gpio_set_level(EPD_DC, 1);
@@ -298,7 +317,9 @@ class EInkDisplay : public wintergreen::IDisplay {
   void waitWhileBusy() {
     uint32_t start = millis();
     while (gpio_get_level(EPD_BUSY) == 1) {
-      vTaskDelay(1);  // 1 tick; pdMS_TO_TICKS(1) rounds to 0 and busy-spins
+      // Woken by the falling edge; a stale give from an earlier waveform only
+      // costs one more pin check.
+      xSemaphoreTake(busy_done_, pdMS_TO_TICKS(10000));
       if (millis() - start > 10000) {
         break;
       }

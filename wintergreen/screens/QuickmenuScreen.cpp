@@ -1,5 +1,6 @@
 #include "QuickmenuScreen.h"
 
+#include <algorithm>
 #include <climits>
 #include <cstdio>
 #include <cstring>
@@ -9,13 +10,7 @@
 
 namespace wintergreen {
 
-// TOC labels are shown verbatim: preprocess.fish writes every book's NCX with
-// final "N: Name" labels, so there is nothing left to rewrite here.
-
-// Left-aligned text, ellipsised when it does not fit in max_w. Chapter titles
-// come from the book and are arbitrarily long ("Chapter 1: In Which Pooh Goes
-// Visiting And Gets Into A Tight Place"), so without this they run off the
-// right edge — and in the TOC they can also collide with the row beneath.
+// Left-aligned text, ellipsised when it does not fit in max_w.
 //
 // Truncation advances by whole UTF-8 sequences: cutting mid-sequence would feed
 // draw_text_proportional a partial codepoint.
@@ -29,84 +24,88 @@ static void draw_text_ellipsised(DrawBuffer& buf, int x, int baseline, const cha
 
 // ---------------------------------------------------------------------------
 
-void QuickmenuScreen::populate(const TableOfContents& toc, uint16_t current_chapter, uint16_t current_para,
-                                   const std::string& fallback_title, int book_progress_pct, int chapter_progress_pct,
-                                   uint16_t chapter_count) {
-  toc_ = &toc;
-  chapter_count_ = chapter_count;
-  book_title_ = fallback_title;
-  chapter_title_ = fallback_title;
+void QuickmenuScreen::populate(std::vector<uint32_t> chapter_pages, uint32_t current_page, const std::string& title,
+                               int book_progress_pct, int chapter_progress_pct) {
+  chapter_pages_ = std::move(chapter_pages);
+  // Collapse runs of spaces and trim, in place: the wrap's lines are then
+  // contiguous spans, exactly the word + ' ' + word strings it used to build.
+  book_title_ = title;
+  size_t n = 0;
+  for (char c : book_title_)
+    if (c != ' ' || (n > 0 && book_title_[n - 1] != ' '))
+      book_title_[n++] = c;
+  if (n > 0 && book_title_[n - 1] == ' ')
+    --n;
+  book_title_.resize(n);
   int best_match = -1;
-  for (size_t i = 0; i < toc_->entries.size(); ++i) {
-    if (toc_->entries[i].file_idx < current_chapter ||
-        (toc_->entries[i].file_idx == current_chapter && toc_->entries[i].para_index <= current_para)) {
+  for (size_t i = 0; i < chapter_pages_.size(); ++i)
+    if (chapter_pages_[i] <= current_page)
       best_match = static_cast<int>(i);
-    }
-  }
-  if (best_match >= 0)
-    chapter_title_ = toc_->entries[best_match].label.to_string(toc_->pool);
-  // Before the first TOC entry (front matter) the nearest chapter is the first.
-  current_chapter_offset_ = toc_->entries.empty() ? current_chapter : std::max(best_match, 0);
+  // Before the first chapter's page the nearest chapter is the first.
+  current_chapter_offset_ = std::max(best_match, 0);
+  chapter_title_[0] = '\0';
+  if (!chapter_pages_.empty())
+    snprintf(chapter_title_, sizeof(chapter_title_), "Chapter %d of %u", current_chapter_offset_ + 1,
+             static_cast<unsigned>(chapter_pages_.size()));
 
   book_progress_pct_ = book_progress_pct;
   chapter_progress_pct_ = chapter_progress_pct;
   has_pending_ = false;
 }
 
-std::vector<std::string> QuickmenuScreen::wrap_(const BitmapFont& f, const std::string& text, int first_w,
-                                                    int rest_w, int max_lines) {
-  std::vector<std::string> out;
-  if (text.empty() || !f.valid() || max_lines <= 0)
-    return out;
-
-  std::vector<std::string> words;
-  {
-    std::string w;
-    for (size_t i = 0; i <= text.size(); ++i) {
-      if (i == text.size() || text[i] == ' ') {
-        if (!w.empty()) words.push_back(w);
-        w.clear();
-      } else {
-        w += text[i];
-      }
-    }
-  }
-  if (words.empty())
-    return out;
-
-  auto width = [&f](const std::string& s) {
-    return static_cast<int>(f.word_width(s.c_str(), s.size(), FontStyle::Regular));
+int QuickmenuScreen::wrap_(const BitmapFont& f, std::string_view text, int first_w, int rest_w, int max_lines,
+                           Line* out) {
+  if (text.empty() || !f.valid() || max_lines <= 0 || text.size() > 0xFFFF)
+    return 0;
+  auto width = [&](size_t a, size_t b) {
+    return static_cast<int>(f.word_width(text.data() + a, b - a, FontStyle::Regular));
+  };
+  auto word_end = [&](size_t i) {
+    while (i < text.size() && text[i] != ' ')
+      ++i;
+    return i;
   };
 
-  size_t wi = 0;
-  while (wi < words.size() && static_cast<int>(out.size()) < max_lines) {
-    const int avail = out.empty() ? first_w : rest_w;
-    std::string line = words[wi++];
-    while (wi < words.size()) {
-      std::string cand = line + ' ' + words[wi];
-      if (width(cand) > avail) break;
-      line = std::move(cand);
-      ++wi;
+  int n = 0;
+  size_t pos = 0;  // start of the next word
+  while (pos < text.size() && n < max_lines) {
+    const int avail = n == 0 ? first_w : rest_w;
+    size_t end = word_end(pos);
+    while (end < text.size()) {
+      const size_t cand = word_end(end + 1);
+      if (width(pos, cand) > avail)
+        break;
+      end = cand;
     }
-    out.push_back(std::move(line));
+    out[n++] = Line{static_cast<uint16_t>(pos), static_cast<uint16_t>(end - pos), false};
+    pos = end < text.size() ? end + 1 : end;
   }
 
   // Anything that did not fit is ellipsised onto the last line.
-  if (wi < words.size() && !out.empty()) {
+  if (pos < text.size() && n > 0) {
     static const char kEll[] = "...";
-    const int avail = (out.size() == 1 ? first_w : rest_w) - static_cast<int>(f.word_width(kEll, 3, FontStyle::Regular));
-    std::string& last = out.back();
-    while (!last.empty() && width(last) > avail)
-      last.erase(last.size() - 1);
-    last += kEll;
+    const int avail = (n == 1 ? first_w : rest_w) - static_cast<int>(f.word_width(kEll, 3, FontStyle::Regular));
+    Line& last = out[n - 1];
+    while (last.len > 0 && width(last.off, last.off + last.len) > avail)
+      --last.len;
+    last.ell = true;
   }
-  return out;
+  return n;
+}
+
+// The UI fonts carry no kerning, so "..." drawn at the line's end cursor is
+// pixel-identical to drawing line + "..." as one string.
+void QuickmenuScreen::draw_line_(DrawBuffer& buf, int x, int baseline, std::string_view text, const Line& l,
+                                 const BitmapFont& f, bool invert) {
+  x = buf.draw_text_proportional(x, baseline, text.data() + l.off, l.len, f, invert);
+  if (l.ell)
+    buf.draw_text_proportional(x, baseline, "...", 3, f, invert);
 }
 
 int QuickmenuScreen::header_content_h_() const {
-  int h = static_cast<int>(title_lines_.size()) * title_font_().y_advance();
-  if (!chapter_lines_.empty())
-    h += kBlockGap + static_cast<int>(chapter_lines_.size()) * chapter_font_().y_advance();
+  int h = title_n_ * title_font_().y_advance();
+  if (chapter_n_ > 0)
+    h += kBlockGap + chapter_n_ * chapter_font_().y_advance();
   return h;
 }
 
@@ -168,16 +167,16 @@ void QuickmenuScreen::on_start() {
     const int bp_w = tfont.valid() ? tfont.word_width(book_pct_buf_.c_str(), book_pct_buf_.size(), FontStyle::Regular) : 0;
     const int cp_w = cfont.valid() ? cfont.word_width(chapter_pct_buf_.c_str(), chapter_pct_buf_.size(), FontStyle::Regular) : 0;
     title_small_ = false;
-    title_lines_ = wrap_(tfont, book_title_, avail - bp_w - kPctGap, avail, 2);
-    if (title_lines_.size() > 1) {
+    title_n_ = wrap_(tfont, book_title_, avail - bp_w - kPctGap, avail, 2, title_lines_);
+    if (title_n_ > 1) {
       // Too long for one full-size line: two lines of the smaller face, so the
       // header keeps its fixed height (see header_h_()).
       title_small_ = true;
       const BitmapFont& sfont = title_font_();
       const int sp_w = sfont.valid() ? sfont.word_width(book_pct_buf_.c_str(), book_pct_buf_.size(), FontStyle::Regular) : 0;
-      title_lines_ = wrap_(sfont, book_title_, avail - sp_w - kPctGap, avail, 2);
+      title_n_ = wrap_(sfont, book_title_, avail - sp_w - kPctGap, avail, 2, title_lines_);
     }
-    chapter_lines_ = wrap_(cfont, chapter_title_, avail - cp_w - kPctGap, avail, 1);
+    chapter_n_ = wrap_(cfont, chapter_title_, avail - cp_w - kPctGap, avail, 1, chapter_lines_);
   }
 
   clear_items();
@@ -241,19 +240,15 @@ void QuickmenuScreen::on_start() {
     add_item(fmt_setting(tmp, sizeof(tmp), "Font Size", val));
   }
 
-  // Chapters, inline below the settings. Nested TOC entries keep their depth as
-  // an indent; a book with no TOC falls back to numbered spine chapters.
-  const bool has_toc = toc_ && !toc_->entries.empty();
-  if (has_toc) {
+  // Chapters, inline below the settings: one numbered cell per chapter start.
+  // List order is grid order (left to right, then down), so the inherited
+  // up/down navigation steps right and wraps to the next row unchanged.
+  const int nch = static_cast<int>(chapter_pages_.size());
+  if (nch > 0) {
     first_chapter_ = count();
-    for (const auto& entry : toc_->entries)
-      add_item_view(entry.label.view(toc_->pool), entry.depth);
-  } else if (chapter_count_ > 1) { // chapter generation
-    first_chapter_ = count();
-    char cbuf[20];
-    for (uint16_t i = 0; i < chapter_count_; ++i) {
-      snprintf(cbuf, sizeof(cbuf), "Chapter %u", static_cast<unsigned>(i + 1));
-      add_item(cbuf);
+    for (int i = 0; i < nch; ++i) {
+      snprintf(tmp, sizeof(tmp), "%d", i + 1);
+      add_item(tmp);
     }
   }
   current_chapter_item_ = -1;
@@ -288,14 +283,27 @@ int QuickmenuScreen::get_visible_count_(int H, int scroll_off) const {
     available_h -= kSeparatorH;
   int h = 0, cnt = 0;
   const int n = count();
-  for (int i = scroll_off; i < n; ++i) {
+  const int settings_end = first_chapter_ >= 0 ? first_chapter_ : n;
+  for (int i = scroll_off; i < settings_end; ++i) {
     // The header item occupies the header, not a list row, so it costs no
     // height here — otherwise the list would think it had one row fewer than
     // it draws and the last chapter would be unreachable.
     const int rh = (i == kIdxBack) ? 0 : row_h_();
-    if (h + rh > available_h) break;
+    if (h + rh > available_h) return cnt;
     h += rh;
     cnt++;
+  }
+  if (first_chapter_ < 0)
+    return cnt;
+  // Grid: whole rows from the one holding scroll_off (draw_all_ starts there
+  // too). Cells of that row left of scroll_off are drawn but not counted.
+  const int rows = (n - first_chapter_ + kGridCols - 1) / kGridCols;
+  for (int r = first_grid_row_(scroll_off); r < rows; ++r) {
+    if (h + cell_h_() > available_h) break;
+    h += cell_pitch_();
+    const int row_first = first_chapter_ + r * kGridCols;
+    const int row_end = std::min(row_first + kGridCols, n);
+    cnt += row_end - std::max(row_first, scroll_off);
   }
   return cnt;
 }
@@ -325,9 +333,8 @@ void QuickmenuScreen::draw_all_(DrawBuffer& buf, std::optional<uint8_t> battery_
     buf.fill_rect(0, 0, W, header_h_() - kSeparatorH, false);
 
   // ── Book title, with the book percentage at the right of its first line ──
-  for (size_t i = 0; i < title_lines_.size(); ++i) {
-    const std::string& line = title_lines_[i];
-    buf.draw_text_proportional(kLM, y + tfont.baseline(), line.c_str(), line.size(), tfont, head_sel);
+  for (int i = 0; i < title_n_; ++i) {
+    draw_line_(buf, kLM, y + tfont.baseline(), book_title_, title_lines_[i], tfont, head_sel);
     if (i == 0) {
       const int pw = tfont.word_width(book_pct_buf_.c_str(), book_pct_buf_.size(), FontStyle::Regular);
       buf.draw_text_proportional(W - kRM - pw, y + tfont.baseline(), book_pct_buf_.c_str(), book_pct_buf_.size(), tfont,
@@ -337,11 +344,10 @@ void QuickmenuScreen::draw_all_(DrawBuffer& buf, std::optional<uint8_t> battery_
   }
 
   // ── Chapter, word-wrapped, with the chapter percentage on its first line ──
-  if (!chapter_lines_.empty()) {
+  if (chapter_n_ > 0) {
     y += kBlockGap;
-    for (size_t i = 0; i < chapter_lines_.size(); ++i) {
-      const std::string& line = chapter_lines_[i];
-      buf.draw_text_proportional(kLM, y + cfont.baseline(), line.c_str(), line.size(), cfont, head_sel);
+    for (int i = 0; i < chapter_n_; ++i) {
+      draw_line_(buf, kLM, y + cfont.baseline(), chapter_title_, chapter_lines_[i], cfont, head_sel);
       if (i == 0) {
         const int pw = cfont.word_width(chapter_pct_buf_.c_str(), chapter_pct_buf_.size(), FontStyle::Regular);
         buf.draw_text_proportional(W - kRM - pw, y + cfont.baseline(), chapter_pct_buf_.c_str(),
@@ -358,41 +364,32 @@ void QuickmenuScreen::draw_all_(DrawBuffer& buf, std::optional<uint8_t> battery_
 
   // ── Item list ────────────────────────────────────────────────────────────
   const int n = count();
+  const int settings_end = first_chapter_ >= 0 ? first_chapter_ : n;
+  const int grid_rows = first_chapter_ >= 0 ? (n - first_chapter_ + kGridCols - 1) / kGridCols : 0;
   // Compute total content height to decide whether scrolling is needed. The
   // header item is not one of these rows.
-  const int total_h = (n - 1) * row_h_();
+  int total_h = (settings_end - 1) * row_h_();
+  if (grid_rows > 0)
+    total_h += (first_chapter_ > 0 ? kSeparatorH : 0) + grid_rows * cell_pitch_() - kCellGap;
   const int so = (total_h <= H - y) ? 0 : scroll_offset();
 
-  for (int i = (so > kIdxBack ? so : kIdxBack + 1); i < n && y < H; ++i) {
+  // Settings rows: "Label: Value", inverted when selected.
+  for (int i = (so > kIdxBack ? so : kIdxBack + 1); i < settings_end && y < H; ++i) {
     const bool sel = (i == selected());
-
     const std::string_view label = get_item_label(i);
-    const bool is_chapter = (first_chapter_ >= 0 && i >= first_chapter_);
-
-    // Hairline between the settings and the chapters. It sits in its own gap
-    // rather than inside a row, so a selected first chapter cannot paint over it.
-    if (i == first_chapter_ && i > so) {
-      draw_separator_(buf, W, y);
-      y += kSeparatorH;
-    }
-
-    // Only a settings row is "Label: Value". Chapter titles legitimately contain
-    // ": " ("Chapter 1: The Beginning") and must never be split into columns.
     std::string_view display_label = label;
     std::string_view display_value;
-    if (!is_chapter) {
-      const auto pos = label.find(": ");
-      if (pos != std::string_view::npos) {
-        display_label = label.substr(0, pos);
-        display_value = label.substr(pos + 2);
-      }
+    const auto pos = label.find(": ");
+    if (pos != std::string_view::npos) {
+      display_label = label.substr(0, pos);
+      display_value = label.substr(pos + 2);
     }
 
     if (sel)
       buf.fill_rect(0, y, W, row_h_(), false);
 
     const int text_y = y + (row_h_() - ui_font_.y_advance()) / 2 + ui_font_.baseline();
-    const int text_x = kLM + (is_chapter ? get_item_indent(i) * 12 : 0);
+    const int text_x = kLM;
 
     // The value keeps its full width and the label gives way: a settings row
     // reads "Font Size: 28", and losing the 28 would defeat the row.
@@ -407,6 +404,32 @@ void QuickmenuScreen::draw_all_(DrawBuffer& buf, std::optional<uint8_t> battery_
 
     y += row_h_();
   }
+
+  if (grid_rows == 0)
+    return;
+
+  // Hairline between the settings and the chapters, in its own gap.
+  if (so < first_chapter_) {
+    draw_separator_(buf, W, y);
+    y += kSeparatorH;
+  }
+
+  // ── Chapter grid ─────────────────────────────────────────────────────────
+  const int cell_w = (W - kLM - kRM - (kGridCols - 1) * kCellGap) / kGridCols;
+  for (int r = first_grid_row_(so); r < grid_rows && y + cell_h_() <= H; ++r) {
+    for (int c = 0; c < kGridCols; ++c) {
+      const int i = first_chapter_ + r * kGridCols + c;
+      if (i >= n)
+        break;
+      const int x = kLM + c * (cell_w + kCellGap);
+      draw_outline(buf, x, y, cell_w, cell_h_(), i == selected() ? kCellSelW : 1);
+      const std::string_view label = get_item_label(i);
+      const int tw = ui_font_.word_width(label.data(), label.size(), FontStyle::Regular);
+      const int text_y = y + kCellPadV + ui_font_.baseline();
+      buf.draw_text_proportional(x + (cell_w - tw) / 2, text_y, label.data(), label.size(), ui_font_, false);
+    }
+    y += cell_pitch_();
+  }
 }
 
 void QuickmenuScreen::on_select(int index) {
@@ -417,14 +440,7 @@ void QuickmenuScreen::on_select(int index) {
   }
 
   if (first_chapter_ >= 0 && index >= first_chapter_) {
-    const int ch = index - first_chapter_;
-    if (toc_ && !toc_->entries.empty()) {
-      pending_chapter_ = toc_->entries[ch].file_idx;
-      pending_para_index_ = toc_->entries[ch].para_index;
-    } else {
-      pending_chapter_ = static_cast<uint16_t>(ch);
-      pending_para_index_ = 0;
-    }
+    pending_page_ = chapter_pages_[index - first_chapter_];
     has_pending_ = true;
     app_->pop_screen();
     return;
@@ -452,18 +468,6 @@ void QuickmenuScreen::on_select(int index) {
   }
   if (index == idx_clicker_) {
     if (runtime_) {
-      // Free the resident book index first, synchronously. The BLE stack starts
-      // allocating the moment toggle_clicker() spawns its worker, and on this
-      // device the two do not fit at once — a connect used to fail with the
-      // host task unable to start (11 KB free), or succeed and then abort the
-      // reader on its next page layout.
-      // Synchronously, and only on the way up: bringup allocates the moment
-      // toggle_clicker() spawns its worker, so Application::update's own check
-      // a frame later is too late. The *restore* is left to that check, which
-      // keys on whether the stack still holds memory rather than on the
-      // connection state — a disconnect does not give the heap back.
-      if (app_ && runtime_->clicker_state() != ClickerState::Connected)
-        app_->release_ram_for_radio();
       // Returns immediately: connecting takes seconds. The row redraws as
       // "Connecting", and update() below repaints it when the outcome lands.
       runtime_->toggle_clicker();

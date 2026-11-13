@@ -13,8 +13,6 @@ set(lib_sources
     ${LIB}/screens/QuickmenuScreen.cpp
     ${LIB}/screens/HomeScreen.cpp
     ${LIB}/content/CoverPaths.cpp
-    ${LIB}/content/TextLayout.cpp
-    ${LIB}/content/hyphenation/Hyphenation.cpp
     ${LIB}/content/BookIndex.cpp
     ${LIB}/content/wgb/WgbReader.cpp)
 

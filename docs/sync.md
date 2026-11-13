@@ -118,31 +118,29 @@ leaves. Parking the radio between DTIM beacons adds latency to every round trip 
 **extends** total radio-on time. Same reasoning keeps `AMPDU_RX` enabled. The energy model
 is "finish and shut down", not "sip while connected".
 
-#### Internal RAM is the binding constraint, and the framebuffers are why
+**Throughput settings (2026-11-12, unmeasured on device; was ~130 KB/s).** The worker holds
+its own `ESP_PM_CPU_FREQ_MAX` lock: the UI performance hold lapses 300 ms after the last
+press and buttons are dead during a sync, so it used to run at the 80 MHz DFS floor. TCP
+window 16 × MSS (23,040, was 4 × MSS) with `TCP_RECVMBOX_SIZE` 18, 24 dynamic RX buffers,
+BA window 12 (IDF `#error`s above 2 × static RX buffers; static stays 6 so `esp_wifi_init`
+needs no more). 16 KB read/write chunk. Connect: no ARP probe of the offered address,
+`LWIP_DHCP_RESTORE_LAST_IP` re-requests the last lease. Floor for big books is the card
+(20 MHz SPI), since receive and `fwrite` still run in series; a writer task would overlap them.
+
+#### Internal RAM: nothing is released for Wi-Fi any more
 
 `esp_wifi_init()` wants **roughly 50 KB of `MALLOC_CAP_INTERNAL`**, and it does not crash
 when it cannot get it — it returns an error, the worker bails, and the row flicks back to
-`Sync` with nothing said. Measured during bring-up: **20 KB free**, so it failed every time.
+`Sync` with nothing said. In the layout era that happened with 20 KB free, and the sync
+released DrawBuffer's spare, the OOM reserve and the reader's caches, and deinitialised the
+BT controller, to fit. Pages are now fully baked, the reader holds no layout memory, and
+all of that is gone: the spare (covers, thumbnails) and the book index stay through a sync.
+Not yet confirmed on hardware — `H wifi` / `H http` in the temporary quick-menu rows are
+the largest block at the two points that used to fail (see `docs/bluetooth.md` "RAM now").
 
-`DrawBuffer` holds `bufs_[2][kBufSize]` — **96,036 bytes of BSS**, the largest symbol in the
-image — plus `spare_`, another 48 KB on the heap. 144 KB of framebuffers on a 320 KB part.
-
-So `wg_sync::start()` calls **`DrawBuffer::release_spare()`**, handing the 48 KB back and
-taking it again when the sync ends (on every path, including a failed `xTaskCreate`). Safe
-because the spare is purely an optimisation — without it a quick-menu dismiss re-renders and
-a page turn re-draws, and the sync screen does neither. Both claim paths already null-check.
-
-`release_spare()` must also reset `spare_use_` and `draw_target_`: `has_snapshot()` /
-`has_offscreen()` test only that enum, so leaving it set would let `restore_snapshot()`
-memcpy from a freed pointer.
-
-**The book index is deliberately not released here**, unlike the clicker path.
-`MainMenu::entries_` holds `StringRef`s into `BookIndex`'s `StringPool`, and that screen is
-*on display* when Sync is pressed — dropping the pool left every title and author resolving
-to an empty `string_view` while the list stayed navigable and kept showing reading
-percentages (`uint8_t` copies). It read as a drawing glitch rather than a dangling
-reference. It also bought nothing: `run_sync_()` reloads the index from disk as its first
-act.
+**Never release the book index from a sync.** `MainMenu::entries_` holds `StringRef`s into
+`BookIndex`'s `StringPool` and the list is on display: dropping the pool blanked every title
+while the list stayed navigable.
 
 #### A 200 is not proof you got the file — encode the URL
 
@@ -184,24 +182,63 @@ synced book does not appear until you navigate away from the list and back.
   a scan — indistinguishable from a wrong password. BSSID/channel are no longer cached at
   all (they were written to NVS every sync and never read); association always scans.
 
-**BLE goes down first and does not come back on its own.** One radio, and ~13 KB free with
-the clicker up leaves no room for Wi-Fi's ~40-50 KB. `start()` calls
-`wg_clicker::radio_off()` and `Application::release_ram_for_radio()` **synchronously before
-the worker task spawns**. The clicker is re-armed by pressing its quick-menu row again.
+**The clicker steps aside for the sync and comes back by itself.** One radio at a time
+(owner's choice over coexistence). `start()` calls `wg_clicker::begin_sync()`
+**synchronously before the worker spawns**: it closes the link and *disables* the
+controller (`radio_off()`), leaves the stack initialised, and returns whether the clicker
+was Connected or Connecting. While the sync owns the radio `toggle()` is a no-op. When the
+worker ends it `ui_wake()`s the loop, and `wg_sync::poll()` calls `end_sync(was_on)`, which
+reconnects with an ordinary `toggle()`. **Never deinit the controller for a sync** — that
+was the old way to make room, and it lost the clicker until reboot (the NimBLE host cannot
+rebind; see `radio_off()`).
 
 **Auto-sleep is held off while a sync runs.** `wg_sync::poll()` calls `keep_awake()` from the
 main loop; a multi-book transfer easily outlasts `kAutoSleepMinutes` and sleeping mid-download
 would cut the radio with files half written.
 
+**All buttons are ignored while a sync runs, power included** (`main.cpp` empties the
+`ButtonState` while `wg_sync::active()`). The low-battery cutoff stays suppressed too
+(`keep_awake()`), so a sync always runs to its end. Timeouts bound it: 20 s Wi-Fi connect,
+8 s per HTTP read.
+
+**Speed floor: ~300 KB/s, serial on purpose** (`DownloadBuf`). Measured 2026-11-12, 4 MB books:
+
+| Variant | Throughput | Split |
+|---|---|---|
+| 16 KB heap buffer, read then write | 296 KB/s | net 7.6 s + card 6.8 s + ~1.6 s overhead |
+| double buffer, writer task same priority (4) | 244 KB/s | net 14.5 s: writer spin held the 10 ms tick |
+| double buffer, writer one below (3) | 292 KB/s | net 6.5 s + waiting for buffer 5.5 s = serial |
+
+The C3 has one core; the Wi-Fi/TCP receive path and SDSPI (interrupt-driven per-sector and
+busy-poll transactions, `sdspi_host.c`) both need it, so overlap only interleaves them.
+The writer task was removed. What stayed: the download fills the spare framebuffer, lent by
+`wg_sync::poll()` (UI thread) via `DrawBuffer::lend_spare()`, 92 whole sectors per `fwrite`,
+zero heap. While lent, every other spare claim refuses; the list thumbnails are re-read
+after the sync, and the sync task waits for the spare to come back before setting Done so the
+final repaint has them. Without a spare, `kChunk` from heap. Below this floor would take an
+ESP-IDF SDSPI patch; the SD clock is already at its 20 MHz ceiling (CLAUDE.md).
+
+**Downloads resume with Range** (`http_get_file_`). Measured 2026-11-12: a 36 MB book at
+~130 KB/s hit one 8 s read timeout (`ESP_ERR_HTTP_EAGAIN`) at 30.2 of 36.1 MB after 234 s,
+and the whole book was discarded. Now a read error or an early close reopens with
+`Range: bytes=<written>-` and appends to the same `.tmp`. It accepts only a 206 whose length
+is exactly the missing tail, and gives up after 5 reopens in a row that brought no bytes.
+
+Open (2026-11-12): an earlier run of the same sync left a 0-byte `book.wgb.tmp`, no index,
+and boots that showed only the wordmark until the card was pulled. Probably a crash
+mid-download, not captured. The same session's `H min` (session minimum of the largest
+internal block) read 1800 B. Where that happened is not known.
+
 ### The server side
 
 In the flake repo (`snowflake`), not here: `hosts/alechomelab/webserver/booksync.js` bolted
 onto the existing bun server (no new service, no new port). **The homelab never converts
-and never sees an EPUB.** `preprocess.fish` (this repo, packaged as `books` by `flake.nix`,
+and never sees an EPUB.** `books` (`tools/books` in this repo, packaged by `flake.nix`,
 installed by snowflake's `modules/desktop.nix`) reviews EPUBs in `~/Downloads/books`,
-rewrites them in place, converts locally, and uploads `/media/books/<dir>/` over ssh:
-tar into `/media/books/.incoming/`, then `mv` into place, so a half-uploaded book is never
-visible to a concurrent sync. The WGB is not kept on the desktop.
+rewrites them in place, bakes locally, and uploads `/media/books/<dir>/` over ssh: a tar
+stream (written by `books` itself) into `/media/books/.incoming/`, then `mv` into place, so
+a half-uploaded book is never visible to a concurrent sync. The WGB is not kept on the
+desktop.
 
 Removed, don't re-add: `books.nix` (path unit converting on the Pi) and
 `scripts/convertBooks.fish`. The `DirectoryNotEmpty` retrigger loop that unit once had is
@@ -210,8 +247,8 @@ moot with it.
 Endpoints: `POST /booksync` (the whole negotiation) and `GET /booksync/<dir>/<file>` (one
 book file). Book directory names are validated against `/^[A-Za-z0-9 ._-]+$/` and rejected
 if they contain `..` or start with `.` — they are used as path segments, and dot dirs
-(`.read`, `.incoming`) must never be listed or served. `preprocess.fish`'s `slug` produces
-names that pass.
+(`.read`, `.incoming`) must never be listed or served. `books::slug` (`tools/books/labels.cpp`)
+produces names that pass.
 
 Book names contain spaces, so anything built on them must encode them.
 

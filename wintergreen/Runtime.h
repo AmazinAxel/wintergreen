@@ -50,7 +50,11 @@ class IRuntime {
   // accumulates this into the auto-sleep countdown, and HoldRepeat uses it as
   // dt, so a constant here makes both drift whenever a frame overruns.
   virtual uint32_t frame_time_ms() const = 0;
-  virtual void wait_next_frame() = 0;
+  // Block until the next frame. budget_ms = how long after the previous frame
+  // began the loop may sleep; 0 = the runtime's normal frame cadence,
+  // UINT32_MAX = until input. Input always ends it early.
+  virtual void wait_next_frame(uint32_t budget_ms) = 0;
+  virtual uint32_t target_frame_ms() const = 0;
 
   // Read battery level (0-100 percentage).
   // Returns empty optional if the platform does not have a battery.
@@ -71,30 +75,6 @@ class IRuntime {
   // when on. Returns immediately — connecting takes seconds and must not block
   // the UI — so the caller watches clicker_state() for the outcome.
   virtual void toggle_clicker() {}
-
-  // Whether the BLE stack is currently holding heap. **Not the same as being
-  // connected**: the NimBLE host and esp_hidh are initialised once per boot and
-  // never deinitialised (deinit panics on this IDF), so they keep their
-  // allocation across a disconnect. The reader sizes its caches off this, so
-  // that a disconnect does not restore a full working set on top of a stack
-  // that still owns its memory.
-  virtual bool clicker_holds_ram() const {
-    return false;
-  }
-
-  // Largest single allocation the heap can currently satisfy. The reader uses it
-  // to skip its speculative next-page layout when the margin is too thin.
-  //
-  // **This, not total free heap, is what a guard before allocating must use.**
-  // IDF's own header says so: total free size says nothing about whether
-  // one block of that size exists, because the heap fragments. Guarding on the
-  // total let a page layout through with 24 KB "free" and then abort on a
-  // 1,416-byte request — reproducibly, on an ordinary forward page turn.
-  //
-  // UINT32_MAX on a host build.
-  virtual uint32_t largest_free_block_bytes() const {
-    return UINT32_MAX;
-  }
 
   // Clicker battery percentage, 0 when it has not reported one. Sampled once on
   // connect and then held: a number that drifts while you read is worse than a

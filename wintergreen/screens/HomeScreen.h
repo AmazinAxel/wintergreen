@@ -2,6 +2,7 @@
 
 #include <cstdint>
 #include <string>
+#include <string_view>
 
 #include "ListMenuScreen.h"
 
@@ -32,11 +33,14 @@ class HomeScreen final : public ListMenuScreen {
  private:
   static constexpr int kMaxBooks = 5;
 
+  // Views into the resident BookIndex pool, not copies: a home visit allocates
+  // nothing. The pool is append-only between load()/build_index(), and this
+  // screen re-runs on_start() (resume() = start()) every time it comes back on
+  // top, after any of those.
   struct BookSlot {
-    std::string path;
-    std::string title;
-    std::string author;
-    std::string home_path;   // exact-fit, blitted 1:1 (see kHomeCoverW in CoverPaths.h)
+    std::string_view path;
+    std::string_view title;
+    std::string_view author;
   };
 
   BookSlot slots_[kMaxBooks];
@@ -48,9 +52,8 @@ class HomeScreen final : public ListMenuScreen {
   // It lives in DrawBuffer's spare framebuffer (claim_spare_cache), not on the
   // heap: a cover is ~26 KB, and a heap copy of it sat resident for as long as
   // the home screen did. Trusted only while spare_cache_valid(cover_gen_) — the
-  // book list's thumbnails, the reader, the sleep path, a radio and the OOM
-  // handler can all take the spare, and the next draw then reloads. With a radio
-  // up there is no spare and the placeholder frame is drawn instead.
+  // book list's thumbnails, the reader and a sync's loan can all take the
+  // spare, and the next draw then reloads.
   //
   // There is exactly ONE cover, deliberately: preloading the neighbour was tried
   // and removed. See "Investigated and rejected" in docs/history.md.

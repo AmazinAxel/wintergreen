@@ -8,6 +8,7 @@
 #include "../ImageDecoder.h"
 #include "../ZipReader.h"
 #include "../CoverPaths.h"
+#include "WgbPaginator.h"
 
 namespace wintergreen {
 
@@ -141,8 +142,11 @@ bool write_split_paragraph(WgbWriter& writer, Paragraph& para) {
 
 }  // namespace
 
-bool convert_epub_to_wgb_streaming(Book& book, const char* output_path, uint8_t* work_buf, uint8_t* xml_buf,
-                                   std::function<void(int, int)> progress_cb) {
+bool convert_epub_to_wgb_streaming(Book& book, const char* output_path, const std::vector<PlannedChapter>& plan,
+                                   const BitmapFontSet& fonts, std::string& err,
+                                   uint8_t* work_buf, uint8_t* xml_buf, std::function<void(int, int)> progress_cb) {
+  if (plan.empty() || plan.front().spine_idx != 0)
+    return false;
   WgbWriter writer;
   if (!writer.open(output_path)) {
     return false;
@@ -166,110 +170,120 @@ bool convert_epub_to_wgb_streaming(Book& book, const char* output_path, uint8_t*
   std::vector<ImageMapping> image_map;
   const auto& zip = book.epub().zip();
 
-  // --- Fragment → para_index resolution setup ---
-  // Build a working copy of the TOC early so we can resolve fragment anchors.
-  struct FragmentNeed {
-    uint16_t zip_file_idx;  // zip entry index of the XHTML file (raw, before spine remapping)
-    std::string fragment;   // the id value to locate
-    size_t toc_entry_idx;   // index into toc_work.entries to fill in
+  // --- Chapter plan: who owns each paragraph ---------------------------------
+  // `cur` is the plan entry owning the content being parsed. It moves at the
+  // start of a spine file (to the last entry starting there with no fragment)
+  // and when the parser reports the id an entry starts at. Paragraphs owned by
+  // a dropped entry are not written, and neither are their images.
+  struct Start {
+    bool resolved = false;
+    uint16_t chapter = 0;  // written chapter index
+    uint16_t para = 0;     // writer paragraph index within it
   };
-  // Use a reference — moving the TOC would invalidate StringRef::pool pointers.
-  TableOfContents& toc_work = book.toc();
+  std::vector<Start> starts(plan.size());
 
-  std::vector<FragmentNeed> fragment_needs;
-  fragment_needs.reserve(toc_work.entries.size());
-  for (size_t i = 0; i < toc_work.entries.size(); ++i) {
-    auto frag = toc_work.entries[i].fragment.to_string(toc_work.pool);
-    if (!frag.empty()) {
-      fragment_needs.push_back({toc_work.entries[i].file_idx, std::string(frag), i});
-    }
-  }
-
-  // Context for the streaming paragraph + ID sinks.
   struct SinkCtx {
     WgbWriter* writer;
     std::vector<ImageMapping>* image_map;
     const ZipReader* zip;
+    const std::vector<PlannedChapter>* plan;
+    std::vector<Start>* starts;
+    size_t cur;
+    uint16_t spine_idx;
     bool error;
-    // Fragment resolution (nullptr if no fragments need resolving)
-    std::vector<FragmentNeed>* fragment_needs;
-    TableOfContents* toc_work;
-    uint16_t current_zip_file_idx;
-    // (anchors are written directly to the WgbWriter as they arrive)
   };
-  SinkCtx ctx{};
-  ctx.writer = &writer;
-  ctx.image_map = &image_map;
-  ctx.zip = &zip;
-  ctx.error = false;
-  ctx.fragment_needs = &fragment_needs;
-  ctx.toc_work = &toc_work;
-  ctx.current_zip_file_idx = 0;
+  SinkCtx ctx{&writer, &image_map, &zip, &plan, &starts, 0, 0, false};
 
-  // ID sink: resolves TOC fragment anchors to paragraph indices.
-  IdSink id_sink = [](void* raw_ctx, const char* id_p, size_t id_len, uint32_t para_idx) {
+  auto mark_start = [](SinkCtx& c, size_t i) {
+    c.cur = i;
+    Start& s = (*c.starts)[i];
+    if (!(*c.plan)[i].keep || s.resolved)
+      return;
+    s.resolved = true;
+    s.chapter = c.writer->chapter_count();
+    // **The writer's count, not the parser's.** The parser counts source
+    // paragraphs; the writer splits oversized ones, so the two diverge after
+    // the first split and a chapter jump would land short. The sink fires
+    // between paragraphs, so this is the index the next paragraph gets.
+    s.para = c.writer->chapter_paragraph_count();
+  };
+
+  IdSink id_sink = [](void* raw_ctx, const char* id_p, size_t id_len, uint32_t) {
     auto& c = *static_cast<SinkCtx*>(raw_ctx);
-    // TOC fragment resolution.
-    for (auto& need : *c.fragment_needs) {
-      if (need.zip_file_idx == c.current_zip_file_idx && need.fragment.size() == id_len &&
-          std::memcmp(need.fragment.data(), id_p, id_len) == 0) {
-        auto& entry = c.toc_work->entries[need.toc_entry_idx];
-        // **Use the writer's count, not the parser's `para_idx`.** The parser
-        // counts source paragraphs; the writer splits oversized ones, so after
-        // the first split in a chapter the two diverge and every later TOC
-        // anchor points a few paragraphs short — a chapter jump lands mid-way
-        // through the preceding text. Both are "paragraphs emitted so far" and
-        // the sink fires between paragraphs, so the writer's is the index this
-        // anchor's paragraph is about to receive.
-        (void)para_idx;
-        const uint32_t written = c.writer->chapter_paragraph_count();
-        if (entry.para_index == 0)  // only record first match per entry
-          entry.para_index = static_cast<uint16_t>(written < 0xFFFFu ? written : 0xFFFFu);
+    const auto& p = *c.plan;
+    for (size_t i = c.cur + 1; i < p.size() && p[i].spine_idx == c.spine_idx; ++i) {
+      if (p[i].fragment.size() == id_len && std::memcmp(p[i].fragment.data(), id_p, id_len) == 0) {
+        // Same rule as mark_start, which a captureless lambda can't call.
+        c.cur = i;
+        Start& s = (*c.starts)[i];
+        if (p[i].keep && !s.resolved) {
+          s.resolved = true;
+          s.chapter = c.writer->chapter_count();
+          s.para = c.writer->chapter_paragraph_count();
+        }
+        return;
       }
     }
   };
 
-  // Non-text paragraph sink: remap image keys, split large text paragraphs, and write to WGB.
   auto sink = [](void* raw_ctx, Paragraph&& para) {
     auto& c = *static_cast<SinkCtx*>(raw_ctx);
-    if (c.error)
+    if (c.error || !(*c.plan)[c.cur].keep)
       return;
-
     remap_paragraph_images(para, *c.writer, *c.image_map, *c.zip);
-
-    bool write_ok = write_split_paragraph(*c.writer, para);
-    if (!write_ok) {
+    if (!write_split_paragraph(*c.writer, para))
       c.error = true;
-    }
   };
 
-  for (size_t ci = 0; ci < book.chapter_count(); ++ci) {
-    writer.begin_chapter();
+  // Plan entries [next, end) start in spine file si. The leading run with no
+  // fragment starts at the file's first byte (plan[0] always does, whatever its
+  // fragment); the rest start at their anchors. `books` orders them so.
+  size_t next = 0;
+  for (size_t si = 0; si < book.chapter_count(); ++si) {
+    ctx.spine_idx = static_cast<uint16_t>(si);
+    size_t end = next;
+    while (end < plan.size() && plan[end].spine_idx == si)
+      ++end;
+    size_t lead = next;
+    while (lead < end && (lead == 0 || plan[lead].fragment.empty()))
+      ++lead;
 
-    ctx.current_zip_file_idx = static_cast<uint16_t>(book.epub().spine()[ci].file_idx);
-    book.load_chapter_streaming(ci, sink, &ctx, work_buf, xml_buf, id_sink, &ctx);
-    if (ctx.error) {
-      return false;
+    bool any_kept = plan[lead > next ? lead - 1 : ctx.cur].keep;
+    for (size_t i = lead; i < end; ++i)
+      any_kept = any_kept || plan[i].keep;
+
+    if (any_kept) {
+      writer.begin_chapter();
+      for (size_t i = next; i < lead; ++i)
+        mark_start(ctx, i);
+      book.load_chapter_streaming(si, sink, &ctx, work_buf, xml_buf, id_sink, &ctx);
+      if (ctx.error)
+        return false;
+      if (writer.chapter_paragraph_count() == 0)
+        writer.cancel_chapter();  // starts recorded in it now name the next chapter
+      else
+        writer.end_chapter();
     }
-
-    writer.end_chapter();
+    // The last entry starting here owns what follows, whether its anchor was
+    // seen or not (a skipped file reports no anchors).
+    if (end > next)
+      ctx.cur = end - 1;
+    next = end;
 
     if (progress_cb)
-      progress_cb(static_cast<int>(ci + 1), static_cast<int>(book.chapter_count()));
-
+      progress_cb(static_cast<int>(si + 1), static_cast<int>(book.chapter_count()));
   }
 
-  // Remap TOC file_idx (zip entry index) → spine index so ReaderScreen::load_chapter_() works.
-  // toc_work already has para_index values filled in from fragment anchor resolution.
-  const auto& spine = book.epub().spine();
-  for (auto& entry : toc_work.entries) {
-    for (size_t si = 0; si < spine.size(); ++si) {
-      if (spine[si].file_idx == entry.file_idx) {
-        entry.file_idx = static_cast<uint16_t>(si);
-        break;
-      }
-    }
+  // Where each kept entry starts. No labels: the device numbers them.
+  std::vector<WgbChapterStart> chapter_starts;
+  const uint16_t written = writer.chapter_count();
+  for (size_t i = 0; i < plan.size(); ++i) {
+    const Start& s = starts[i];
+    if (s.resolved && s.chapter < written)
+      chapter_starts.push_back({s.chapter, s.para});  // unit, paragraph
   }
+  if (written == 0)
+    return false;
 
 
   // --- Rasterise the images --------------------------------------------------
@@ -303,8 +317,16 @@ bool convert_epub_to_wgb_streaming(Book& book, const char* output_path, uint8_t*
     }
   }
 
-  bool ok = writer.finish(book.metadata(), toc_work);
-  writer.close();  // explicit close so fclose() happens before we return
+  bool ok = writer.finish(book.metadata());
+  const std::vector<std::vector<uint32_t>> units = writer.units();
+  writer.close();  // explicit close so fclose() happens before paginating
+  if (!ok)
+    err = "writing the book failed";
+
+  // --- Bake the pages ----------------------------------------------------------
+  // Every page of every layout, laid out here with the device's own code and
+  // font, so the device never paginates. See WgbFormat.h.
+  ok = ok && paginate_wgb(output_path, units, chapter_starts, fonts, err);
 
   // Extract the covers alongside the WGB if the EPUB has one, each already at
   // the size its screen draws it: the device never scales a cover. The device

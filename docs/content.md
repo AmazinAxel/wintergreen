@@ -5,14 +5,55 @@ Part of the Wintergreen notes; the entry point is `CLAUDE.md`.
 ## Content pipeline
 
 EPUB → WGB (a preprocessed binary layout format) → rendered pages. There is no on-device
-conversion at all, so `tools/convert-books.sh <epub-dir> <out-dir>` is the only way a book
-gets made. It builds and runs `tools/epub2wgb`, which reopens each output with `WgbReader` —
-the same code the device runs — so a file that would not load is reported at conversion time.
+conversion at all, so `books` (`tools/books`, packaged by `flake.nix`) is the only way a
+book gets made. It reviews each EPUB (title, author, cover, chapters), bakes it and reopens
+the output with `WgbReader` — the same code the device runs — so a file that would not load
+is reported at bake time.
+
+**Chapters are the reviewed list, not the spine.** `convert_epub_to_wgb_streaming` takes a
+`PlannedChapter` list (`WgbConverter.h`): each entry starts at a spine file or an anchor id
+inside one and owns everything up to the next entry. Paragraphs (and images) owned by a
+dropped entry are never written, even when they share an XHTML file with a kept chapter;
+spine files with nothing kept are left out. The WGB stores, per layout, the page each
+kept entry starts on; there are no labels, and the quick menu shows kept entry i as the
+number i + 1. Names exist only in the review: `books` prints them raw from the EPUB
+(whitespace collapsed, nothing renumbered or renamed). The EPUB's own NCX is ignored by the
+bake. The reviewed EPUB carries the list as `wg.ncx`, dropped entries as `class="wgdrop"`,
+so a re-review starts from it and can restore them.
+
+**Pages are fully baked** (`WgbPaginator.cpp`, called by the converter): every page of all
+four layouts, laid out with `TextLayout` and the reader font compiled into `books`
+(`tools/books/reader_font.cpp`, `.incbin` of `resources/Libron.bin`), stored as a display
+list (format in `WgbFormat.h`; parsed by `WgbPageView.h`). `WgbWriter` writes an
+intermediate file with the paragraph stream; the paginator lays it out (through
+`WgbParagraphs.h`'s `WgbPageSource`, host-only) and rewrites the file **without** the
+stream: header, image bitmaps, image refs, metadata, page tables, display lists. The
+device has no layout engine, hyphenation or paragraph parser. A spine file still always
+ends a page. See docs/display.md "Pages are fully baked".
+
+Size: text is stored once per layout, so a book is ~4× its text plus ~2 B per word per
+layout (x as a 1-byte delta, flags only when they change; was 4 B). Word text is glyph
+indices resolved at bake time (`wgb_read_glyph`, ASCII 1 B, never longer than UTF-8): the
+device does no UTF-8 decode and no range search per glyph. Project Hail Mary:
+4.8 MB (was 6.0), Dune omnibus 28.8 MB (was 36.1). Card and sync cost only; RAM per page
+is one ≤ 4 KB buffer, largest list 705 B. Sharing the text across layouts was rejected
+(`docs/history.md`).
+
+**Rebake rule: font bundle, `TextLayout`, `PageGeometry.h` or hyphenation change =
+rebake the library, same commit.** Unchecked (no version); a stale book draws what it
+was baked with (a font bundle change draws it with the wrong glyph indices).
+
+Tried and reverted on the way: making each kept entry one WGB chapter (as the load
+unit) gave an omnibus an 8,513-paragraph chapter whose paragraph table alone was ~136 KB.
+Baked pages removed the load unit instead.
 
 **Images are rasterised by the converter, not decoded on the device.** `WgbImageRef` is
 `{data_offset, data_size, width, height}` (12 bytes) addressing a raw 1-bit bitmap inside the
-WGB: `(width+7)/8` bytes per row, MSB first, bit clear = ink. `data_size` is always exactly
-`(width+7)/8 * height`, worth asserting if you touch the writer.
+WGB: `(width+7)/8` bytes per row, MSB first, bit clear = ink, followed by a portrait copy in
+8-row bands (`wgb_image_bands_bytes`: band b = `width` bytes, one per column, rows 8b..8b+7,
+top MSB). `data_size` is exactly rows + bands (`WgbWriter::set_image_data` builds both). The
+reader reads rows in landscape and bands in portrait (`blit_1bit_bands`, a byte copy per
+column); a page's slice of an image is one contiguous read either way.
 
 The converter decodes the source JPEG/PNG, scales it to fit `kWgbImageBoxW × kWgbImageBoxH`
 (480 × 772 — the portrait panel width and the page height less its vertical padding) and
@@ -37,10 +78,9 @@ the repo entirely: its buffer-decode path was never called by the converter, whi
 through its own decoders. An image page
 now turns at the speed of a text page.
 
-`WgbReader::open()` reads the chapter and image tables with **one `fread` each** and parses
-from memory, and `WgbChapterSource`'s constructor does the same for the per-chapter paragraph
-descriptor table. One `fread` per entry costs a FATFS + SPI round trip apiece and a long book
-has hundreds of each. The spine-filename and anchor tables are **gone from the format**: both
+`WgbReader::open()` reads the image table with **one `fread`** and parses from memory (one
+`fread` per entry costs a FATFS + SPI round trip apiece). Nothing else is resident: page
+records, chapter pages and paragraphs are read when asked for. The spine-filename and anchor tables are **gone from the format**: both
 existed only to resolve hyperlinks. Dropping them also removed the anchor `.tmp` file
 `WgbWriter` streamed during every conversion, and the header's `anchor_offset` with it (28 →
 24 bytes).
@@ -64,10 +104,15 @@ Output is one folder per book:
 
 ```
 <out>/<book name>/book.wgb
-<out>/<book name>/cover_list.bin   # fitted to 76x115, book list rows
-<out>/<book name>/cover_home.bin   # fitted to 424x479, home carousel
-<out>/<book name>/cover_sleep.bin  # 480x786, composed for the panel (bars included)
+<out>/<book name>/cover_list.bin   # fitted to 76x115, book list rows, column-major
+<out>/<book name>/cover_home.bin   # fitted to 424x486, home carousel, column-major
+<out>/<book name>/cover_sleep.bin  # the panel's own 48,000 B frame, no header
 ```
+
+Layouts in `CoverPaths.h`. All three are baked for the portrait screens: list/home are
+`[u16 w][u16 h]` then w columns of ceil(h/8) bytes (`DrawBuffer::blit_1bit_cols`, a byte
+copy per column); the sleep cover is the physical frame, read straight into the draw buffer
+(`DrawBuffer::frame()`), no scratch buffer and no blit.
 
 The three cover files are written only when the EPUB has a cover. The `book.wgb` filename is
 not arbitrary — `convert_epub_to_wgb_streaming()` looks for the literal string `book.wgb` in
@@ -89,12 +134,12 @@ failure.
 
 ### The sleep cover
 
-`show_book_cover_sleep_` in `Application.cpp` has **nothing left in it but a blit**.
+`show_book_cover_sleep_` in `Application.cpp` has **nothing left in it but one `fread`**.
 `cover_sleep.bin` is composed by `Book::write_sleep_cover_bin` at exactly `kSleepCoverW` ×
-`kSleepCoverH` (480x786 — **not** 800) with the artwork already trimmed, scaled, centred and
-its letterbox bars filled, so the device streams it a row at a time straight onto the panel —
-no 48 KB buffer, no scaling, no tone measurement. A file of any other size is from an older
-conversion and is **ignored**; the wordmark shows instead.
+`kSleepCoverH` (480x793) with the artwork already trimmed, scaled and dithered, then laid
+out as the panel's frame (`kSleepFrameBytes`), so the device reads it into the draw buffer —
+no scratch buffer, no blit, no scaling. A file of any other size is **ignored**; the
+wordmark shows instead.
 
 What the converter does, and why:
 
@@ -135,19 +180,25 @@ still depends on font metrics and has to be re-derived by hand if the layout mov
 
 ## File formats: WGB and WGF
 
-Fonts are **magic-as-version**: there is no version field. An incompatible layout change
-changes the four magic bytes, so a stale file is rejected by the existing magic check rather
-than misparsed. Bump the digit when the layout changes, and re-convert.
+**No file format has a magic or a version** (removed 2026-11-10: WGF `WGF1`, bundle `WGFS`,
+sleep image `MGR2`, index header `#wintergreen-index v2`). Fonts and the sleep image are
+built and flashed with the firmware, so a mismatched one cannot exist; a layout change means
+regenerating them in the same commit. The index is binary now (`BookIndex.cpp`); a file whose
+sizes do not add up (an older text index) fails `load()` and the list rescans the card.
 
-WGB has no magic at all. `WgbReader::open` requires the image ref table to end exactly at
+WGB has no magic either. `WgbReader::open` requires the image ref table to end exactly at
 `meta_offset`, which rejects a stale or non-WGB file (e.g. an HTML page saved by a bad sync).
 Any WGB layout change means re-converting the library.
 
-| | Magic | Holds | Defined in |
+| | Name | Holds | Defined in |
 |---|---|---|---|
-| Book | none | one book: paragraphs, chapter/image tables, metadata, TOC, image bitmaps | `content/wgb/WgbFormat.h` |
-| Font | `WGF1` | one font at one pixel size, up to four styles | `content/WgfFormat.h` |
-| Font set | `WGFS` | a count, a size table, and N `WGF1` blobs | `tools/make_font.py` `pack_bundle()` |
+| Book | WGB | one book: paragraph stream, image bitmaps + table, metadata, baked pages + chapter pages per layout | `content/wgb/WgbFormat.h` |
+| Font | WGF | one font at one pixel size, up to four styles | `content/WgfFormat.h` |
+| Font set | WGFS | `[u8 count][pad:3][count × u32 size]` then the WGF blobs | `tools/make_font.py` `pack_bundle()` |
+
+The magic removal shifted every absolute offset in `WgfHeader` down by four (49 → 45 bytes),
+the same trap as the version-byte removal below; the checked-in assets were converted
+mechanically (drop 4 bytes, subtract 4 from each nonzero offset field), not regenerated.
 
 They were MRB/MBF4/FNTS. The rename came with three simplifications, all of which mean any
 file produced before it must be re-converted:
@@ -176,7 +227,6 @@ the mapping by `DrawBuffer::Mgr2Source_` — there is no file-backed variant, so
 is a pointer add.
 
 ```
-"MGR2"   4 bytes
 width    uint16 LE      height   uint16 LE
 pixels   2 bits each, row-major, stride = ceil(width / 4), MSB-first:
          value = (row[x / 4] >> (6 - (x % 4) * 2)) & 3
@@ -225,7 +275,7 @@ first.**
 `StringPool`. `MainMenu` rescans whenever the loaded index is **empty**, not just when it
 fails to parse: a valid-but-empty index is indistinguishable from "never scanned", and
 treating it as authoritative meant books added to the card were never discovered. It has a
-`generation()` counter — MainMenu polls it so serial uploads/deletes refresh the visible list
+`generation()` counter — MainMenu polls it so a sync refreshes the visible list
 without navigating away.
 
 **`StringPool::get` is O(chunks), and callers must not treat it as free.** It walks the chunk
@@ -273,12 +323,14 @@ docstring is the real reference:
   white `(1,0,0)`, light `(1,0,1)`, mid `(0,1,0)`, dark `(0,1,1)`, black `(0,0,0)`. The BW
   plane draws where its bit is **clear**; the gray planes draw where theirs is **set**. So
   `(msb,lsb)` is a lightening modifier, not a magnitude.
-- The reader font asset is `[uint32 uncompressed size][zlib stream]` wrapping a WGFS v2
-  bundle: `[WGFS][num][ver=2][pad:2][name:32][num × uint32][WGF1...]`.
+- The reader font asset is `[uint32 uncompressed size][zlib stream]` wrapping a WGFS
+  bundle: `[num][pad:3][num × uint32][WGF...]`.
 
-The gray planes are **optional** — `gray_lsb_offset` / `gray_msb_offset` of 0 mean absent.
-The device ignores both fields (its gray-plane plumbing is gone); every font is built with
-`--mono`: `FT_LOAD_TARGET_MONO`, no gray planes.
+The two old gray-plane header fields are now `col_bitmap_offset` / `col_index_offset`: a
+column-major copy of every glyph plus a u32-per-glyph index (`WgfFormat.h`), appended by
+`tools/wgf_columns.py` (from the existing bitmaps, so pixels never change; idempotent;
+`make_font.py` calls it). Portrait text uses it (`blit_cols_`), landscape the row-major
+bitmaps. Every font is built with `--mono`: `FT_LOAD_TARGET_MONO`, no gray planes.
 
 That followed from the reader drawing only the BW plane. The BW plane is not a 50%
 threshold — `LEVEL_BITS` puts level 2 (37.5% coverage) in the ink plane, so BW-only text was
@@ -291,7 +343,7 @@ Don't "fix" the AA path to match — the 5-level encoding and its 37.5% threshol
 *for grayscale output*, where the lightening pass pulls those edge pixels back. They only
 misbehave when the gray planes are thrown away.
 
-`tools/check_font.py` parses a bundle or bare WGF1 exactly the way `BitmapFont.h` does and
+`tools/check_font.py` parses a bundle (compressed or raw) exactly the way `BitmapFont.h` does and
 ASCII-art renders a sample string. Run it after regenerating a font — a structurally broken
 font renders blank on device with no error. Its header line reports `gray=yes|no`, the quick
 check that `--mono` took effect.
@@ -308,6 +360,8 @@ is drawn in the regular UI font.
 
 Glyph lookup itself is a binary search over the WGF1 range table
 (`BitmapFont::find_glyph_index_in`), so `char_width` is O(log ranges) and needs no cache.
+UI strings still go through it; reader pages do not (glyph indices are baked into the
+display lists).
 
 Regenerating (needs freetype-py + fontTools, absent from the PlatformIO interpreter, hence
 nix-shell):

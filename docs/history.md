@@ -4,16 +4,68 @@ Part of the Wintergreen notes; the entry point is `CLAUDE.md`.
 
 ## Still open
 
-- **Pre-draw skips image pages.** `draw_image_()` must drain the waveform before touching the
-  card, so a speculative draw would block the UI loop for the couple of hundred ms the current
-  page is still painting. Needs a second spare buffer, or an SD read that does not need the
-  panel idle. **Neither is available**: the measured ~13 KB free with the radio up has no room
-  for another 48 KB framebuffer, and the SD/panel SPI2 sharing is a wiring fact. Do not re-open
-  without one of those two changing.
+Moved here from `PLAN.md` (deleted 2026-11-12). Owner's call unless noted.
+
+- **Neighbouring carousel cover preload (reopened 2026-11-12, not built).** Two covers
+  (2 × 25,387 B) do not fit the 48,000 B spare, so it needs a fixed 25 KB buffer claimed
+  at boot. Waits for the device heap numbers (`H min`) to show the room.
+- **Re-baked books never re-sync.** Sync matches by folder name only; a re-bake under the
+  same slug is never offered again. Bug. Any WGB format change (2026-11-12: compact word
+  records) needs the card's books replaced by hand until this is fixed.
+- **Sync re-download on size mismatch** (old item 1b). Touches the NAS side.
+- **Latency floor not reached** for backward turn, quick-menu open, home ↔ library and
+  chapter jump: 10–30 ms render + card reads above input + ~10 ms SPI + ~300 ms waveform.
+  Each extra pre-draw needs another 48 KB buffer; likely not beside Wi-Fi.
+- **Built 2026-11-12, none device-tested yet:** column-major glyphs, covers in panel
+  order, glyph ids in display lists, allocation-free quick-menu wrap, thumbnail pack,
+  allocation-free home slots, hidden-book title cache, unclipped fast path in
+  `put_row_`, reader images with a portrait band copy, binary index file (format only:
+  `BookIndex` API, sort, sync and hidden handling unchanged). Not baked: display-order
+  records and pre-cut titles (sort and `fit_prefix` are sub-ms; would change the API).
+- B1 light-sleep experiment, B2 `min_freq_mhz = 40`: both contradict CLAUDE.md "never
+  break" rows.
+- Ammeter only: B3 deep-sleep current, B8 current with the clicker connected.
+- R8: NimBLE host stack high-water mark never read (task not found by that name).
+- Not flashed: final sync build (47 KB spare as the download buffer; expect ~300 KB/s).
+- Never device-tested: sync started while the clicker is still connecting (code review
+  2026-11-12 found and fixed a race: `begin_sync()` now aborts and waits for
+  `connect_task` to exit); clicker paired elsewhere then back (fixed: stale bond deleted
+  even when the clicker hangs up, then one fresh re-pair); image-page pre-draw after idle; `stage_next_page_` ordering on
+  quick-menu resume; final-file rewrite in `WgbPaginator` (tmp + remove + rename) on the
+  owner's machine.
+- Seen once, never again: 20/20 clicker presses dropped (queue full) in one run; first
+  big sync leaving a 0-byte `book.wgb.tmp` (`docs/sync.md` "Open").
+- README line 12 still says the NAS converts books (`books` converts locally).
+
+(Image-page pre-draw, formerly open here, is done: drawn on the first frame after the
+waveform, see `docs/display.md`.)
 
 ### Investigated and rejected
 
-- **Preloading the neighbouring carousel cover.** Built, flashed, and it **ran the device out of
+- **Resume state in RTC memory (2026-11-12).** Would draw the first page on wake without
+  opening `.wintergreen`, `book.pos` or the book, but keeping RTC memory powered adds
+  deep-sleep current. Owner: nothing that costs battery.
+- **Baking the quick-menu title wrap into the WGB (2026-11-12).** The wrap depends on the
+  percentage's width at runtime; baking would mean reserving "100%" (a title could wrap
+  earlier than today). Made allocation-free at runtime instead, same pixels.
+
+- **Text stored once, shared by the 4 layouts (2026-11-12).** Measured on Dune: word text
+  is 48% of the file (17.5 MB, ×4), so sharing it saves ~36%. Rejected for compact word
+  records instead: sharing needs a second card read on every page not pre-staged
+  (backward turn, chapter jump, open), against a one-time sync gain.
+
+- **Shorter page-turn waveform (custom fast LUT)** — offered 2026-11-11 as the only lever
+  left on turn/menu/hold latency (~150-200 ms vs ~300 ms, at a ghosting/contrast cost
+  judged by eye). Owner declined; not built. Offered again 2026-11-12 for menu cursor moves
+  only (fast clicker taps batch into one ~430 ms frame and look skipped; measured: 26 presses,
+  0 dropped, queue peak 5, longest wait 428 ms). Declined again.
+
+- **Fast wake paint** (2026-11-12) — wake measured at 131 ms of software, then ~1565 ms of
+  Half refresh (`M boot` 1696). Replacing it with the page-turn refresh would save ~1.1 s
+  per wake at the cost of sleep-cover ghosting. Owner kept Half.
+
+- **Preloading the neighbouring carousel cover** (reopened by the owner 2026-11-12, see
+  "Still open"; the history below is why the first two attempts failed). Built, flashed, and it **ran the device out of
   memory and restarted it** while cycling books on the home screen. The estimate of "~25 KB for
   a second cache" was right about the steady state and missed the spike:
 
@@ -79,6 +131,32 @@ turns). See "Build & flash", "Idle power" and "Refresh latency".
 ## Removed (don't resurrect without asking)
 
 Only the reasons are kept — the symbol-by-symbol inventories are in git history.
+
+**`esp_hidh` (2026-11-11).** Its discovery and CCCD writes ran before encryption and
+mapped nothing, its INPUT events never fired, and its connect failed on every fresh boot
+(measured, 78 ms in). Replaced by raw NimBLE (`docs/bluetooth.md`); with it went the 6 KB
+event task and the forced `ROLE_PERIPHERAL` / `GATT_SERVER` / `HID_SERVICE` keys.
+
+**USB detection (2026-11-11, owner's call).** `usb_serial_jtag_is_connected()` gated three
+things: skipping the wake hold, skipping the low-battery boot gate, and `keep_awake()`
+while plugged in. All gone. Consequence accepted: flash within `kAutoSleepMinutes` of a
+wake or start the upload and hold power; a flat cell refuses boot even on USB until the
+charger lifts it (`CLAUDE.md` "Low-battery cutoff"). The reader's low-battery bar
+latches until the next boot instead of clearing on USB.
+
+**Clicker release-edge page turn (2026-11-11).** Replaced by press-edge turn + Undo on
+hold (`docs/bluetooth.md`).
+
+**Device-side layout and every radio RAM workaround (2026-11-11).** Pages became display
+lists baked by `books`, so `TextLayout`, hyphenation, `WgbPageSource` / paragraph parsing
+and the paragraph cache left the firmware, and with them: the OOM reserve +
+`set_new_handler` rescue, `largest_free_block` guards and cache caps in the reader,
+`Application::release_ram_for_radio` / `restore_ram_after_radio`,
+`BookIndex::release_memory`, the clicker and sync releasing DrawBuffer's spare (which hid
+covers and thumbnails), `IRuntime::clicker_holds_ram` / `largest_free_block_bytes`,
+`layout_memory_test`, and the sync's controller deinit that left the clicker unavailable
+until reboot. The reasoning they were built on is kept in `docs/bluetooth.md` (layout-era
+sections).
 
 Screens and settings: the settings menu, theme picker, Stats / GlobalStats / WhatsNew / Alert /
 ConvertAll screens, the bouncing-ball and grayscale demos, BMP sleep-image conversion,

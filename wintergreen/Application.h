@@ -110,8 +110,8 @@ class Application {
   ReaderScreen* reader() {
     return &reader_;
   }
-  // Returns true when the Reader is the top/active screen. The main loop defers
-  // serial Add/Rename index ops while it is, and the clicker swaps its keys.
+  // Returns true when the Reader is the top/active screen. The clicker swaps
+  // its keys while it is.
   bool is_reader_active() const {
     return screen_mgr_.top() == &reader_;
   }
@@ -134,22 +134,6 @@ class Application {
     rotate_reader_ = v == 1 ? 1 : 0;
     save_settings_();
   }
-
-  // Hand the resident book index (~30 KB) back to the heap so the BLE stack has
-  // room. Called synchronously just before the radio is switched on, because
-  // bringup allocates immediately and a next-frame release would be too late.
-  //
-  // The reader does not need the index while a book is open, and every screen
-  // reloads it from disk when empty — see BookIndex::release_memory.
-  // drop_book_index: false when the caller's screen displays index strings —
-  // see the comment in the definition.
-  void release_ram_for_radio(bool drop_book_index = true);
-  // Counterpart: lifts the reader's cache cap once no radio is up.
-  void restore_ram_after_radio();
-
-  // Whether the BLE stack currently holds heap, as last seen by update(). Not
-  // the connection state — see the comment at the check.
-  bool radio_ram_held_ = false;
 
   // Called when a book is opened: bumps the open-order counter in the in-memory
   // index and persists settings. The index itself is written once per session,
@@ -190,29 +174,27 @@ class Application {
 
   void start(DrawBuffer& buf, IRuntime& runtime);
 
-  // Reset the inactivity timer so the device won't sleep. Call each tick
-  // whenever an external connection (e.g. USB serial) is active.
-  // Called each tick while a USB host is attached: suppresses auto-sleep and the
-  // low-battery cutoff, since the device is being powered rather than drained.
+  // Reset the inactivity timer so the device won't sleep.
+  // Called each tick while a Wi-Fi sync runs: suppresses auto-sleep and the
+  // low-battery cutoff, so a transfer is never cut mid-file.
   void keep_awake() {
     inactivity_ms_ = 0;
-    usb_powered_ = true;
     low_battery_ms_ = 0;
   }
-  // True while a USB host is attached, i.e. the device is being charged rather
-  // than drained. Valid only during update() — main.cpp asserts it each frame
-  // via keep_awake() and update() clears it on the way out.
-  bool usb_powered() const {
-    return usb_powered_;
-  }
-  // Open a book by path, bypassing the menu: the boot resume path and the
-  // serial 'O' command.
+  // Open a book by path, bypassing the menu: the boot resume path.
   void auto_open_book(const char* epub_path, DrawBuffer& buf, IRuntime& runtime);
   // Write what persist_pending_ says is owed (index, settings) now rather than at
   // the next quiet moment. For anything about to reload the index from disk.
   void flush_persist();
   void update(const ButtonState& buttons, uint32_t dt_ms, DrawBuffer& buf, IRuntime& runtime);
   bool running() const;
+  // How long the UI loop may block before update() has work again, or 0 for
+  // ordinary frame cadence (anything in motion: a button down, a transition,
+  // the panel mid-waveform, the perf hold, a pending card write). Otherwise
+  // the nearest timer: the 1 s battery poll or auto-sleep. Input, clicker and
+  // sync end the wait early through ui_wake, so this is a ceiling, never a
+  // delay on anything that happens.
+  uint32_t idle_wait_ms(DrawBuffer& buf) const;
 
  private:
   bool started_ = false;
@@ -221,6 +203,10 @@ class Application {
   uint32_t inactivity_ms_ = 0;
   // Milliseconds since the UI last did anything; drives the DFS performance hold.
   uint32_t perf_idle_ms_ = 0;
+  static constexpr uint32_t kPerfHoldMs = 300;
+  // Any button held at the last update(): power hold and hold-repeat count
+  // frames' worth of dt while it lasts, so the loop keeps its cadence.
+  bool buttons_down_ = false;
 
   // Low-battery cutoff state — see Application::update.
   // Wall time the battery must stay below the cutoff before acting. Comfortably
@@ -228,8 +214,7 @@ class Application {
   static constexpr uint32_t kLowBatteryHoldMs = 4000;
   uint32_t low_battery_ms_ = 0;
   uint32_t battery_poll_ms_ = 0;
-
-  bool usb_powered_ = false;
+  static constexpr uint32_t kBatteryPollMs = 1000;
 
   // Power button: armed on a rising edge only, so the press that woke us from
   // deep sleep (cleared by main.cpp) can never register as an action.

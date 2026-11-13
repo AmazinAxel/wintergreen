@@ -47,10 +47,25 @@ and quick-menu return), so the first turn after waking is a memcpy. Going to sle
 `do_sleep_()` puts the sleep screen up **before** stopping the reader and saving, so
 those SD writes are not latency; the panel's `deep_sleep()` is sent last.
 
-**The CPU never sleeps between frames.** `wait_next_frame()` `vTaskDelay`s to a 25 ms
-cadence, so the core wakes 40×/s at ~15 mA. With no light sleep available the only
-lever is reaching deep sleep sooner. A longer frame period saves a fraction of a
-milliamp and costs input latency — measured and rejected.
+**The CPU never light-sleeps between frames.** The loop is already deadline-driven
+(old plan item B4, read 2026-11-12): `main.cpp` waits `Application::idle_wait_ms()` — 0 while
+a button is down, the perf hold runs, a persist or transition is pending or the panel is
+busy; otherwise until the battery poll or auto-sleep deadline — shortened to the clicker
+hold deadline, and woken early by input through `g_ui_wake`. The 25 ms frame cadence
+runs only while one of those holds. What still wakes the core regardless is the 5 ms
+`esp_timer` button sampler (`input.h`), which the ADC ladders need. Between wakes the
+core idles (WFI) awake at ~15 mA; the only levers are deep sleep sooner and B1 below.
+A longer frame period saves a fraction of a milliamp and costs input latency —
+measured and rejected.
+
+**B1, manual light sleep between page turns (open in `docs/history.md`), is not done and cannot be done
+blind.** It is the same SAR-ADC-state failure documented above, reached by a different
+call (`esp_light_sleep_start()` from the loop, not tickless idle). Unknown until a
+battery run: whether the ADC reads after a manual light sleep (or after re-creating the
+oneshot unit), whether GPIO1/GPIO2 can wake the chip beside their ADC channels, whether
+the panel pads hold. If wrong, buttons die on battery and look fine on USB. Proposed
+form: an experiment behind a compile-time switch, tested unplugged. Estimate only:
+~15 mA → ~1 mA while reading.
 
 ## Dynamic frequency scaling (live)
 
@@ -99,6 +114,30 @@ not a task notification, because IDF drivers the UI task calls may block on its
 notification slot. Screens repaint only on state changes, so frame rate does not drive
 panel traffic.
 
+### Idle loop (B4, 2026-11-11)
+
+The loop no longer wakes 40 times a second to find nothing. After `app.update`,
+`main.cpp` asks `Application::idle_wait_ms(buf)`: **0** (keep the 25 ms cadence) while
+anything is in motion — a button down (`buttons_down_`), power armed, the perf hold,
+`persist_pending_`, a pending transition, the panel busy — else the nearest timer (1 s
+battery poll, auto-sleep). A sync (`wg_sync::active()`) or a clicker connect
+(`wg_clicker::busy()`) forces cadence; a clicker key down shortens the wait to exactly
+`wg_clicker::hold_wait_ms()`. `Esp32Runtime::wait_next_frame(budget)` blocks on
+`g_ui_wake` for that long (`UINT32_MAX` = `portMAX_DELAY`), ticks **rounded up** so a
+deadline a few ms away is not a zero-tick spin.
+
+**Anything that changes state asynchronously must call `ui_wake()`**, or the screen shows
+it only at the next deadline (up to 1 s): input edges, clicker presses, clicker connect
+end, clicker peer disconnect, sync end all do. The 5 ms ADC sampler still runs; that is
+B1's territory.
+
+**The first frame of a hold counts no time** (hardware bug, 2026-11-11). With the idle
+loop, the dt of the frame that sees a press is the whole wait *before* it (up to 1 s).
+`HoldRepeat::tick` and HomeScreen's Back-hold added it, so a quick tap crossed
+`kHoldDelayMs` at once: lists skipped rows, the carousel wrapped the wrong way, and a Back
+tap could open the hidden list. Both now start counting on the second down frame. Any new
+dt-accumulating hold must do the same.
+
 **Card writes are kept off transitions.** A reader close (`record_book_progress`) and a
 pop from the reader stack set `persist_pending_` instead of writing the index and
 settings; `Application::update` flushes them once input has been still for
@@ -115,6 +154,9 @@ ms to ~25:
 - the reader's and list's page/row repeat fired once **per frame** with no delay, so a
   tap registered as two presses. They now use `HoldRepeat` (`Input.h`), driven by
   `config::kHoldDelayMs` / `kHoldRepeatMs` / `kHoldAccelStep`.
+- the clicker's hold is its own constant, `config::kBluetoothHoldDelayMs` (100), timed by
+  `esp_timer` in `wg_clicker::poll()` with the loop waking at the deadline
+  (`docs/bluetooth.md`).
 - the hidden-books long-press was `15` frames, commented "≈3s at typical e-ink frame
   rate" — i.e. calibrated to refresh-blocked frames. It became ~0.4 s. It is
   milliseconds now, and on `HomeScreen` it is the tree's only hold gesture outside
@@ -132,7 +174,19 @@ the list length.
 
 Beware `pdMS_TO_TICKS(1)`: at `FREERTOS_HZ=100` it is **0 ticks**, and `vTaskDelay(0)`
 only yields, so any wait loop using it spins the CPU flat out. `epd.h`'s
-`waitWhileBusy` had this bug and now uses a literal `vTaskDelay(1)`.
+`waitWhileBusy` had this bug; it now blocks on the BUSY falling-edge interrupt instead
+(`docs/display.md`).
+
+### Deep sleep pin holds (B3, 2026-11-11)
+
+`deep_sleep_now_()` drives SD CS (GPIO12), panel CS (GPIO21) and panel RST (GPIO5) high
+and holds them (`gpio_hold_en` + `gpio_deep_sleep_hold_en`): floating, a CS can drift low
+and select its device and a floating RST can pulse the panel out of its deep sleep, both
+for the whole night. **`app_main` releases them first thing** (`release_sleep_holds_()`,
+before anything touches a pin): a hold survives the wake and a held CS cannot be driven,
+which would leave panel and card dead. Device-checked by function (wake, panel, card,
+book list); the current saving is unmeasured (no ammeter). Card standby current itself
+is not reachable from firmware.
 
 ## The power button
 
@@ -161,8 +215,7 @@ default-constructed forever: every button died, power included, and the firmware
 and booted perfectly showing the home screen. Deleting the member makes that state
 unrepresentable.
 
-Auto-sleep never fires while USB is connected — `main.cpp` calls `keep_awake()` every
-iteration when `usb_serial_jtag_is_connected()`. The timeout can only be tested on
-battery. `Esp32Runtime::frame_time_ms()` returns the **measured** duration of the last
+Auto-sleep fires on USB too: there is no USB detection (removed 2026-11-11). Flash within
+a minute of waking, or start the upload and hold power. `Esp32Runtime::frame_time_ms()` returns the **measured** duration of the last
 frame, not the nominal target; `Application` accumulates it into the auto-sleep
 countdown, so returning the constant made that clock drift whenever a frame overran.

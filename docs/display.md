@@ -21,7 +21,7 @@ waveform. Safe only because **every** `EInkDisplay` entry point opens with
   in flight (why `main.cpp` defers index ops on `epd.is_busy()`). Any new SD access must
   call `DrawBuffer::wait_panel_idle()` first. Existing ones: `draw_image_`,
   `ReaderScreen::stop()`'s `.pos` write, `do_sleep_()`, the settings save on reader pop,
-  every sync write. Text-only pages never touch the card and keep the full overlap.
+  every sync write, `ReaderScreen::load_page_` (display lists; see "Pages are fully baked").
 
 **Region refresh cannot update "just the changed rows" — tried and reverted.**
 `setRamArea()` bounds where a RAM *write* lands, not the refresh. `refreshDisplay()`
@@ -34,16 +34,43 @@ the reader page showed through behind the menu. `partial_refresh_region()` remai
 correct for its **one** caller, `show_loading()`, where the rest of the screen is
 static *and* BW RAM already matches it.
 
-**`ReaderScreen::page_cache_`** holds one laid-out page, so `prev_page_()`'s
-`layout_backward()` result is not thrown away for `render_page_()` to redo. Key is
-chapter + position + `PageOptions` + font size index, checked **after**
-`resolve_stable_position()` (which can move `page_pos_`). `set_font`/`set_options` wipe
-`TextLayout`'s paragraph cache wholesale, so a stale entry points at freed line
-vectors. `LayoutWord::text` points into `WgbChapterSource`'s 32-slot paragraph window
-rather than into `PageContent`, which is why the cached page is **moved** into `page_`
-(only one may be live) and why `load_chapter_()` and `stop()` drop it explicitly:
-rebuilding the source frees every slot it points into and no key comparison detects
-that.
+### Pages are fully baked; the device never lays out
+
+`books` lays out every page of every layout (2 font sizes × 2 orientations) on the build
+machine and stores one 14-byte record plus one **display list** per page (`WgbFormat.h`,
+`WgbPaginator.cpp`): line baselines, word x / font / style / valign / text, rules, image
+slices, in draw order. The reader's position is a page index: forward/back are ±1, a
+chapter jump is a page, progress is page / page_count. A page turn reads the record and
+the list (≤ `kWgbMaxPageBytes`, measured max 879 B) into `ReaderScreen::page_buf_` and
+draws it with `DrawBuffer::draw_baked_line`; nothing allocates. `baked_line_test` proves
+the draw pixel-identical to the PageContent draw it replaced.
+
+**Display lists come off the card, so the read follows the SPI2 rule.** `load_page_`
+waits for the panel before reading. To keep the pre-draw overlap, `stage_next_page_`
+reads page + 1's list **before** `refresh()` (panel idle, a few ms), and
+`prerender_next_page_` draws it during the waveform from RAM. A page with an image needs
+the card to draw, so it is pre-drawn on the first frame after the waveform ends
+(`predraw_after_idle_`; the loop runs frames while the panel is busy), still well before
+the next turn.
+
+**Rebake rule.** Font bundle, `TextLayout`, `PageGeometry.h` or hyphenation change =
+rebake the library in the same commit. No version field: a stale book still opens and
+draws what it was baked with.
+
+Two bugs the per-page source exposed (layout era, still in host `TextLayout`), both fixed:
+- `leading_spacer` was granted to source paragraph 0. With a source per page that was
+  every page's first paragraph, shifting its collect-index space by one against the
+  page before it (a line repeated or skipped). Now only when the source
+  `starts_unit()` (record top bit).
+- A page boundary's `text_offset` indexed `lines[]` with the collect index, which also
+  counts the spacer and promoted-image rows, so pages starting mid-paragraph often got
+  0. `text_offset_at()` maps it; the offset orders pages across layouts (`find_page`,
+  `book.pos`).
+
+### History: backward paging (removed with baked pages)
+
+Everything below describes the runtime backward walk that baked pages replaced; kept
+for why the device no longer does it.
 
 ### Forward and backward must use the same line-fitting rule
 
@@ -97,6 +124,18 @@ happens before the walk, not during it. Two other approaches that do *not* work:
 Everything CPU-side is off the critical path, leaving the ~300 ms waveform as the
 floor:
 
+- **`waitWhileBusy()` is event-driven** (2026-11-11). A BUSY falling-edge GPIO interrupt
+  (`busy_isr_`, ISR service flags 0, so held off during flash writes rather than run from
+  disabled cache) gives `busy_done_`; the waiter re-checks the pin, so a stale give costs
+  one check. The old one-tick poll saw a waveform end up to 10 ms late (`FREERTOS_HZ=100`),
+  paid by every frame chained behind a waveform: a menu after a page turn, a turn during
+  a turn. The 10 s dead-panel guard stays.
+- **Two chained waveforms are the floor for anything that follows a page turn.** A
+  waveform cannot be aborted, so a clicker hold (page turned on press, menu at 100 ms)
+  shows its menu after the rest of the turn's ~300 ms plus the menu's own ~300 ms: the
+  ~0.5-0.6 s the owner noticed. Below that needs a shorter waveform LUT (more ghosting,
+  weaker black, by eye); offered 2026-11-11 and **declined by the owner**.
+
 - **The next page is laid out *and drawn* during the waveform**, so a forward turn is a
   memcpy plus an SPI write. Returning from the quick menu is a memcpy too. Both use the
   spare buffer.
@@ -107,15 +146,20 @@ floor:
   it. Small writes stay polled deliberately: a 105-byte LUT costs less than the
   interrupt round trip, **and LUT tables live in rodata, which is not DMA-capable** —
   hence the `esp_ptr_dma_capable()` guard rather than a size test alone.
-- **Chapter load reads its descriptor table in one `fread`.** One read per entry costs a
-  FATFS + SPI round trip apiece, and a chapter can have hundreds. On the path for every
-  book open and chapter jump.
+- **No chapter load.** A page turn reads one 14-byte page record and that page's display
+  list; a book open or font/rotation change is a binary search over records on the card.
+  No paragraph or descriptor table is ever resident.
 - **Images are never decoded on the device.** An image page turns at the speed of text.
-- **Nothing walks the chapter.** Opening a book lays out one page.
+- **Nothing walks the chapter.** Opening a book lays out nothing; pages are baked.
+- **Drawing is byte copies (2026-11-12).** Display lists hold glyph indices (no UTF-8
+  decode, no range search); portrait glyphs, covers and reader images have baked
+  column-major / band copies (`blit_cols_`, no bit transpose); unclipped rows skip the
+  per-byte clip math (`put_row_` fast path). See docs/content.md.
 - **The book index stays resident** for the session. Both `MainMenu` and `HomeScreen`
   load from disk only when `entries()` is empty — once, on a cold boot. Every mutation
   updates the in-memory copy and saves, so a non-empty index is authoritative. ~30 KB
-  against ~165 KB free heap, and dropping it meant re-reading and re-parsing on entry to
+  against ~165 KB free heap (binary file since 2026-11-12, no text parse), and dropping it
+  meant re-reading and re-parsing on entry to
   the home screen, on entry to the list, and again when the reader wrote progress.
 - **Label truncation is linear, not quadratic.** `fit_prefix()` in `ListMenuScreen.h` is
   the one place that measures how much of a string fits a width; it accumulates
@@ -129,9 +173,19 @@ floor:
 by `spare_use_`:
 
 - **Snapshot** — a copy of the displayed frame. `ReaderScreen::pause()` takes it when
-  the quick menu opens; `resume()` puts it back, so dismissing the menu is a memcpy.
+  the quick menu opens; `resume()` puts it back. Both are pointer swaps between the
+  draw buffer and the spare, no memcpy.
 - **Offscreen** — where `prerender_next_page_()` draws the next page while the panel is
   still running the current waveform. `take_predrawn_()` commits it.
+
+Two more users, each displacing whatever it held: **Cache** (`claim_spare_cache`, the
+book list's thumbnails and the home cover, generation-checked) and **Lent**
+(`lend_spare()` / `return_spare()`, 2026-11-12): the sync's download buffer, handed out
+and taken back by `wg_sync::poll()` on the UI thread. While lent (`spare_lent_`) every
+other claim refuses (cache returns null, snapshot and pre-draw skip), so no screen can
+write into a buffer another task is filling. The sleep cover no longer borrows it
+(`borrow_spare_scratch()` removed 2026-11-12): `cover_sleep.bin` is the panel's frame and
+is read straight into the draw buffer.
 
 They share storage because a reader is either in the quick menu or turning pages, never
 both. **Claiming it for one purpose silently invalidates the other**, safe only because
@@ -139,8 +193,15 @@ both consumers re-check: `resume()` tests `has_snapshot()`, `take_predrawn_()` t
 `has_offscreen()`, and either falling false just means rendering normally.
 
 `begin_offscreen()` redirects `draw_()` at the spare; `end_offscreen()` publishes it and
-`commit_offscreen()` moves it into the inactive buffer. The commit paths (`refresh`,
-`full_refresh`, `restore_snapshot`, the MGR2 sleep blit) use `inactive_()` directly.
+`commit_offscreen()` swaps it into the draw buffer. The commit paths (`refresh`,
+`full_refresh`, `restore_snapshot`, the MGR2 sleep blit) use `buf_` directly.
+
+There is one draw buffer, not a front/back pair. `refresh()` sends it and does not
+flip: the controller keeps the pixels, the SPI write is synchronous, and every draw
+starts from `fill()` or a whole-buffer swap, so nothing reads the previous frame. Between
+refreshes the draw buffer is the frame on the glass. The second host copy (48 KB) was
+removed because nothing read it; `RefreshMode::Full`, the only mode that takes the old
+frame from the host, has no caller, and one added later must keep its own copy.
 
 Two things `prerender_next_page_()` must get right:
 

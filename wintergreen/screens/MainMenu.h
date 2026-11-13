@@ -1,6 +1,7 @@
 #pragma once
 
 #include <cstdint>
+#include <cstdio>
 #include <cstring>
 #include <string_view>
 
@@ -51,6 +52,7 @@ class MainMenu final : public ListMenuScreen {
   int count() const override;
   int prepare_thumbs(int box_h) const override;
   bool get_item_thumb(int index, Thumb& out) const override;
+  void end_thumbs() const override;
 
   void start(DrawBuffer& buf, IRuntime& runtime) override {
     buf_ = &buf;
@@ -74,8 +76,8 @@ class MainMenu final : public ListMenuScreen {
   std::string initial_selection_;   // path to pre-select after scan
   DrawBuffer* buf_ = nullptr;
   // Cached BookIndex::generation() value from the last populate_list_(). When
-  // update() detects a mismatch, the index was mutated externally (e.g. by a
-  // serial upload/delete/rename while this screen is showing) and we refresh
+  // update() detects a mismatch, the index was mutated externally (a sync
+  // while this screen is showing) and we refresh
   // the list in place without requiring the user to navigate away and back.
   uint64_t cached_generation_ = 0;
 
@@ -87,6 +89,7 @@ class MainMenu final : public ListMenuScreen {
     StringRef author_ref;
     uint32_t last_open_order = 0;
     uint8_t progress_pct = 0;
+    int index_pos = -1;  // position in BookIndex::entries(): its thumbnail pack slot
     // Books under .hidden/ are not in BookIndex — there is no pool to reference,
     // so they carry their own strings and are read straight from the WGB.
     bool hidden = false;
@@ -141,7 +144,7 @@ class MainMenu final : public ListMenuScreen {
   void populate_list_();
   // Land on the first book rather than on Sync when the screen opens. Called
   // after populate_list_() from the two paths that build the list on entry, so
-  // an in-place refresh (serial upload) does not move the cursor.
+  // an in-place refresh (sync) does not move the cursor.
   void select_first_book_();
   // NAS sync: hands off to IRuntime::start_sync() and returns.
   void run_sync_();
@@ -177,8 +180,11 @@ class MainMenu final : public ListMenuScreen {
   mutable int thumb_slots_n_ = 0;
   mutable ThumbSlot thumb_slots_[kThumbSlotsMax];
   mutable uint32_t thumb_clock_ = 0;
-  size_t thumb_slot_bytes_() const { return static_cast<size_t>((thumb_w_ + 7) / 8) * thumb_h_; }
-  static uint32_t thumb_key_(std::string_view path);
+  size_t thumb_slot_bytes_() const { return cover_cols_bytes(thumb_w_, thumb_h_); }
+  // The thumbnail pack, open only for the duration of one draw (end_thumbs).
+  mutable FILE* pack_ = nullptr;
+  mutable bool pack_tried_ = false;
+  bool load_packed_thumb_(int index_pos, uint32_t key, uint8_t* dst, ThumbSlot& slot) const;
   // Claims (or re-validates) the cache for a w x h box; false when the spare is
   // unavailable. Changing the box empties every slot.
   bool thumb_cache_ready_(int w, int h) const;
@@ -186,7 +192,7 @@ class MainMenu final : public ListMenuScreen {
   uint8_t* thumb_slot_bits_(const ThumbSlot& s) const {
     return thumb_bits_ + static_cast<size_t>(&s - thumb_slots_) * thumb_slot_bytes_();
   }
-  void load_thumb_(std::string_view book_path, uint8_t* dst, ThumbSlot& slot) const;
+  void load_thumb_(std::string_view book_path, int index_pos, uint8_t* dst, ThumbSlot& slot) const;
   void forget_thumbs_() const;  // a book may have changed under its path
 
   // Last sync state painted, so the Sync row repaints when it changes.

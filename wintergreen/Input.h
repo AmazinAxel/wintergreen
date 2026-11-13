@@ -6,7 +6,11 @@
 
 namespace wintergreen {
 
-enum class Button : uint8_t { Button0 = 0, Button1 = 1, Button2 = 2, Button3 = 3, Up = 4, Down = 5, Power = 6 };
+// Undo is not a key. The clicker turns the page (or moves the cursor) on the
+// press edge, and a press that turns into a hold queues Undo + Back/Confirm:
+// the screen reverts its last step without drawing, then acts. Only ever a
+// press event, never in `current`.
+enum class Button : uint8_t { Button0 = 0, Button1 = 1, Button2 = 2, Button3 = 3, Up = 4, Down = 5, Power = 6, Undo = 7 };
 
 struct ButtonState {
   static constexpr uint8_t kButtonCount = 7;
@@ -61,6 +65,15 @@ struct HoldRepeat { // button holding
     if (!down) {
       held_ms = 0;
       fired = 0;
+      return 0;
+    }
+    // The frame a hold starts on counts nothing. Its dt is the time since the
+    // previous frame, and with the idle loop (B4) that can be a whole second
+    // of waiting *before* the press: counted, a quick tap crossed
+    // kHoldDelayMs at once and fired repeats (lists skipped, the carousel
+    // wrapped the wrong way).
+    if (held_ms == 0) {
+      held_ms = 1;
       return 0;
     }
     held_ms += dt_ms;

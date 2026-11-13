@@ -23,7 +23,29 @@ struct BookIndexEntry {
 };
 
 static constexpr int MAX_BOOKS = 250;
-static constexpr uint32_t INDEX_FORMAT_VERSION = 2;
+
+// FNV-1a of a book path: the thumbnail pack's per-slot check and the book
+// list's thumbnail cache key.
+inline uint32_t book_path_key(std::string_view path) {
+  uint32_t key = 2166136261u;
+  for (const char c : path)
+    key = (key ^ static_cast<uint8_t>(c)) * 16777619u;
+  return key;
+}
+
+// Thumbnail pack: every indexed book's cover_list.bin in one file beside the
+// index, so the book list opens one file per draw instead of one per row (each
+// open walks the card's root directory, which holds every book folder).
+//
+//   slot i (kThumbPackSlot bytes) = BookIndex entry i at the last save:
+//     u32 book_path_key, u16 w, u16 h (0 = no cover), then
+//     cover_cols_bytes(w, h) bytes as in cover_list.bin, padded.
+//
+// A cache only: written by save() when the set of books changed, never on the
+// page-turn or reader-close path; a slot whose key does not match its book is
+// ignored and the book's own cover_list.bin read instead.
+std::string thumb_pack_path(const std::string& index_file);
+size_t thumb_pack_slot_bytes();
 
 // Case-insensitive title ordering, shared so the book list and the home carousel
 // sort never-opened books identically.
@@ -59,24 +81,7 @@ class BookIndex {
   const std::vector<BookIndexEntry>& entries() const { return entries_; }
   const StringPool& pool() const { return pool_; }
 
-  // Drop the in-memory index and its string pool, actually returning the memory
-  // rather than just clearing (a cleared vector keeps its capacity). ~30 KB for
-  // a full library.
-  //
-  // Safe because an empty index is the "never loaded" state everywhere: every
-  // screen reloads from disk when entries() is empty, and every mutator calls
-  // ensure_loaded_() first, so nothing can truncate the file by saving over it.
-  // Only worth calling when something else needs the heap more — see
-  // Application::update's BLE case.
-  void release_memory() {
-    if (dirty_)
-      return;  // unsaved changes would be lost; a reload cannot recover them
-    std::vector<BookIndexEntry>().swap(entries_);
-    pool_ = StringPool{};
-  }
-
-  // Bumped on every logical mutation (index_file / remove_path / rename_in_place /
-  // build_index). MainMenu caches this to detect external changes. load() does not
+  // Bumped on every logical mutation (build_index, sync). MainMenu caches this to detect external changes. load() does not
   // bump.
   uint64_t generation() const { return generation_; }
 
@@ -103,18 +108,6 @@ class BookIndex {
   // No-op if not found. Call save() to persist.
   void remove_entry(std::string_view path);
 
-  // Open path as a WGB, upsert its index entry, and save to index_path.
-  // Reloads from disk first if entries_ is empty, to avoid truncating the .dat.
-  bool index_file(const std::string& path, const std::string& index_path);
-
-  // Remove path's entry and save to index_path. No-op (returns true) if not indexed.
-  // Reloads from disk first if entries_ is empty.
-  bool remove_path(const std::string& path, const std::string& index_path);
-
-  // Rename src→dst in-place, preserving metadata. Returns false if src not indexed
-  // (caller may fall back to index_file). Reloads from disk first if entries_ is empty.
-  bool rename_in_place(const std::string& src, const std::string& dst, const std::string& index_path);
-
 
  private:
   std::vector<BookIndexEntry> entries_;
@@ -123,11 +116,15 @@ class BookIndex {
   // Set by any mutator that actually changes stored data; cleared by save() and
   // load(). Guards against rewriting an identical file — see save().
   mutable bool dirty_ = false;
+  // Set when the set or order of entries changed (add, remove, rescan): the
+  // thumbnail pack's slots no longer line up. Not set by progress or open order.
+  mutable bool thumbs_dirty_ = false;
+  // Books added since the pack was last written: their slots are read from
+  // their own cover_list.bin, never copied from the old pack (a re-synced book
+  // keeps its path but may bring a new cover).
+  mutable std::vector<uint32_t> fresh_keys_;
+  void save_thumbs_(const std::string& index_file) const;
   BookIndex() = default;
-
-  // Loads from index_path if entries_ is empty, preventing .dat truncation
-  // when a mutation arrives after MainMenu::stop() cleared in-memory state.
-  void ensure_loaded_(const std::string& index_path);
 };
 
 }  // namespace wintergreen

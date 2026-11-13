@@ -19,28 +19,19 @@ namespace wintergreen {
 struct ReaderSettings {
   uint8_t font_size_idx = 0;  // base font size preset index (0 = 32px)
 
-  // Must match the number of sizes tools/make_font.py builds into the bundle.
-  static constexpr uint8_t kNumFontSizePresets = 2;
-
-  static constexpr uint16_t h_padding() {
-    return 12;
-  }
-  static constexpr uint16_t v_padding() {
-    return 4;
-  }
-  // Breathing room above the panel edge. Nothing is drawn in it.
-  static constexpr uint16_t bottom_margin() {
-    return 6;
-  }
+  // Must match the number of sizes tools/make_font.py builds into the bundle;
+  // every book carries one baked page table per size and orientation.
+  static constexpr uint8_t kNumFontSizePresets = kWgbFontSizes;
 };
 
 // In-reader options menu — shown when the user presses Button1 while reading.
 // Populated by ReaderScreen before being pushed so it reflects the current
-// reading context (TOC availability).
+// reading context. Below the settings rows, the book's chapters as a two-column
+// grid of numbered boxes (chapter start i is chapter i + 1; there are no names).
 //
 // Usage:
 //   app_->quickmenu()->set_settings(&reader_settings_);
-//   app_->quickmenu()->populate(wgb_.toc(), chapter_idx, page_pos_.paragraph);
+//   app_->quickmenu()->populate(std::move(chapter_pages), page, title, book_pct, chapter_pct);
 //   app_->push_screen(ScreenId::Quickmenu);
 class QuickmenuScreen final : public ListMenuScreen {
  public:
@@ -51,12 +42,10 @@ class QuickmenuScreen final : public ListMenuScreen {
     settings_ = s;
   }
 
-  // Populate before pushing. Pass toc (may be empty) and chapter_count from WGB.
-  // The chapter list is appended below the settings when toc has entries OR
-  // chapter_count > 1 (numbered fallback).
-  void populate(const TableOfContents& toc, uint16_t current_chapter, uint16_t current_para,
-                const std::string& fallback_title, int book_progress_pct, int chapter_progress_pct,
-                uint16_t chapter_count = 0);
+  // Populate before pushing. The chapter grid is appended below the settings.
+  // `chapter_pages`: the page each chapter starts on, in the current layout.
+  void populate(std::vector<uint32_t> chapter_pages, uint32_t current_page, const std::string& title,
+                int book_progress_pct, int chapter_progress_pct);
 
   void draw_all_(DrawBuffer& buf, std::optional<uint8_t> battery_pct = std::nullopt) const override;
   int get_visible_count_(int H, int scroll_off) const override;
@@ -77,6 +66,17 @@ class QuickmenuScreen final : public ListMenuScreen {
   static constexpr int kHeaderTop = 16;
   int header_top_() const { return kHeaderTop; }
 
+  // Chapter grid: two columns of boxed numbers inside kLM/kRM. Every cell has a
+  // 1 px box; the selected one a kCellSelW frame (the home cover's frame width),
+  // never an inverted fill — a frame flips far fewer pixels per move. Cells are
+  // a little taller than a settings row.
+  static constexpr int kGridCols = 2;
+  static constexpr int kCellGap = 8;   // between columns and between rows
+  static constexpr int kCellPadV = 10; // above and below the number
+  static constexpr int kCellSelW = 2;
+  int cell_h_() const { return ui_font_.y_advance() + 2 * kCellPadV; }
+  int cell_pitch_() const { return cell_h_() + kCellGap; }
+
   // The chapter is a subtitle to the book title: one step down in size, in the
   // same font the settings rows use.
   const BitmapFont& chapter_font_() const { return section_font_; }
@@ -91,11 +91,9 @@ class QuickmenuScreen final : public ListMenuScreen {
   bool has_pending() const {
     return has_pending_;
   }
-  uint16_t pending_chapter() const {
-    return pending_chapter_;
-  }
-  uint16_t pending_para_index() const {
-    return pending_para_index_;
+  // The page the chosen chapter starts on.
+  uint32_t pending_page() const {
+    return pending_page_;
   }
   void clear_pending() {
     has_pending_ = false;
@@ -108,7 +106,7 @@ class QuickmenuScreen final : public ListMenuScreen {
   }
 
   void stop() override {
-    toc_ = nullptr;
+    std::vector<uint32_t>().swap(chapter_pages_);
   }
 
   void pause() override {}
@@ -126,6 +124,12 @@ class QuickmenuScreen final : public ListMenuScreen {
     if (idx_clicker_ >= 0) {
       const ClickerState now = runtime.clicker_state();
       const uint8_t pct = runtime.clicker_battery_pct();
+      // A connect that succeeds while this menu is up returns to the book:
+      // the next thing anyone does after pairing a page-turner is read.
+      if (clicker_shown_ == ClickerState::Connecting && now == ClickerState::Connected) {
+        on_back();
+        return;
+      }
       if (now != clicker_shown_ || pct != clicker_pct_shown_) {
         refresh_items_(selected());
         request_redraw();
@@ -162,33 +166,47 @@ class QuickmenuScreen final : public ListMenuScreen {
   int idx_clicker_ = -1;
   int first_chapter_ = -1;
   // List index of the chapter holding the reading position, or -1. Derived in
-  // on_start() from current_chapter_offset_, which populate() sets: a TOC entry
-  // index, or a spine index when the book has no TOC.
+  // on_start() from current_chapter_offset_, which populate() sets: the last
+  // chapter starting on or before the current page.
   int current_chapter_item_ = -1;
   int current_chapter_offset_ = -1;
+  std::vector<uint32_t> chapter_pages_;
   bool open_on_chapter_ = false;
 
-  uint16_t pending_chapter_ = 0;
-  uint16_t pending_para_index_ = 0;
+  uint32_t pending_page_ = 0;
   bool has_pending_ = false;
 
   void refresh_items_(int restore_selection);
 
   int prev_selected_ = 0;
 
+  // Spaces collapsed to one and trimmed (populate), so every wrapped line is a
+  // contiguous span of it.
   std::string book_title_;
-  std::string chapter_title_;
+  char chapter_title_[32] = {};
+  // A wrapped line: bytes [off, off + len) of its text, then "..." when the
+  // rest did not fit.
+  struct Line {
+    uint16_t off = 0, len = 0;
+    bool ell = false;
+  };
   // Wrapped at on_start() so draw_all_ and header_h_ measure the same block.
-  std::vector<std::string> title_lines_;
-  std::vector<std::string> chapter_lines_;
+  // Spans, not strings: opening the menu allocates nothing.
+  Line title_lines_[2];
+  int title_n_ = 0;
+  Line chapter_lines_[1];
+  int chapter_n_ = 0;
   std::string book_pct_buf_;
   std::string chapter_pct_buf_;
 
-  // Word-wraps `text` into at most `max_lines` lines of `f`, ellipsising the
-  // last one if it still overflows. `first_w` is the width available to the
-  // first line, which is narrower when a percentage sits beside it.
-  static std::vector<std::string> wrap_(const BitmapFont& f, const std::string& text, int first_w, int rest_w,
-                                        int max_lines);
+  // Word-wraps `text` (single spaces, no leading/trailing) into at most
+  // `max_lines` lines of `f`, ellipsising the last one if it still overflows.
+  // `first_w` is the width available to the first line, which is narrower when
+  // a percentage sits beside it. Returns the line count.
+  static int wrap_(const BitmapFont& f, std::string_view text, int first_w, int rest_w, int max_lines, Line* out);
+  // Draw one wrapped line; returns nothing, the caller advances y.
+  static void draw_line_(DrawBuffer& buf, int x, int baseline, std::string_view text, const Line& l,
+                         const BitmapFont& f, bool invert);
 
   // Pixels from the top of the panel to the rule above the item list.
   int header_h_() const;
@@ -197,8 +215,11 @@ class QuickmenuScreen final : public ListMenuScreen {
 
   int book_progress_pct_ = 0;
   int chapter_progress_pct_ = 0;
-  uint16_t chapter_count_ = 0;
 
-  const TableOfContents* toc_ = nullptr;
+  // Grid row (0-based) of the chapter grid that a draw starting at list index
+  // `scroll_off` begins with: the row holding that cell, so a row is never split.
+  int first_grid_row_(int scroll_off) const {
+    return scroll_off > first_chapter_ ? (scroll_off - first_chapter_) / kGridCols : 0;
+  }
 };
 }  // namespace wintergreen

@@ -27,6 +27,7 @@
 
 #include <cstdint>
 
+#include "ui_wake.h"
 #include "wintergreen/Runtime.h"
 
 namespace wg_sync {
@@ -51,9 +52,11 @@ using wintergreen::SyncState;
 #include "esp_heap_caps.h"
 #include "esp_http_client.h"
 #include "esp_netif.h"
+#include "esp_pm.h"
 #include "esp_wifi.h"
 #include "freertos/FreeRTOS.h"
 #include "freertos/event_groups.h"
+#include "freertos/semphr.h"
 #include "freertos/task.h"
 #include "lwip/inet.h"
 #include "lwip/netdb.h"
@@ -63,14 +66,14 @@ using wintergreen::SyncState;
 #include "wintergreen/content/BookIndex.h"
 #include "wintergreen/display/DrawBuffer.h"
 
-// Defined in main.cpp — see the note there. Hands back the OOM rescue block,
-// which competes with the Wi-Fi stack for the same internal DRAM pool.
-void wg_release_oom_reserve();
-
 namespace wg_sync {
 
 inline volatile SyncState g_state = SyncState::Idle;
 inline volatile bool g_busy = false;
+// UI-thread only: a sync was started and poll() has not yet handed the radio
+// back to the clicker; whether the clicker was up when the sync took it.
+inline bool g_end_pending = false;
+inline bool g_reconnect_clicker = false;
 
 // Set while the worker runs so the UI loop can hold off auto-sleep. A sync with
 // several books to fetch easily outlasts kAutoSleepMinutes, and deep-sleeping
@@ -88,9 +91,10 @@ inline constexpr int kConnectedBit = BIT0;
 // radio rather than a failed sync the user has to notice and retry by hand.
 inline constexpr int kConnectTimeoutMs = 20000;
 inline constexpr int kHttpTimeoutMs = 8000;
-// One chunk of a book download. 4 KB is a FATFS cluster and a comfortable TCP
-// read; the point is that a 1 MB book is never held in RAM.
-inline constexpr int kChunk = 4096;
+// One chunk of a book download, read and written in series. Bigger chunks mean
+// fewer, longer card writes (multi-block SD transfers) while the TCP window keeps
+// the sender going; a book is still never held in RAM.
+inline constexpr int kChunk = 16384;
 
 // ── Cached server address ──────────────────────────────────────────────────
 //
@@ -244,6 +248,62 @@ inline bool http_post_(const std::string& body, std::string& out) {
   return ok;
 }
 
+// ── Download pipe: network fills one buffer while the card writes the other ──
+
+// The spare framebuffer, lent by the UI thread for the length of a sync. It is
+// 48 KB the sync would otherwise take from a heap that bottoms out at ~44 KB
+// free during one, and while a sync runs nothing needs it: input is locked and
+// the book list repaints only at the end (its thumbnails are re-read then).
+// Lending and returning both happen in poll() on the UI thread, which owns the
+// DrawBuffer; this task only asks and waits.
+inline uint8_t* g_spare = nullptr;
+inline volatile bool g_spare_want = false;
+inline volatile bool g_spare_back = false;
+inline SemaphoreHandle_t g_spare_ready = nullptr;
+
+inline uint8_t* acquire_spare_() {
+  if (g_spare)
+    return g_spare;
+  if (!g_spare_ready)
+    g_spare_ready = xSemaphoreCreateBinary();
+  if (!g_spare_ready)
+    return nullptr;
+  g_spare_want = true;
+  ui_wake();
+  xSemaphoreTake(g_spare_ready, portMAX_DELAY);
+  return g_spare;  // null when there is no spare: DownloadBuf falls back to the heap
+}
+
+// One download buffer: the lent spare in whole sectors (92 × 512 B), or kChunk
+// from the heap without one. Filled from the network, written in one fwrite,
+// so the card sees few, large multi-block writes.
+//
+// **Serial on purpose.** A double buffer with a separate card-writer task was
+// built and measured 2026-11-12 and gained nothing (docs/sync.md "Speed
+// floor"): the C3 has one core, and both the Wi-Fi/TCP receive path and SDSPI
+// (interrupt-driven per-sector and busy-poll transactions) need it, so the two
+// took turns instead of overlapping.
+struct DownloadBuf {
+  uint8_t* data = nullptr;
+  size_t cap = 0;
+  uint8_t* heap = nullptr;
+
+  bool open() {
+    if (uint8_t* spare = acquire_spare_()) {
+      data = spare;
+      cap = wintergreen::DrawBuffer::kBufSize / 512 * 512;
+      return true;
+    }
+    heap = static_cast<uint8_t*>(std::malloc(kChunk));
+    data = heap;
+    cap = kChunk;
+    return heap != nullptr;
+  }
+  ~DownloadBuf() {
+    std::free(heap);
+  }
+};
+
 // Stream one file to the card. Written to .tmp and renamed, so an interrupted
 // download can never leave a truncated book.wgb that the reader would accept.
 //
@@ -272,18 +332,67 @@ inline bool http_get_file_(const std::string& url_path, const std::string& dest)
     return false;
   }
 
-  std::vector<char> buf(kChunk);
+  // **A stalled read resumes, it does not restart.** A 36 MB book takes minutes,
+  // and over that long one 8 s gap with no data is likely: the first one
+  // measured hit at 30 of 36 MB (ESP_ERR_HTTP_EAGAIN), and the whole book was
+  // thrown away and re-offered, to fail the same way next time. On a read error
+  // or an early close the connection is reopened with Range from the bytes
+  // already received (the server answers 206; Bun.file supports it) and the same
+  // file keeps growing. Gives up after kMaxResumes reopens in a row that brought
+  // no new bytes.
+  static constexpr int kMaxResumes = 5;
+  DownloadBuf buf;
+  if (!buf.open()) {
+    std::fclose(f);
+    esp_http_client_close(g_http);
+    std::remove(tmp.c_str());
+    return false;
+  }
   bool ok = true;
-  int64_t written = 0;
-  int r;
-  while ((r = esp_http_client_read(g_http, buf.data(), kChunk)) > 0) {
-    if (std::fwrite(buf.data(), 1, static_cast<size_t>(r), f) != static_cast<size_t>(r)) {
+  int resumes = 0;
+  int64_t written = 0;  // received; on the card once flushed below
+  int r = 0;
+  size_t fill = 0;
+  for (;;) {
+    const int64_t before = written;
+    while ((r = esp_http_client_read(g_http, reinterpret_cast<char*>(buf.data) + fill,
+                                     static_cast<int>(buf.cap - fill))) > 0) {
+      fill += static_cast<size_t>(r);
+      written += r;
+      if (fill == buf.cap) {
+        if (std::fwrite(buf.data, 1, fill, f) != fill) {
+          ok = false;
+          break;
+        }
+        fill = 0;
+      }
+    }
+    if (!ok)
+      break;
+    // Without a declared length, a clean close is the only end there is.
+    if (declared <= 0 ? r == 0 : written >= declared)
+      break;
+    resumes = written > before ? 1 : resumes + 1;
+    if (resumes > kMaxResumes) {
       ok = false;
       break;
     }
-    written += r;
+    esp_http_client_close(g_http);
+    char range[32];
+    std::snprintf(range, sizeof(range), "bytes=%lld-", static_cast<long long>(written));
+    esp_http_client_set_header(g_http, "Range", range);
+    int64_t rest = -1;
+    if (esp_http_client_open(g_http, 0) == ESP_OK)
+      rest = esp_http_client_fetch_headers(g_http);
+    esp_http_client_delete_header(g_http, "Range");  // the handle goes on to the covers
+    // 206 with exactly the missing tail, or nothing: a 200 here would be the
+    // whole file again, appended after the part already written.
+    if (rest != declared - written || esp_http_client_get_status_code(g_http) != 206) {
+      ok = false;
+      break;
+    }
   }
-  if (r < 0)
+  if (ok && fill && std::fwrite(buf.data, 1, fill, f) != fill)
     ok = false;
   if (std::fclose(f) != 0)
     ok = false;
@@ -610,6 +719,13 @@ inline bool sync_once_() {
 }
 
 inline void sync_task(void*) {
+  // Full CPU clock for the whole sync. The UI's performance hold lapses 300 ms
+  // after the last press (and buttons are dead during a sync), so without this
+  // lwIP, the HTTP client and FATFS all ran at the 80 MHz DFS floor.
+  esp_pm_lock_handle_t cpu_lock = nullptr;
+  if (esp_pm_lock_create(ESP_PM_CPU_FREQ_MAX, 0, "sync", &cpu_lock) == ESP_OK)
+    esp_pm_lock_acquire(cpu_lock);
+
   bool ok = false;
   {
     WifiGuard guard;  // radio down on every path out of this scope
@@ -628,18 +744,23 @@ inline void sync_task(void*) {
     }
   }
 
-  // After the WifiGuard has run, so the radio's memory is back first.
-  g_buf->reacquire_spare();
-  // Lift the reader's cache caps, but only if the BLE stack is not still
-  // holding memory — release_for_wifi() deinits the controller and leaves the
-  // NimBLE host up, so "no clicker connected" does not mean "heap is free".
-  // Application::update re-applies them if that changes.
-  if (g_app && !wg_clicker::holds_ram())
-    g_app->restore_ram_after_radio();
+  if (cpu_lock) {
+    esp_pm_lock_release(cpu_lock);
+    esp_pm_lock_delete(cpu_lock);
+  }
 
+  // The download buffers go back before the end state is visible: poll() on
+  // the UI thread returns the spare and only then is the state set, so the
+  // repaint that shows "Synced" has its thumbnails again.
+  if (g_spare) {
+    g_spare_back = true;
+    ui_wake();
+    xSemaphoreTake(g_spare_ready, portMAX_DELAY);  // poll() gives it once returned
+  }
   g_state = ok ? SyncState::Done : SyncState::Failed;
   g_keep_awake = false;
   g_busy = false;
+  ui_wake();  // the row shows the result now, not at the next idle deadline
   vTaskDelete(nullptr);
 }
 
@@ -664,74 +785,17 @@ inline void start() {
   g_state = SyncState::Working;
   g_keep_awake = true;
 
-  // Both radios cannot fit. The clicker goes down first, and stays down for the
-  // session unless its quick-menu row is pressed again.
-  //
-  // release_for_wifi(), not radio_off(): the latter disables the controller but
-  // leaves it initialised and holding its buffers, which left esp_wifi_init()
-  // ~18 KB short of the ~50 KB it wants. The sync then failed immediately
-  // ("Fail 5, 18k") *and* left the heap too full to open a book afterwards —
-  // WgbReader::open aborted allocating an 8 KB StringPool chunk for the TOC.
-  wg_clicker::release_for_wifi();
-
-  // **The book index is deliberately NOT released here.**
-  //
-  // It was, and it did two bad things at once. `MainMenu::entries_` holds
-  // `StringRef`s into the index's `StringPool`, and this screen is *on display*
-  // when Sync is pressed — so dropping the pool left every title and author
-  // resolving to an empty `string_view` (`StringPool::get` walks an empty chunk
-  // list and returns `{}`). The list stayed navigable and kept showing reading
-  // percentages, because those are `uint8_t` copies, which made it look like a
-  // drawing bug rather than a dangling reference.
-  //
-  // And it bought nothing: `run_sync_()` reloads the index from disk as its
-  // first act, so the memory came straight back before Wi-Fi ever started.
-  //
-  // The clicker's own release (QuickmenuScreen) is unaffected — that runs from
-  // a screen that holds no `StringRef`s.
-
-  // **This is what actually makes room for the radio.** Measured on hardware:
-  // esp_wifi_init() failed with 20 KB of internal RAM free, because two static
-  // framebuffers are 96 KB of BSS and the spare is another 48 KB of heap. Wi-Fi
-  // wants ~50 KB. Handing the spare back covers it.
-  //
-  // Costs nothing but latency while the sync runs: without the spare a quick
-  // menu dismiss re-renders and a page turn re-draws, and the sync screen is
-  // doing neither.
-  g_buf->release_spare();
-
-  // Same for main.cpp's OOM reserve: esp_wifi_init() wants ~50 KB of internal
-  // RAM out of the same pool, so a block held back for a rescue is the
-  // difference between a sync that runs and one that bails with nothing said.
-  // The frame loop takes it back when the radio is down.
-  wg_release_oom_reserve();
-
-  // **And the reader's caches, which the spare alone does not cover when a
-  // clicker has been used this session.** The NimBLE host and esp_hidh can
-  // never be deinitialised on this IDF, so release_for_wifi() gives back the
-  // controller and nothing else — tens of KB stay held for the rest of the
-  // boot. With Wi-Fi's ~50 KB on top of that, esp_http_client_init() had
-  // nothing left: "Fail 13, 0k", i.e. stage HttpInit with zero free.
-  //
-  // Association had already succeeded at that point, so this is not a
-  // bring-up shortage; it is the last allocation in a sequence that had
-  // already spent everything. The reader's page and paragraph caches are the
-  // largest thing still reclaimable, and being without them costs a re-layout
-  // the sync screen never performs anyway.
-  //
-  // **The book index stays** (drop_book_index = false). Releasing it here was tried twice and is wrong
-  // both ways round. Dropping the pool alone blanks every title and author,
-  // because MainMenu::entries_ holds StringRefs into it and this screen is on
-  // display for the whole sync. Clearing entries_ first and bumping the
-  // generation so the list repopulates was worse: the books did not come back,
-  // the screen repainted several times over, and it freed *less* than leaving
-  // it alone (28 KB -> 24 KB at esp_wifi_init) because the repopulate reloads
-  // the index from disk immediately, mid-bringup.
-  g_app->release_ram_for_radio(/*drop_book_index=*/false);
+  // One radio at a time: the clicker's link closes and its controller is
+  // disabled, but its stack stays initialised (never deinit — that loses the
+  // clicker until reboot), and poll() reconnects it when the sync ends.
+  // Nothing is freed: the book index (whose strings the book list is showing)
+  // and the reader's page buffer stay. The spare framebuffer is only *lent* to
+  // the downloads (acquire_spare_), contents dropped, and comes back at the end.
+  g_reconnect_clicker = wg_clicker::begin_sync();
+  g_end_pending = true;
 
   // 6 KB: the worker runs TLS-free HTTP, JSON scanning and FATFS writes.
   if (xTaskCreate(sync_task, "wg_sync", 6144, nullptr, 4, nullptr) != pdPASS) {
-    g_buf->reacquire_spare();  // the task that would have restored it never ran
     g_state = SyncState::Failed;
     g_keep_awake = false;
     g_busy = false;
@@ -739,10 +803,33 @@ inline void start() {
 }
 
 // Called every UI frame. Holds off auto-sleep while a sync is in flight —
-// deep-sleeping mid-transfer would cut the radio with files half written.
+// deep-sleeping mid-transfer would cut the radio with files half written —
+// and, once the worker has finished (it ui_wake()s the loop), hands the radio
+// back to the clicker, reconnecting it if the sync took it down.
 inline void poll() {
   if (g_keep_awake && g_app)
     g_app->keep_awake();
+  if (g_spare_want && g_buf) {
+    g_spare_want = false;
+    g_spare = g_buf->lend_spare();
+    xSemaphoreGive(g_spare_ready);
+  }
+  if (g_spare_back && g_buf) {
+    g_spare_back = false;
+    g_spare = nullptr;
+    g_buf->return_spare();
+    xSemaphoreGive(g_spare_ready);
+  }
+  if (g_end_pending && !g_busy) {
+    g_end_pending = false;
+    wg_clicker::end_sync(g_reconnect_clicker);
+    g_reconnect_clicker = false;
+  }
+}
+
+// A sync in flight: the main loop keeps its frame cadence.
+inline bool active() {
+  return g_busy;
 }
 
 }  // namespace wg_sync
@@ -762,6 +849,9 @@ inline SyncState state() {
 inline void bind(wintergreen::Application&, wintergreen::DrawBuffer&) {}
 inline void start() {}
 inline void poll() {}
+inline bool active() {
+  return false;
+}
 
 }  // namespace wg_sync
 

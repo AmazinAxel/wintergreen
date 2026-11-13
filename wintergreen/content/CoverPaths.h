@@ -1,10 +1,12 @@
 #pragma once
 
+#include <cstddef>
+#include <cstdint>
 #include <string>
 
 namespace wintergreen {
 
-// Where a book's cover bitmaps live: beside the book, written by tools/epub2wgb
+// Where a book's cover bitmaps live: beside the book, written by `books`
 // — the device cannot generate them, since there is no EPUB on the card.
 // Deriving a path from the file stem would be wrong as well as useless: every
 // converted book is literally named book.wgb.
@@ -73,5 +75,32 @@ inline constexpr int kListCoverH = 115;
 // this said 800 and every cover silently failed the size check.
 inline constexpr int kSleepCoverW = 480;
 inline constexpr int kSleepCoverH = 793;
+
+// On-card layouts, both baked for the portrait screens so the device copies
+// bytes instead of transposing bits:
+//
+//   cover_list.bin, cover_home.bin: u16 w, u16 h, then w columns of
+//     ceil(h / 8) bytes, top pixel MSB, bit set = white
+//     (DrawBuffer::blit_1bit_cols).
+//   cover_sleep.bin: the panel's own frame, kSleepFrameBytes, no header:
+//     physical row kSleepFrameRows - 1 - x, bit kSleepFrameOffX + y holds
+//     portrait pixel (x, y). Read straight into the draw buffer.
+//
+// Frame constants mirror DisplayFrame (Application.cpp static_asserts them);
+// they live here so the host converter needs no display header.
+inline constexpr int kSleepFrameStride = 100;
+inline constexpr int kSleepFrameRows = 480;
+inline constexpr int kSleepFrameOffX = 7;
+inline constexpr size_t kSleepFrameBytes = static_cast<size_t>(kSleepFrameStride) * kSleepFrameRows;
+
+inline constexpr size_t cover_cols_bytes(int w, int h) {
+  return static_cast<size_t>((h + 7) / 8) * static_cast<size_t>(w);
+}
+
+// Portrait pixel (x, y) of a sleep frame: true = white.
+inline bool sleep_frame_white(const uint8_t* frame, int x, int y) {
+  const int bit = kSleepFrameOffX + y;
+  return (frame[static_cast<size_t>(kSleepFrameRows - 1 - x) * kSleepFrameStride + (bit >> 3)] >> (7 - (bit & 7))) & 1;
+}
 
 }  // namespace wintergreen

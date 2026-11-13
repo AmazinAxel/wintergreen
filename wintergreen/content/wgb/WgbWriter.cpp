@@ -84,18 +84,7 @@ bool WgbWriter::open(const char* path) {
   if (!bw_.open(path))
     return false;
 
-
-  // Open a single temp file for all paragraph descriptors across the whole book.
-  // Reused across chapters; chapter_desc_start_ tracks where each chapter begins.
-  std::snprintf(desc_tmp_path_, sizeof(desc_tmp_path_), "%s.desc", path);
-  desc_tmp_ = std::fopen(desc_tmp_path_, "w+b");
-  chapter_desc_start_ = 0;
-  if (!desc_tmp_) {
-    close();
-    return false;
-  }
-
-  // Write placeholder header (will be fixed up in finish()).
+  // Placeholder header, fixed up in finish().
   WgbHeader hdr{};
   if (!write_bytes(&hdr, sizeof(hdr))) {
     close();
@@ -106,60 +95,32 @@ bool WgbWriter::open(const char* path) {
 
 void WgbWriter::close() {
   bw_.close();
-  if (desc_tmp_) {
-    std::fclose(desc_tmp_);
-    desc_tmp_ = nullptr;
-    if (desc_tmp_path_[0])
-      std::remove(desc_tmp_path_);
-    desc_tmp_path_[0] = '\0';
-  }
-  chapter_desc_start_ = 0;
-  paragraph_count_ = 0;
-  chapters_.clear();
+  units_.clear();
   images_.clear();
   image_data_.clear();
   in_chapter_ = false;
-  chapter_para_count_ = 0;
-  chapter_char_count_ = 0;
 }
 
 void WgbWriter::begin_chapter() {
-  chapter_para_count_ = 0;
-  chapter_char_count_ = 0;
-  // Record where this chapter's descriptors start in desc_tmp_.
-  if (desc_tmp_) {
-    std::fseek(desc_tmp_, 0, SEEK_END);
-    chapter_desc_start_ = static_cast<uint32_t>(std::ftell(desc_tmp_));
-  }
+  if (in_chapter_)
+    end_chapter();
+  units_.emplace_back();
   in_chapter_ = true;
 }
 
 void WgbWriter::end_chapter() {
-  if (!in_chapter_)
-    return;
-
-  // Write the descriptor table by reading back from desc_tmp_.
-  uint32_t table_offset = bw_.tell();
-  if (desc_tmp_ && chapter_para_count_ > 0) {
-    std::fseek(desc_tmp_, static_cast<long>(chapter_desc_start_), SEEK_SET);
-    uint32_t remaining = chapter_para_count_ * 8u;
-    uint8_t copy_buf[128];
-    while (remaining > 0) {
-      size_t want = remaining < sizeof(copy_buf) ? remaining : sizeof(copy_buf);
-      size_t n = std::fread(copy_buf, 1, want, desc_tmp_);
-      if (n == 0)
-        break;
-      write_bytes(copy_buf, n);
-      remaining -= static_cast<uint32_t>(n);
-    }
-  }
-
-  WgbChapterEntry entry{};
-  entry.para_table_offset = table_offset;
-  entry.paragraph_count = chapter_para_count_;
-  entry.char_count = chapter_char_count_;
-  chapters_.push_back(entry);
   in_chapter_ = false;
+}
+
+void WgbWriter::cancel_chapter() {
+  if (in_chapter_ && !units_.empty() && units_.back().empty())
+    units_.pop_back();
+  in_chapter_ = false;
+}
+
+void WgbWriter::record_paragraph_() {
+  if (in_chapter_)
+    units_.back().push_back(bw_.tell());
 }
 
 // Total text bytes across a paragraph's runs.
@@ -461,13 +422,7 @@ bool WgbWriter::write_paragraph(const Paragraph& para) {
     return write_text_paragraph(para.text, spacing, para.text.runs.data(), para.text.runs.size());
   }
 
-  // Record descriptor for non-text paragraphs: append {file_offset, char_offset} to desc_tmp_.
-  if (desc_tmp_) {
-    uint8_t desc[8];
-    wgb_write_u32(desc, bw_.tell());
-    wgb_write_u32(desc + 4, chapter_char_count_);
-    std::fwrite(desc, 1, 8, desc_tmp_);
-  }
+  record_paragraph_();
 
   // Serialize and write: [type(1)][data_size(4)][data...] — no link header.
   switch (para.type) {
@@ -503,8 +458,6 @@ bool WgbWriter::write_paragraph(const Paragraph& para) {
     }
   }
 
-  ++chapter_para_count_;
-  ++paragraph_count_;
   return true;
 }
 
@@ -519,9 +472,24 @@ uint16_t WgbWriter::add_image_ref(uint32_t local_header_offset, uint16_t width, 
   return idx;
 }
 
+// Rows as decoded, then the portrait band copy (WgbFormat.h, WgbImageRef).
 void WgbWriter::set_image_data(uint16_t idx, std::vector<uint8_t>&& data) {
-  if (idx < image_data_.size())
-    image_data_[idx] = std::move(data);
+  if (idx >= image_data_.size())
+    return;
+  const uint32_t w = images_[idx].width, h = images_[idx].height;
+  const uint32_t rows = wgb_image_rows_bytes(w, h);
+  if (data.size() != rows) {
+    image_data_[idx].clear();  // not the size the ref says: draw blank space
+    return;
+  }
+  const size_t stride = (w + 7) / 8;
+  data.resize(rows + wgb_image_bands_bytes(w, h), 0xFF);
+  uint8_t* bands = data.data() + rows;
+  for (uint32_t y = 0; y < h; ++y)
+    for (uint32_t x = 0; x < w; ++x)
+      if (!((data[y * stride + (x >> 3)] >> (7 - (x & 7))) & 1))
+        bands[(y >> 3) * w + x] &= static_cast<uint8_t>(~(0x80u >> (y & 7)));
+  image_data_[idx] = std::move(data);
 }
 
 void WgbWriter::update_image_size(uint16_t idx, uint16_t width, uint16_t height) {
@@ -531,24 +499,13 @@ void WgbWriter::update_image_size(uint16_t idx, uint16_t width, uint16_t height)
   }
 }
 
-bool WgbWriter::finish(const EpubMetadata& meta, const TableOfContents& toc) {
+bool WgbWriter::finish(const EpubMetadata& meta) {
   if (!bw_.is_open())
     return false;
 
   // Close any open chapter.
   if (in_chapter_)
     end_chapter();
-
-  // --- Write chapter table (10 bytes each) ---
-  uint32_t chapter_offset = bw_.tell();
-  for (const auto& ch : chapters_) {
-    uint8_t buf[kWgbChapterEntrySize];
-    wgb_write_u32(buf, ch.para_table_offset);
-    wgb_write_u16(buf + 4, ch.paragraph_count);
-    wgb_write_u32(buf + 6, ch.char_count);
-    if (!write_bytes(buf, kWgbChapterEntrySize))
-      return false;
-  }
 
   // --- Write image blob, then the ref table that points into it ---
   // Blob first so the refs can carry final offsets. The images are contiguous
@@ -586,37 +543,14 @@ bool WgbWriter::finish(const EpubMetadata& meta, const TableOfContents& toc) {
   write_string(meta.author.value_or(""));
   write_string(meta.language.value_or(""));
 
-  // --- Write TOC ---
-  uint16_t toc_count = static_cast<uint16_t>(toc.entries.size());
-  uint8_t toc_hdr[2];
-  wgb_write_u16(toc_hdr, toc_count);
-  write_bytes(toc_hdr, 2);
-  for (const auto& entry : toc.entries) {
-    auto lbl = entry.label.to_string(toc.pool);
-    // Defensive: ensure label fits u16 length field
-    if (lbl.size() > 0xFFFF) {
-      return false;
-    }
-    if (!write_string(lbl)) {
-      int e = errno;
-      return false;
-    }
-    uint8_t buf[5];
-    wgb_write_u16(buf, entry.file_idx);
-    buf[2] = entry.depth;
-    wgb_write_u16(buf + 3, entry.para_index);
-    write_bytes(buf, 5);
-  }
-
-
   // --- Fix up header ---
+  // No pages yet: the page section starts (empty) at the end of the file, so
+  // the result already opens, which is what lets WgbPaginator read it back.
   WgbHeader hdr{};
-  hdr.paragraph_count = paragraph_count_;
-  hdr.chapter_count = static_cast<uint16_t>(chapters_.size());
   hdr.image_count = static_cast<uint16_t>(images_.size());
-  hdr.chapter_offset = chapter_offset;
   hdr.image_offset = image_offset;
   hdr.meta_offset = meta_offset;
+  hdr.pages_offset = bw_.tell();
 
   bw_.seek(0);
   if (!write_bytes(&hdr, sizeof(hdr)))
@@ -634,17 +568,7 @@ bool WgbWriter::write_text_paragraph(const TextParagraph& meta, uint16_t spacing
   if (!bw_.is_open())
     return false;
 
-  // Record descriptor.
-  if (desc_tmp_) {
-    uint8_t desc[8];
-    wgb_write_u32(desc, bw_.tell());
-    wgb_write_u32(desc + 4, chapter_char_count_);
-    std::fwrite(desc, 1, 8, desc_tmp_);
-  }
-
-  // Count chars.
-  for (size_t i = 0; i < run_count; ++i)
-    chapter_char_count_ += static_cast<uint32_t>(runs[i].text.size());
+  record_paragraph_();
 
   // Compute body size (pure arithmetic, no allocation).
   static constexpr size_t kBodyHdrSize = 14;  // alignment(1)+indent(2)+spacing(2)+lh(1)+img(6)+runcount(2)
@@ -708,8 +632,6 @@ bool WgbWriter::write_text_paragraph(const TextParagraph& meta, uint16_t spacing
       return false;
   }
 
-  ++chapter_para_count_;
-  ++paragraph_count_;
   return true;
 }
 

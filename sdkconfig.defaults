@@ -5,8 +5,15 @@ CONFIG_ESPTOOLPY_FLASHSIZE="16MB"
 CONFIG_ESPTOOLPY_FLASHMODE_DIO=y
 CONFIG_ESPTOOLPY_FLASHFREQ_80M=y
 
-# FAT Long File Name support for .epub filenames
-CONFIG_FATFS_LFN_HEAP=y
+# FAT Long File Name support. Stack, not heap: the heap variant mallocs and
+# frees 512 B on every fopen/stat/rename, and this heap fails by fragmenting
+# (docs/bluetooth.md). Costs 512 B of stack in every task that touches the card.
+CONFIG_FATFS_LFN_STACK=y
+
+# Ring buffer ISR functions in flash (1,998 B of IRAM). The only ring buffer
+# user is the USB-serial driver, whose interrupt is not IRAM, and
+# UART_ISR_IN_IRAM is off.
+CONFIG_RINGBUF_PLACE_ISR_FUNCTIONS_INTO_FLASH=y
 
 # Build a per-file cluster-link map so fseek() stays in RAM instead of
 # re-traversing the FAT chain on every random access. ~29% faster conversion.
@@ -16,10 +23,12 @@ CONFIG_FATFS_USE_LABEL=y
 # Codepage 437, not dynamic — dynamic costs 478 KB of flash. See CLAUDE.md.
 CONFIG_FATFS_CODEPAGE_437=y
 
-# Main task needs enough stack for EPUB parsing (ZIP + XML + CSS) and
-# for FatFS/SDSPI calls inside settings flows (clear cache, etc).
-# IDF default is 3584 which is far too tight.
-CONFIG_ESP_MAIN_TASK_STACK_SIZE=16384
+# Measured 2026-11-12: 13,624 B of 16,384 never touched over a session with
+# book opens, page turns, menus and a sync (peak ~2.8 KB). The 16 KB dated from
+# on-device EPUB parsing, which is gone (books arrive baked). 8 KB keeps ~5 KB of
+# margin and returns 8 KB of internal heap. Raise it again on a stack-overflow
+# panic, not by guesswork. IDF default 3584 is too tight (FatFS/SDSPI paths).
+CONFIG_ESP_MAIN_TASK_STACK_SIZE=8192
 
 # Note: automatic light sleep (CONFIG_PM_ENABLE + FREERTOS_USE_TICKLESS_IDLE) is
 # deliberately absent — it breaks the ADC-ladder buttons. See CLAUDE.md "Idle power".
@@ -207,26 +216,16 @@ CONFIG_ESP_PHY_RF_CAL_PARTIAL=n
 CONFIG_ESP_PHY_CALIBRATION_MODE=2
 CONFIG_BT_NIMBLE_ROLE_CENTRAL=y
 CONFIG_BT_NIMBLE_ROLE_OBSERVER=y
+# Central only: nothing advertises or serves GATT. These default on.
+CONFIG_BT_NIMBLE_ROLE_PERIPHERAL=n
+CONFIG_BT_NIMBLE_ROLE_BROADCASTER=n
+CONFIG_BT_NIMBLE_GATT_SERVER=n
 CONFIG_BT_NIMBLE_MAX_CONNECTIONS=1
 CONFIG_BT_NIMBLE_LOG_LEVEL_NONE=y
 # Bond keys survive a reboot; some clickers refuse to re-pair silently.
 CONFIG_BT_NIMBLE_NVS_PERSIST=y
-#
-# These three look wrong for a central-only device and are not. IDF guards
-# nimble_hidh.c — the HID **host** — with CONFIG_BT_NIMBLE_HID_SERVICE, which is
-# the HID *device* service option, and that option sits inside a Kconfig menu
-# gated on GATT_SERVER, which in turn depends on ROLE_PERIPHERAL. So the host
-# implementation cannot be compiled without nominally enabling the peripheral
-# role. Nothing ever advertises; this costs image size and no runtime behaviour.
-# Drop any of them and the link fails with "undefined reference to
-# esp_ble_hidh_init".
-CONFIG_BT_NIMBLE_ROLE_PERIPHERAL=y
-CONFIG_BT_NIMBLE_GATT_SERVER=y
-CONFIG_BT_NIMBLE_HID_SERVICE=y
-# Required, and its absence is silent. esp_hidh's NimBLE path never calls
-# ble_gap_security_initiate, and the HID characteristics need an encrypted link
-# — so without this the clicker connects and then reads nothing. This is the
-# switch that makes ble_gattc retry a read through pairing when the peer answers
+# bluetooth_clicker.h encrypts the link itself before any GATT access, so this
+# is a backstop: ble_gattc retries a read through pairing when the peer answers
 # INSUFFICIENT_ENC/AUTHEN (ble_gattc.c's BLE_GATTC_AUTO_PAIR block). The
 # matching ble_hs_cfg.sm_* fields are set in bluetooth_clicker.h; both halves are
 # needed, since NimBLE defaults sm_bonding and both key-dist masks to 0.
@@ -332,11 +331,18 @@ CONFIG_ESP_COEX_SW_COEXIST_ENABLE=y
 # NimBLE host and did not work — stage 5 still failed, and the smaller pools
 # degraded the clicker too. esp_wifi_init's requirement is not dominated by
 # these counts.
+#
+# RX side sized for throughput: the TCP window below is 16 segments, and each
+# in-flight segment pins one dynamic RX buffer until lwIP frees it, so the pool
+# and the block-ack window must cover it or the window never opens in practice.
+# Heap cost exists only while a sync runs. BA window capped at 2 x static RX
+# buffers (wifi_init.c #error); 12 keeps the static pool, allocated at
+# esp_wifi_init, at 6.
 CONFIG_ESP_WIFI_STATIC_RX_BUFFER_NUM=6
-CONFIG_ESP_WIFI_DYNAMIC_RX_BUFFER_NUM=12
+CONFIG_ESP_WIFI_DYNAMIC_RX_BUFFER_NUM=24
 CONFIG_ESP_WIFI_TX_BUFFER_TYPE=1
 CONFIG_ESP_WIFI_DYNAMIC_TX_BUFFER_NUM=12
-CONFIG_ESP_WIFI_RX_BA_WIN=6
+CONFIG_ESP_WIFI_RX_BA_WIN=12
 
 # RX aggregation stays ON. It is what makes a bulk download fast, and a faster
 # download is less radio-on time. Turning it off looks like a saving and costs
@@ -349,6 +355,14 @@ CONFIG_ESP_WIFI_SOFTAP_SUPPORT=n
 CONFIG_ESP_WIFI_ENTERPRISE_SUPPORT=n
 CONFIG_ESP_WIFI_NVS_ENABLED=n
 
+# Wi-Fi hot paths in flash, not IRAM: 19,724 B of IRAM (wifi0iram 8,206,
+# wifirxiram 3,910, wifislprxiram 7,608) were resident whether or not a sync
+# ever ran, and IRAM comes out of the same SRAM as the heap. wifislprxiram
+# follows RX_IRAM_OPT || SLP_IRAM_OPT, and SLP is already off. Cost: somewhat
+# slower sync throughput.
+CONFIG_ESP_WIFI_IRAM_OPT=n
+CONFIG_ESP_WIFI_RX_IRAM_OPT=n
+
 # lwIP: one outbound connection to one server, plain HTTP, nothing listening.
 CONFIG_LWIP_MAX_SOCKETS=4
 CONFIG_LWIP_IPV6=n
@@ -357,7 +371,16 @@ CONFIG_LWIP_DHCPS=n
 # for it (no esp_mdns component). IDF's default, pinned so it cannot drift.
 CONFIG_LWIP_DNS_SUPPORT_MDNS_QUERIES=y
 CONFIG_LWIP_TCP_SND_BUF_DEFAULT=5760
-CONFIG_LWIP_TCP_WND_DEFAULT=5760
+# Receive window 16 x MSS (was the 4 x MSS default). A 4-segment window stalls
+# the sender every round trip and again during every card write; downloads are
+# the whole cost of a sync. Mailbox = WND/MSS + 2, per the Kconfig help.
+CONFIG_LWIP_TCP_WND_DEFAULT=23040
+CONFIG_LWIP_TCP_RECVMBOX_SIZE=18
+# Connect time. No ARP probe on the offered address (~1 s of waiting for nobody
+# to answer), and re-request the last lease straight away instead of a full
+# DISCOVER/OFFER round (lease kept in NVS by lwIP; unchanged lease = no write).
+CONFIG_LWIP_DHCP_DOES_NOT_CHECK_OFFERED_IP=y
+CONFIG_LWIP_DHCP_RESTORE_LAST_IP=y
 
 # esp_http_client drags in esp-tls and mbedtls unconditionally, even for a
 # plain-HTTP build. The sync is HTTP on a LAN and there is no other TLS user in

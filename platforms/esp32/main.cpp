@@ -1,10 +1,7 @@
 #include <cstdio>
-#include <new>  // set_new_handler, see reclaim_on_oom_
 
 #include "driver/gpio.h"
-#include "driver/usb_serial_jtag.h"
 #include "epd.h"
-#include "esp_heap_caps.h"
 #include "esp_sleep.h"
 #include "esp_system.h"
 #include "esp_timer.h"
@@ -14,11 +11,9 @@
 #include "wintergreen/Application.h"
 #include "wintergreen/Input.h"
 #include "wintergreen/Runtime.h"
-#include "wintergreen/content/BookIndex.h"
 #include "wintergreen/display/DrawBuffer.h"
 #include "runtime.h"
 #include "sdcard.h"
-#include "serial_communication.h"
 
 // Every deep-sleep entry goes through here. The ROM bootloader prints its banner
 // (chip, reset reason, boot mode, entry point — a few hundred characters at
@@ -30,7 +25,28 @@
 // Wake is the power button, level-triggered on LOW.
 static constexpr gpio_num_t kPowerPin = GPIO_NUM_3;
 
+// Chip-selects and the panel reset, driven high and held through deep sleep
+// (B3). Floating, a CS can drift low and select its device, and a floating
+// panel RST can pulse it out of its own deep sleep; either costs current for
+// the whole night. SD_CS is sdcard.h's GPIO12.
+//
+// **Released first thing in app_main.** A hold survives the wake, and a held
+// CS cannot be driven: panel and card would both be dead.
+static constexpr gpio_num_t kSleepHoldPins[] = {GPIO_NUM_12, EPD_CS, EPD_RST};
+
+static void release_sleep_holds_() {
+  gpio_deep_sleep_hold_dis();
+  for (gpio_num_t p : kSleepHoldPins)
+    gpio_hold_dis(p);
+}
+
 [[noreturn]] static void deep_sleep_now_() {
+  for (gpio_num_t p : kSleepHoldPins) {
+    gpio_set_direction(p, GPIO_MODE_OUTPUT);
+    gpio_set_level(p, 1);
+    gpio_hold_en(p);
+  }
+  gpio_deep_sleep_hold_en();
   esp_sleep_enable_gpio_wakeup_on_hp_periph_powerdown(1ULL << kPowerPin, ESP_GPIO_WAKEUP_GPIO_LOW);
   esp_deep_sleep_disable_rom_logging();
   esp_deep_sleep_start();
@@ -43,34 +59,15 @@ static void wait_power_release_() {
     vTaskDelay(pdMS_TO_TICKS(10));
 }
 
-// When the device boots on battery (no USB), require the power button to be
-// held for at least kPowerWakeupMs milliseconds before allowing boot.
+// On a clean power-on, require the power button to be held for at least
+// kPowerWakeupMs milliseconds before allowing boot. USB makes no difference.
 // A brief accidental touch goes back to sleep immediately without any display
 // activity, just like the original wintergreen firmware.
 // Exception: software resets (e.g. after esptool flash) boot immediately.
 static constexpr uint32_t kPowerWakeupMs = 50;
 
-// True when a USB host is attached.
-//
-// This asks the USB Serial/JTAG peripheral directly. It used to read GPIO20
-// (U0RXD) and call a high level "USB connected", which is only true behind an
-// external UART bridge — the X4 uses the C3's *native* USB, so GPIO20 never goes
-// high and the check always answered "no host". That was harmless while it only
-// decided whether to require a wake-hold, and became a device-bricking bug the
-// moment the battery cutoff used it to decide whether it was safe to sleep.
-//
-// Safe to call before usb_serial_jtag_driver_install(); it reads peripheral
-// state, not driver state.
-static bool usb_attached() {
-  return usb_serial_jtag_is_connected();
-}
-
 static void verify_wakeup_press() {
-  // If USB is connected, boot immediately.
-  if (usb_attached())
-    return;
-
-  // Only require a hold check on a clean power-on (battery, no USB).
+  // Only require a hold check on a clean power-on.
   // Crashes, panics, watchdog resets, SW resets — all boot immediately.
   if (esp_reset_reason() != ESP_RST_POWERON) {
     return;
@@ -110,16 +107,16 @@ static void verify_wakeup_press() {
 // and mount the card would take the cell lower still.
 //
 // Charging is the way out. The charger IC works whether or not the SoC is
-// running, so a cut-off device left on USB recovers on its own; and this check
-// is skipped outright while a host is attached, so plugging in always gives a
-// bootable device to flash. It runs before epd.begin(), so a refused boot never
-// lights the panel.
+// running, so a cut-off device left on USB recovers on its own. USB does not
+// bypass this check: flashing a refused device means starting the upload and
+// holding power (each wake boot-loops through here, enumerating USB). It runs
+// before epd.begin(), so a refused boot never lights the panel.
 //
 // A reading of zero (cannot measure) or an implausibly low one is treated as
 // "fine": stranding a device because it cannot read its own battery would be
 // worse than the discharge it is trying to prevent.
 static void verify_battery(const Esp32Runtime& runtime) {
-  if (wintergreen::kLowBatteryCutoffMv == 0 || usb_attached())
+  if (wintergreen::kLowBatteryCutoffMv == 0)
     return;
   static constexpr int kImplausibleMv = 2500;
   // Eight back-to-back reads, averaged. These used to be 25 ms apart, keeping the
@@ -138,85 +135,12 @@ static void verify_battery(const Esp32Runtime& runtime) {
   deep_sleep_now_();
 }
 
-// Last resort before an allocation failure becomes a reboot.
-//
-// With exceptions disabled a std::bad_alloc is an abort(), so every OOM in the
-// reader was a full restart mid-book. This runs *before* operator new throws
-// and hands back the two largest reclaimable blocks in the system — the spare
-// framebuffer and the book index — giving the allocation a second chance.
-//
-// It is not a substitute for the caches being sized correctly; it is the net
-// under them, for the page whose layout happens to land on a bad heap. If it
-// frees nothing (already released, or the index is dirty) the throw proceeds
-// exactly as before, so the worst case is unchanged.
-static wintergreen::DrawBuffer* g_oom_buf = nullptr;
-
-// **The reserve is what makes the rescue work with a radio up.**
-//
-// The handler used to free only the spare framebuffer and the book index. Both
-// are already gone by the time the clicker is connected — that is exactly what
-// release_ram_for_radio() does — so the handler ran, freed *nothing*, and the
-// abort proceeded. Every clicker-connected crash in this reader had a live
-// new_handler that could not help.
-//
-// This block exists solely to be freed here. It is claimed once at boot, is
-// never read or written, and is large enough for the worst cold page layout
-// measured over four books (24,066 B on the Odyssey) plus margin. Releasing it
-// turns the one allocation that would have aborted into a slow page turn, and
-// the reader keeps running in the reduced state its own guards already handle.
-static void* g_oom_reserve = nullptr;
-// 12 KB, not the 28 KB first tried. The reserve does not have to cover a whole
-// page layout — the reader's own guards drop their caches long before this
-// fires, and every failure seen on hardware has been a *small* allocation on a
-// fragmented heap (192, 256, 456, 1212, 1416 bytes). What the rescue has to
-// supply is one clean extent big enough for the request that lost the race,
-// which is far less than a page.
-//
-// Staying small also matters because this competes with the radios for the
-// single ~50 KB internal DRAM pool: 28 KB of it was over half, and that is what
-// stopped the clicker connecting at all.
-static constexpr size_t kOomReserveBytes = 12 * 1024;
-
-// **The radio needs this block back, and holding it broke the clicker.**
-//
-// The BT controller wants a contiguous allocation out of the single ~50 KB
-// internal DRAM pool this device has (see the note in bluetooth_clicker.h).
-// Reserving 28 KB of that pool at boot (the first size tried) left too little
-// for it: the connect
-// worker could not start, toggle() cleared g_state back to Disconnected, and the
-// row looked like the button had done nothing — it never even said "Connecting".
-//
-// So the reserve is given back on the way up, the same way DrawBuffer's spare
-// is, and re-claimed by the frame loop once the radio is down again and the
-// heap has room. wg_clicker calls this through the hook below.
-void wg_release_oom_reserve() {
-  if (g_oom_reserve) {
-    heap_caps_free(g_oom_reserve);
-    g_oom_reserve = nullptr;
-  }
-}
-
-static void reclaim_on_oom_() {
-  // **Must disarm itself.** operator new calls the handler in a loop and only
-  // stops when the handler frees nothing *and* clears itself — a handler that
-  // returns without freeing spins forever. Clearing first means one rescue
-  // attempt per re-arm, which app_main does at each frame boundary.
-  std::set_new_handler(nullptr);
-  // Reserve first: it is the only one guaranteed to still be holding memory.
-  if (g_oom_reserve) {
-    heap_caps_free(g_oom_reserve);  // IDF documents free() as equivalent; explicit for clarity
-    g_oom_reserve = nullptr;
-  }
-  if (g_oom_buf)
-    g_oom_buf->release_spare();
-  wintergreen::BookIndex::instance().release_memory();
-}
-
+// No out-of-memory rescue. Every long-lived buffer (both framebuffers, the
+// reader's page buffer, the book index) is claimed at boot and kept; a page
+// turn allocates nothing; the radios come and go beside them without anything
+// being handed back. See docs/history.md "OOM rescue".
 extern "C" void app_main(void) {
-  // Claimed before anything else allocates, so it is guaranteed to exist and to
-  // come out of internal RAM. Never read; it is a rope for reclaim_on_oom_.
-  g_oom_reserve = heap_caps_malloc(kOomReserveBytes, MALLOC_CAP_INTERNAL);
-  std::set_new_handler(reclaim_on_oom_);
+  release_sleep_holds_();
   verify_wakeup_press();
 
   static Esp32InputSource input;
@@ -230,7 +154,6 @@ extern "C" void app_main(void) {
   runtime.set_performance_hold(true);
   static wintergreen::Application app;
   static wintergreen::DrawBuffer buf(epd);
-  g_oom_buf = &buf;  // the spare is the largest block the OOM rescue can free
 
   // Before anything touches the panel or the card.
   verify_battery(runtime);
@@ -267,134 +190,41 @@ extern "C" void app_main(void) {
   // while the panel is mid-waveform.
   wg_sync::bind(app, buf);
 
-  // The clicker borrows the same spare framebuffer, but only when the heap is
-  // too tight for the BT controller to allocate beside it.
-  wg_clicker::bind(buf);
-
   app.start(buf, runtime);
 
   // Discard the power-button press that woke us from deep sleep.
   input.clear_button(wintergreen::Button::Power);
 
   while (app.running()) {
-    // A host is attached: bring the serial receiver up (once) and hold off
-    // auto-sleep for as long as it stays attached.
-    if (usb_serial_jtag_is_connected()) {
-      serial_start_if_connected();
-      app.keep_awake();
-    }
-
-    // Process pending index mutation (upload via EPUB magic or 'W' command,
-    // delete via 'R', rename via 'N'). Single-slot SPSC queue: receiver task
-    // is the producer, this loop is the consumer.
-    //
-    // Deferral rules:
-    //   (A) Add/Rename open the book to read its metadata and may reload the
-    //       ~30 KB index — defer while the reader is the top screen, which is
-    //       using the heap for its own caches.
-    //   (B) ALL ops do SD card I/O (fopen/fprintf in save/load) which shares
-    //       SPI2_HOST with the display. Defer when the EPD hardware is
-    //       mid-refresh. This prevents SPI contention that corrupts the
-    //       display during SD card writes.
-    if (g_index_op != SerialIndexOp::None) {
-      const SerialIndexOp op = g_index_op;
-      std::atomic_thread_fence(std::memory_order_acquire);
-      const bool opens_book = (op == SerialIndexOp::Add || op == SerialIndexOp::Rename);
-      const bool defer = (opens_book && app.is_reader_active()) || epd.is_busy();
-
-      if (defer) {
-        // Leave the slot occupied; retry next iteration. The main loop
-        // continues to run (UI updates, serial commands) between retries.
-      } else {
-        // Copy paths to locals BEFORE clearing the slot — minimizes the window
-        // in which a new op would be dropped.
-        char path_a[256];
-        char path_b[256];
-        strncpy(path_a, g_index_path_a, sizeof(path_a) - 1);
-        path_a[sizeof(path_a) - 1] = '\0';
-        strncpy(path_b, g_index_path_b, sizeof(path_b) - 1);
-        path_b[sizeof(path_b) - 1] = '\0';
-        std::atomic_thread_fence(std::memory_order_release);  // copies above happen first
-        g_index_op = SerialIndexOp::None;  // free slot before processing
-
-        const std::string& index_path = app.index_path();
-        switch (op) {
-          case SerialIndexOp::Add:
-            (void)wintergreen::BookIndex::instance().index_file(path_a, index_path);
-            break;
-          case SerialIndexOp::Remove:
-            wintergreen::BookIndex::instance().remove_path(path_a, index_path);
-            break;
-          case SerialIndexOp::Rename:
-            // Fast path: in-place rename preserves metadata + last_open_order.
-            // Fallback: src wasn't indexed → index dst fresh (extracts metadata).
-            if (!wintergreen::BookIndex::instance().rename_in_place(path_a, path_b, index_path)) {
-              (void)wintergreen::BookIndex::instance().index_file(path_b, index_path);
-            }
-            break;
-          default:
-            break;
-        }
-      }
-    }
-
-    // Dispatch serial path commands.
-    {
-      const char* cmd_path = nullptr;
-      if (serial_cmd_take(&cmd_path) == SerialCmdType::Open) {
-        app.auto_open_book(cmd_path, buf, runtime);
-        // auto_open_book pushes the Reader and renders the page into the
-        // inactive buffer, but does not commit it. We must refresh here to
-        // show the book page on the display (the Application::start() path
-        // has its own buf.full_refresh() after auto_open_book returns).
-        buf.refresh();
-      }
-    }
-
-    // Skip UI update during upload: prevents display SPI (SPI2_HOST) from
-    // contending with SD-card fwrite() (also SPI2_HOST).
-    if (g_upload_in_progress) {
-      vTaskDelay(pdMS_TO_TICKS(10));
-      continue;
-    }
-
     // Carry out a BLE teardown the HID callback asked for. Compiles to nothing
     // unless a clicker MAC is configured; see bluetooth_clicker.h for why the
     // callback cannot tear its own stack down.
-    wg_clicker::g_in_reader = app.is_reader_active();
     wg_clicker::poll();
-    // Re-arm the out-of-memory rescue once per frame. It disarms itself when it
-    // fires, so without this it would rescue exactly one allocation per boot.
-    //
-    // Re-claim the reserve too, but only when the heap has recovered enough that
-    // taking it back cannot itself cause the shortage it exists to prevent.
-    // Without this the rope is single-use: the first rescue spends it and every
-    // later page turn is unprotected again.
-    //
-    // **Never while a radio holds RAM.** The reserve comes out of the same ~50 KB
-    // internal pool the BT controller needs a contiguous block from, so taking it
-    // back mid-session would starve the stack that is already up — and taking it
-    // at all is what stopped the clicker connecting in the first place.
-    //
-    // The re-claim is gated on the reserve being spent: in the steady state —
-    // every frame of an ordinary reading session — that is one pointer test
-    // instead of a heap free-list walk 40 times a second. The re-arm is *not*
-    // gated on it, because the handler disarms itself on any rescue and its
-    // other two levers (the spare framebuffer, the book index) can fire while
-    // the reserve is still held.
-    if (!g_oom_reserve && !runtime.clicker_holds_ram() &&
-        heap_caps_get_largest_free_block(MALLOC_CAP_INTERNAL) > kOomReserveBytes + 16 * 1024)
-      g_oom_reserve = heap_caps_malloc(kOomReserveBytes, MALLOC_CAP_INTERNAL);
-    std::set_new_handler(reclaim_on_oom_);
 
-    // Hold off auto-sleep while a sync is in flight: a multi-book transfer
+    // Hold off auto-sleep while a sync is in flight (a multi-book transfer
     // easily outlasts kAutoSleepMinutes, and sleeping mid-download would cut
-    // the radio with files half written.
+    // the radio with files half written), and reconnect the clicker once a
+    // sync that dropped it has finished.
     wg_sync::poll();
 
-    const wintergreen::ButtonState buttons = input.poll_buttons();
+    // Every button is dead while a sync runs, power included (owner's call): no
+    // sleeping or navigating away mid-download. The sync always ends on its own
+    // (HTTP and Wi-Fi timeouts).
+    wintergreen::ButtonState buttons = input.poll_buttons();
+    if (wg_sync::active())
+      buttons = {};
     app.update(buttons, runtime.frame_time_ms(), buf, runtime);
-    runtime.wait_next_frame();
+
+    // Sleep as long as nothing is due. A radio in transition keeps the frame
+    // cadence (its rows repaint as state changes); a clicker key down shortens
+    // the wait to exactly its hold deadline.
+    uint32_t budget = app.idle_wait_ms(buf);
+    if (wg_sync::active() || wg_clicker::busy())
+      budget = 0;
+    const uint32_t hold = wg_clicker::hold_wait_ms();
+    if (hold < (budget ? budget : runtime.target_frame_ms()))
+      budget = hold;
+    runtime.wait_next_frame(budget);
   }
 
   // Hold-to-sleep leaves the power button still down.

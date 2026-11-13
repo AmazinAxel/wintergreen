@@ -19,7 +19,7 @@ shipped Literata:
 
   * advance_width is in QUARTER-pixels, not pixels.
   * The BW plane draws where its bit is CLEAR; untouched BW bits must be 1.
-    The format's two gray planes are always written absent (offset 0).
+    The column-major copy for portrait (tools/wgf_columns.py) is appended last.
 
 Rendering choices, for quality:
 
@@ -40,6 +40,8 @@ import sys
 import zlib
 
 import freetype
+
+from wgf_columns import add_columns
 
 # Same coverage as Literata and Inter: ASCII, Latin-1 + Latin Ext-A, and
 # General Punctuation / Currency. 527 glyphs.
@@ -66,8 +68,7 @@ SUBSTITUTES = {
 
 STYLE_ORDER = ["regular", "bold", "italic", "bold_italic"]
 
-WGF_MAGIC = 0x31464757  # "WGF1"
-HEADER_SIZE = 49
+HEADER_SIZE = 45  # no magic: fonts are built and flashed with the firmware
 RANGE_SIZE = 8
 GLYPH_SIZE = 10
 STYLE_SECTION_SIZE = 8
@@ -404,9 +405,9 @@ def build_wgf(faces, px, name, kern_sources=None, line_height_pct=None):
             offsets[style].append(seen[g.bw])
 
     bitmap_data_offset = off
-    # The format's gray-plane offsets; 0 = plane absent, which every font now is.
-    gray_lsb_offset = 0
-    gray_msb_offset = 0
+    # Column bitmaps: filled in by add_columns() below.
+    col_bitmap_offset = 0
+    col_index_offset = 0
 
     glyph_height = max((g.height for g in styles["regular"]), default=px)
     underline_pos = max(1, px // 10)
@@ -419,8 +420,7 @@ def build_wgf(faces, px, name, kern_sources=None, line_height_pct=None):
 
     out = bytearray()
     out += struct.pack(
-        "<IBBBBBHHH",
-        WGF_MAGIC,
+        "<BBBBBHHH",
         min(glyph_height, 255),
         min(baseline, 255),
         min(y_advance, 255),
@@ -438,8 +438,8 @@ def build_wgf(faces, px, name, kern_sources=None, line_height_pct=None):
         style_offsets.get("italic", 0),
         style_offsets.get("bold_italic", 0),
         kern_offset,
-        gray_lsb_offset,
-        gray_msb_offset,
+        col_bitmap_offset,
+        col_index_offset,
     )
     out += struct.pack("<bB", underline_pos, underline_thickness)
     assert len(out) == HEADER_SIZE
@@ -474,7 +474,7 @@ def build_wgf(faces, px, name, kern_sources=None, line_height_pct=None):
 
     assert len(out) == bitmap_data_offset
     out += bw_pool
-    return bytes(out)
+    return add_columns(bytes(out))
 
 
 def open_face(spec):
@@ -491,14 +491,12 @@ def split_spec(spec):
 
 
 def pack_bundle(blobs):
-    """WGFS: [WGFS][u8 count][pad:3][count x uint32 size][payloads]
+    """WGFS: [u8 count][pad:3][count x uint32 size][payloads]
 
-    The magic is the version. The old FNTS container also carried a version byte
-    and a 32-byte font name; the name was never read (there is exactly one reader
-    font and it is found by partition, not by name) and the version is now the
-    magic, so both are gone.
+    No magic, no version, no name: there is exactly one reader font, found by
+    partition and flashed by the same build that reads it.
     """
-    out = bytearray(b"WGFS")
+    out = bytearray()
     out += struct.pack("<BBBB", len(blobs), 0, 0, 0)
     for b in blobs:
         out += struct.pack("<I", len(b))

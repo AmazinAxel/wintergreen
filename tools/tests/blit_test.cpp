@@ -47,9 +47,34 @@ int main() {
     for (auto& b : img) b = static_cast<uint8_t>(std::rand());
     const int x = std::rand() % (buf.width() + 2 * w) - w;
     const int y = std::rand() % (buf.height() + 2 * h) - h;
-    buf.blit_1bit(x, y, img.data(), w, h, stride);
+    // Rows actually drawn: all, except for the band path, which draws a slice
+    // [r_from, r_to) the way a reader page shows part of an image.
+    int r_from = 0, r_to = h;
+    if ((iter & 12) == 8) {
+      // Reader image portrait copy: 8-row bands, drawn band by band.
+      r_from = std::rand() % h;
+      r_to = r_from + 1 + std::rand() % (h - r_from);
+      std::vector<uint8_t> bands(((h + 7) / 8) * w, 0xFF);
+      for (int r = 0; r < h; ++r)
+        for (int c = 0; c < w; ++c)
+          if (!((img[r * stride + c / 8] >> (7 - (c & 7))) & 1))
+            bands[(r / 8) * w + c] &= static_cast<uint8_t>(~(0x80u >> (r & 7)));
+      for (int b = r_from / 8; b <= (r_to - 1) / 8; ++b)
+        buf.blit_1bit_bands(x, y + 8 * b, bands.data() + b * w, w, r_from - 8 * b, r_to - 8 * b);
+    } else if (iter & 4) {
+      // Same image column-major, through blit_1bit_cols (baked covers).
+      const size_t cs = (h + 7) / 8;
+      std::vector<uint8_t> cols(cs * w, 0xFF);
+      for (int r = 0; r < h; ++r)
+        for (int c = 0; c < w; ++c)
+          if (!((img[r * stride + c / 8] >> (7 - (c & 7))) & 1))
+            cols[c * cs + r / 8] &= static_cast<uint8_t>(~(0x80u >> (r & 7)));
+      buf.blit_1bit_cols(x, y, cols.data(), w, h);
+    } else {
+      buf.blit_1bit(x, y, img.data(), w, h, stride);
+    }
 
-    for (int r = 0; r < h; ++r)
+    for (int r = r_from; r < r_to; ++r)
       for (int c = 0; c < w; ++c) {
         const int lx = x + c, ly = y + r;
         if (lx < 0 || ly < 0 || lx >= buf.width() || ly >= buf.height())

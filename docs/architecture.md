@@ -62,13 +62,15 @@ item/selection/navigation machinery; every pixel comes from its own `draw_all_`.
   trusted while `spare_cache_valid(cover_gen_)`). A heap copy was ~26 KB resident for as
   long as the home screen was. The cache owner is part of the claim, so the book list's
   thumbnails and this cover invalidate each other instead of trusting overwritten bytes.
-  With a radio up there is no spare and the placeholder frame is drawn. There is still
-  exactly **one** cover — a second, preloaded one crashed the device; see "Investigated
-  and rejected". `cover_slot_` is what stops the card being re-read every frame,
+  The spare is never released (radios included, since 2026-11-11), so the cover shows
+  with the clicker connected and through a sync. There is still exactly **one** cover —
+  a second, preloaded one crashed the device in the layout era; reopened 2026-11-12 and
+  waiting on heap numbers (two covers do not fit the 48,000 B spare; it needs its own
+  fixed 25 KB buffer). See `docs/history.md` "Still open". `cover_slot_` is what stops the card being re-read every frame,
   including for a book with no cover file: no cover with a valid `cover_slot_` is a real
   state, not a miss. A cover that was loaded and then lost its spare is reloaded.
 - `on_start()` clears `cover_slot_` because it rebuilds `slots_` from the index — a sync,
-  a serial upload or a delete repoints every index without necessarily changing one.
+  a sync repoints every index without necessarily changing one.
 - The cover is **`cover_home.bin`**, rendered by the converter to fit the box
   (`kHomeCoverW` × `kHomeCoverH` = 424x486 in `content/CoverPaths.h`) with its blank top
   and bottom rows already trimmed (`Book::write_cover_bin`), so a load is a header and
@@ -81,10 +83,24 @@ item/selection/navigation machinery; every pixel comes from its own `draw_all_`.
 
 ### QuickmenuScreen
 
+**Closes itself when the clicker connects.** `update()` watches `clicker_state()`; a
+Connecting → Connected change while the menu is up calls `on_back()`, returning to the
+book (snapshot fast path).
+
 A flat list: header block, Font Size, Orientation, Clicker (only when a MAC is
-configured), then Chapters when the book has a TOC. There is no separate Chapters page —
-selecting a chapter sets `pending_chapter()` / `pending_para_index()` and pops one screen;
-`ReaderScreen::resume()` consumes them.
+configured), then the chapter grid. There is no separate Chapters page — selecting a
+chapter sets `pending_page()` (the chapter's baked start page in the current layout) and
+pops one screen; `ReaderScreen::resume()` consumes it.
+
+**Chapter grid.** Two columns of boxed numbers (`1`, `2`, ...), nothing else; the header's
+chapter line reads "Chapter N of M". Each chapter is still one list item, in grid order, so
+the inherited linear navigation is the grid's: down / front Button2 steps right, then wraps
+to the next row's left cell; up reverses. Every cell has a 1 px box, the selected one a
+2 px frame (`kCellSelW`, same as the home cover frame, shared `draw_outline()` in
+`ListMenuScreen.h`), never an inverted fill — fewer pixels flip per move, so less ghosting.
+Settings rows keep the inverted selection. Scrolling is item-indexed (base class), but the
+grid always draws and counts whole rows from the row holding `scroll_offset()`
+(`first_grid_row_()`); `get_visible_count_` and `draw_all_` must agree on that.
 
 **Item 0 *is* the header block** — book title, chapter and their two percentages.
 Selecting it pops back to the book. It is **not** the default selection: a power-button
@@ -97,28 +113,23 @@ is *not* is a row: `draw_all_` paints it at the top and inverts the whole block 
 `selected() == kIdxBack`, and the list loop starts at `kIdxBack + 1`. Two places must
 agree that it costs no height, or the last chapter becomes unreachable:
 `get_visible_count_` gives index `kIdxBack` a row height of 0, and `draw_all_`'s `total_h`
-is `(n - 1) * row_h_()`.
+starts from `(settings_end - 1) * row_h_()`.
 
 Its header is drawn entirely by its own `draw_all_` — the base class's card header is
 unused, so `title_`/`subtitle_` are left empty. Book title, current chapter, rule; there
 is **no battery** (it is an overlay on the book, and the reader underneath shows none).
-Both title and chapter are word wrapped (`wrap_`, 2 and 3 lines) and each carries its
+Both title and chapter are word wrapped (`wrap_`, into spans of the space-collapsed
+title: no allocation per open; "..." drawn at the line's end cursor, identical because the
+UI fonts have no kerning) and each carries its
 percentage right-aligned on its **first** line, set in the *same font as the text beside
 it* so the pair reads as one line. The chapter is a size down (`chapter_font_()` =
 `section_font_`). `header_h_()` measures that block from the wrapped lines computed in
 `on_start()`, and `get_visible_count_()` calls it — the two used to re-derive the height
 independently, which is how scroll bugs get in.
 
-A hairline divides settings from chapters, drawn in a `kSeparatorH` gap of its own rather
-than inside the first chapter's row — a selected row fills its whole rect and would paint
-over it. Row height is `row_h_()` = the list font's `y_advance()` + padding, not a
+A hairline divides settings from chapters, drawn in a `kSeparatorH` gap of its own. Row height is `row_h_()` = the list font's `y_advance()` + padding, not a
 constant: the list is set in the 32 px header face and the old fixed 28 px row was
 shorter than a single line.
-
-Two things the TOC merge broke: chapter titles legitimately contain `": "` ("Chapter 1:
-The Beginning"), so the `Label: Value` split is gated to non-chapter rows or the title is
-torn into two columns; and nested TOC entries carry a depth that must still indent, via
-`ListMenuScreen::get_item_indent()`.
 
 The book title comes from `ReaderScreen::display_title_()`, not `wgb_.metadata().title`:
 a converted EPUB with no usable metadata title yields the literal string `"none"`, and
@@ -136,6 +147,13 @@ is its hairline (pushed into `separators_` like any other), and books start at r
 in `populate_list_()` carries the same `first_book` offset (2 or 0); getting that wrong
 shows up as the wrong book opening, not as a drawing glitch.
 
+**One repaint at the end of a sync, with everything final** (`MainMenu::update`). The
+worker bumps the index generation just before it sets its end state, so the list used to
+paint the new books under "Syncing" and then refresh again for the label. While the state
+is Working, generation changes wait; the frame that sees the end state repopulates and
+draws books plus label together (full refresh if books changed, else partial). It also
+keeps the UI thread from reading the index while the worker is still mutating it.
+
 Entries reference `BookIndex`'s pool for path, title and author (`path_of_()`); only hidden
 books own strings. A `std::string` path per book was up to 250 allocations per list build.
 
@@ -151,7 +169,7 @@ Idle and Failed both read `Sync`.
 
 `select_first_book_()` moves the cursor off Sync onto the first book when the screen
 opens. Called from `on_start()` and from `update()`'s scan branch — deliberately **not**
-from `populate_list_()`, which also runs on an in-place refresh (a serial upload) where
+from `populate_list_()`, which also runs on an in-place refresh (a sync) where
 moving the cursor under the user would be wrong. With no books there is no hairline and
 Sync is the only row.
 
@@ -179,8 +197,9 @@ this problem.**
 Four things the hidden list depends on:
 
 - `.hidden` books are **not in `BookIndex`** (its scan skips dot-directories), so
-  `MainMenu::scan_hidden_()` walks the folder itself and reads title/author straight from
-  each WGB. Those entries carry owned `title_own`/`author_own` strings rather than
+  `MainMenu::scan_hidden_()` walks the folder itself and takes title/author from
+  `.hidden/.wintergreen-index`, opening only WGBs not in it (rewritten when the hidden
+  set changed). Those entries carry owned `title_own`/`author_own` strings rather than
   `StringRef`s, because there is no pool entry to reference. The scan runs only when the
   gesture first asks for it.
 - `on_select` skips `record_book_opened()` for a hidden entry — a hidden book must never
@@ -193,6 +212,19 @@ Four things the hidden list depends on:
   removed.
 
 ### ListMenuScreen
+
+**`Button::Undo`** (`Input.h`, index 7, press-only, never in `current`) is injected only
+by the clicker's hold (`docs/bluetooth.md`): it means "revert the step the last press
+made, without drawing; an action follows". Here: `undo_selected_` (cursor before the last
+press move) is restored. In `ReaderScreen`: `last_step_` (+1/-1 of the last turn that
+moved, 0 if none, so a press at the book's first page undoes nothing) is reverted with
+`prev_page_()`/`next_page_()` and `pixels_stale_` stops `pause()` snapshotting the
+page the glass still shows; a turn still pending in the same batch is just cancelled.
+Screens that do not handle it ignore it.
+
+**Back no longer flushes a pending move before `on_back()`.** It used to draw + refresh
+first "in case on_back stays", which cost a whole refresh before leaving the screen when
+an Undo preceded it. Now `on_back()` runs first; if it stays, `moved` still draws.
 
 Base class for every list screen: item storage, navigation, hold-repeat, scrolling and
 the battery header. Its own draw pass is **one layout**, the book list's; `HomeScreen` and
@@ -211,13 +243,15 @@ left using them and are gone, along with the 14 px UI font only they used.
   the title wraps at a word, a one-line title leaves the second blank) so the cover gets
   a 76x115 box. The file is `cover_list.bin`, rendered by the converter to fit
   `kListCoverW`x`kListCoverH`, so a load is a header and one `fread` straight into the
-  slot. **The device has no cover scaler** — a book without the file draws an empty
+  slot. Indexed books read their slot from the thumbnail pack (`.wintergreen-thumbs`,
+  `BookIndex.h`), opened once per draw and closed by `end_thumbs()`; hidden books and
+  any slot whose key does not match fall back to the book's own file. **The device has no cover scaler** — a book without the file draws an empty
   frame. Covers load **during the draw that first shows the row**, so a page and its
   covers arrive in one refresh; nothing is read ahead (a prefetch of rows that might
   never be shown was built and removed as wasted card reads and CPU). The cache lives
   in the spare framebuffer (`DrawBuffer::claim_spare_cache`, validity by
   `spare_cache_gen()`): no allocation, up to 40 slots, keyed by path, surviving list
-  visits until the reader, the sleep path or a radio claims the spare — with a radio up
+  visits until the reader or a radio claims the spare — with a radio up
   the column is absent. The first version used its own `malloc` gated on 40 KB of
   contiguous heap and showed nothing on hardware: the heap is too fragmented for that
   gate. A load re-checks the spare after its last allocation, because the OOM handler

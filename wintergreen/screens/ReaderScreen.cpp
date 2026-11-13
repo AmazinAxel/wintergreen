@@ -42,7 +42,8 @@ bool ReaderScreen::draw_image_(uint32_t offset, uint32_t size, DrawBuffer& buf, 
     return false;
 
   const uint16_t row_bytes = static_cast<uint16_t>((width + 7) / 8);
-  if (static_cast<uint32_t>(row_bytes) * height > size)
+  const uint32_t rows_bytes = wgb_image_rows_bytes(width, height);
+  if (rows_bytes + wgb_image_bands_bytes(width, height) > size)
     return false;
   const uint16_t first = src_y;
   uint16_t last = height;
@@ -50,6 +51,32 @@ bool ReaderScreen::draw_image_(uint32_t offset, uint32_t size, DrawBuffer& buf, 
     last = static_cast<uint16_t>(first + clip_h);
   if (first >= last)
     return false;
+
+  if (buf.rotation() == Rotation::Deg90) {
+    // Portrait: the band copy after the rows (WgbFormat.h). Bands first/8 ..
+    // (last-1)/8 are contiguous, read a few at a time; rows of the edge bands
+    // outside [first, last) are not drawn.
+    if (width > 2 * DisplayFrame::kStride * 8)
+      return false;
+    const uint32_t b0 = first / 8u, b1 = (last - 1u) / 8u;
+    if (std::fseek(f, static_cast<long>(offset + rows_bytes + b0 * width), SEEK_SET) != 0)
+      return false;
+    static constexpr uint32_t kBandBuf = 16 * DisplayFrame::kStride;
+    uint8_t bands[kBandBuf];
+    const uint32_t per = std::max<uint32_t>(1, kBandBuf / width);
+    for (uint32_t b = b0; b <= b1;) {
+      const uint32_t n = std::min(per, b1 - b + 1);
+      const size_t got = std::fread(bands, width, n, f);
+      for (uint32_t k = 0; k < got; ++k) {
+        const int top = static_cast<int>(8 * (b + k));  // image row of the band's first row
+        buf.blit_1bit_bands(dest_x, dest_y + top - first, bands + k * width, width, first - top, last - top);
+      }
+      if (got != n)
+        break;
+      b += n;
+    }
+    return true;
+  }
 
   if (row_bytes > DisplayFrame::kStride)
     return false;  // wider than the panel: not something the converter produces
@@ -71,15 +98,11 @@ bool ReaderScreen::draw_image_(uint32_t offset, uint32_t size, DrawBuffer& buf, 
   return true;
 }
 
-// Latching: once the bar is up it stays up until the device is plugged in.
-// A cell sags a few hundred millivolts under an e-ink refresh, so an unlatched
-// threshold would flicker the bar on and off between page turns right around
-// 15%, which is exactly where it matters.
+// Latching: once the bar is up it stays up until the next boot (deep-sleep
+// wake is one). A cell sags a few hundred millivolts under an e-ink refresh, so
+// an unlatched threshold would flicker the bar on and off between page turns
+// right around 15%, which is exactly where it matters.
 void ReaderScreen::sample_battery_(IRuntime& runtime) {
-  if (app_ && app_->usb_powered()) {
-    low_battery_ = false;
-    return;
-  }
   if (low_battery_)
     return;
   const std::optional<uint8_t> pct = runtime.battery_percentage();
@@ -88,10 +111,24 @@ void ReaderScreen::sample_battery_(IRuntime& runtime) {
   low_battery_ = pct.has_value() && *pct <= kLowBatteryBarPct;
 }
 
+uint8_t ReaderScreen::wanted_layout_(const DrawBuffer& buf) const {
+  const uint8_t size = reader_settings_.font_size_idx < kWgbFontSizes ? reader_settings_.font_size_idx : 0;
+  return wgb_layout_index(size, buf.rotation() == Rotation::Deg0);
+}
+
+void ReaderScreen::sync_layout_(const DrawBuffer& buf) {
+  const uint8_t want = wanted_layout_(buf);
+  if (want == layout_)
+    return;
+  WgbPage p;
+  page_ = wgb_.page(layout_, page_, p) ? wgb_.find_page(want, p.para_offset, p.text_offset) : 0;
+  layout_ = want;
+  predrawn_.valid = false;
+}
+
 void ReaderScreen::start(DrawBuffer& buf, IRuntime& runtime) {
   sample_battery_(runtime);
   buf_ = &buf;
-  runtime_ = &runtime;
   snapshot_ok_ = false;  // a fresh book must never resume into a previous one's pixels
   predrawn_.valid = false;
   pos_written_valid_ = false;
@@ -99,49 +136,29 @@ void ReaderScreen::start(DrawBuffer& buf, IRuntime& runtime) {
     buf.set_rotation(rotation_from_setting(app_->rotate_reader()));
   pos_path_.clear();
 
-  // The path *is* the book: BookIndex only recognises .wgb, so nothing else can
-  // reach here. The old else-branch pointed at <data_dir>/cache/<stem>/book.wgb
-  // for an EPUB that the firmware would convert — but on-device conversion and
-  // EPUB support are both gone, so it created cache directories for a file it
-  // could never produce.
-  wgb_path_ = path_;
-
   // No reader font, no book: update() pops straight back without drawing.
   open_ok_ = false;
-  if (!ext_font_set_ || !ext_font_set_->valid() || !wgb_.open(wgb_path_.c_str()))
+  if (!page_buf_ || !ext_font_set_ || !ext_font_set_->valid() || !wgb_.open(path_.c_str()))
     return;
+  layout_ = wanted_layout_(buf);
+  if (wgb_.page_count(layout_) == 0) {
+    wgb_.close();
+    return;
+  }
 
-  pos_path_ = book_pos_path(wgb_path_.c_str());
-
+  pos_path_ = book_pos_path(path_.c_str());
   open_ok_ = true;
-  chapter_idx_ = 0;
-  page_pos_ = PagePosition{0, 0};
-  image_size_fn_ = make_image_size_query(wgb_);
-  saved_chapter_idx_ = 0;
-  saved_page_pos_ = PagePosition{0, 0};
-  load_position_();
-  load_chapter_(saved_chapter_idx_);
-  if (!chapter_src_) {
-    // Fallback to chapter 0 if saved index is invalid.
-    saved_chapter_idx_ = 0;
-    saved_page_pos_ = PagePosition{0, 0};
-    load_chapter_(0);
-  }
-  if (!chapter_src_) {
-    open_ok_ = false;
-    return;
-  }
-  page_pos_ = saved_page_pos_;
-  layout_engine_ = TextLayout{};
-  layout_engine_.set_source(*chapter_src_);
-  layout_engine_.set_image_size_fn(image_size_fn_);
-  layout_engine_.set_hyphenation_lang(detect_language(wgb_.metadata().language));
-  // Not done here: the step-back needs a laid-out engine, and set_font/
-  // set_options happen inside render_page_. Doing it at this point laid out
-  // with font_ still null and took a load fault. render_page_ consumes the
-  // flag once, after the engine is fully configured.
-  resume_back_pending_ = config::kResumeOnePageBack;
+
+  page_ = 0;
+  PosKey saved;
+  if (load_position_(saved))
+    page_ = wgb_.find_page(layout_, saved.para_offset, saved.text_offset);
+  // Step back one page on a fresh open (config::kResumeOnePageBack). The .pos
+  // dedup key keeps what the file holds, so only reading moves it.
+  if (config::kResumeOnePageBack && page_ > 0)
+    --page_;
   render_page_(buf);
+  stage_next_page_(buf);
   prerender_pending_ = true;
 }
 
@@ -155,13 +172,13 @@ void ReaderScreen::pause() {
   buf_->save_snapshot();
   snapshot_font_size_ = reader_settings_.font_size_idx;
   snapshot_rotation_ = app_ ? app_->rotate_reader() : 0;
-  snapshot_ok_ = true;
+  snapshot_ok_ = !pixels_stale_;
+  pixels_stale_ = false;
 }
 
 void ReaderScreen::resume(DrawBuffer& buf, IRuntime& runtime) {
   sample_battery_(runtime);
   buf_ = &buf;
-  runtime_ = &runtime;
   if (app_)
     buf.set_rotation(rotation_from_setting(app_->rotate_reader()));
   if (!open_ok_)
@@ -170,37 +187,28 @@ void ReaderScreen::resume(DrawBuffer& buf, IRuntime& runtime) {
   // Fast path: nothing that affects the pixels changed while the quick menu was
   // up, so put the snapshot back instead of laying the page out and drawing
   // every glyph again. The caller (Application's pop handler) does the refresh.
-  // page_pos_, page_.end and page_cache_ are all untouched, so the next page
-  // turn still hits the prerendered page.
   const bool jumping = app_ && app_->quickmenu()->has_pending();
   if (!jumping && snapshot_ok_ && reader_settings_.font_size_idx == snapshot_font_size_ &&
       (app_ ? app_->rotate_reader() : 0) == snapshot_rotation_ && buf.has_snapshot() &&
       buf.restore_snapshot()) {
     snapshot_ok_ = false;
+    stage_next_page_(buf);
     prerender_pending_ = true;  // the snapshot claimed the spare the pre-drawn page was in
     return;
   }
   snapshot_ok_ = false;
 
-  // Handle pending chapter jump (chosen from the in-book quick menu).
-  if (app_ && app_->quickmenu()->has_pending()) {
-    saved_chapter_idx_ = app_->quickmenu()->pending_chapter();
-    saved_page_pos_ = PagePosition{app_->quickmenu()->pending_para_index(), 0, 0};
+  // A chapter jump chosen from the quick menu: its page, in the layout the
+  // menu was opened in (render_page_ maps it if the layout changed too).
+  if (jumping) {
+    page_ = app_->quickmenu()->pending_page();
     app_->quickmenu()->clear_pending();
-    load_chapter_(saved_chapter_idx_);
-    page_pos_ = saved_page_pos_;
-    layout_engine_.set_source(*chapter_src_);
-    layout_engine_.set_image_size_fn(image_size_fn_);
-    layout_engine_.set_hyphenation_lang(detect_language(wgb_.metadata().language));
+    if (page_ >= wgb_.page_count(layout_))
+      page_ = 0;
   }
 
-  // **Not redundant.** A font-size change keeps the same BitmapFontSet pointer
-  // and the same page options, so set_font()/set_options() see nothing new;
-  // re-setting the source is what invalidates the paragraph cache and the epoch.
-  if (chapter_src_)
-    layout_engine_.set_source(*chapter_src_);
-
   render_page_(buf);
+  stage_next_page_(buf);
   prerender_pending_ = true;
 }
 
@@ -216,22 +224,16 @@ void ReaderScreen::stop() {
     if (app_)
       app_->record_book_progress(path_, progress_pct());
   }
-  image_size_fn_ = {};
-  chapter_src_.reset();
+  loaded_.valid = false;
   wgb_.close();
-  page_ = PageContent{};
-  page_cache_ = LaidOutPageCache{};  // its words pointed into the source just freed
   predrawn_.valid = false;
-  wgb_path_.clear();
-  wgb_path_.shrink_to_fit();
+  predraw_after_idle_ = false;
   pos_path_.clear();
   pos_path_.shrink_to_fit();
   open_ok_ = false;
   // Restore the global menu rotation before handing the buffer back.
   if (buf_)
     buf_->set_rotation(Rotation::Deg90);
-  // saved_chapter_idx_ / saved_page_pos_ are intentionally NOT reset here —
-  // resume() uses them as the nav-history origin when a link jump is pending.
   buf_ = nullptr;
 }
 
@@ -267,20 +269,39 @@ void ReaderScreen::update(const ButtonState& buttons, DrawBuffer& buf, IRuntime&
       --page_delta;
     } else {
       switch (btn) {
+        case Button::Undo:
+          // A clicker hold: the press already turned the page, the hold wants
+          // Back/Confirm from where the reader was. Revert the position only;
+          // what follows paints over the glass. A turn still pending in this
+          // batch (the frame ran long) is simply cancelled instead.
+          if (page_delta != 0) {
+            page_delta += page_delta > 0 ? -1 : 1;
+            break;
+          }
+          if (last_step_ > 0)
+            prev_page_();
+          else if (last_step_ < 0)
+            next_page_();
+          if (last_step_ != 0) {
+            predrawn_.valid = false;
+            pixels_stale_ = true;
+          }
+          last_step_ = 0;
+          break;
         case Button::Button0:
           app_->pop_screen();
           return;
-        case Button::Button1:
-          saved_chapter_idx_ = chapter_idx_;
-          saved_page_pos_ = page_pos_;
+        case Button::Button1: {
+          std::vector<uint32_t> chapters;
+          wgb_.chapter_pages(layout_, chapters);
+          const int chapter_pct = chapter_progress_pct_(chapters);
           app_->quickmenu()->set_settings(&reader_settings_);
           // Power tap → the top setting; front select → the chapter being read.
           app_->quickmenu()->set_open_on_chapter(!app_->confirm_from_power());
-          app_->quickmenu()->populate(wgb_.toc(), static_cast<uint16_t>(chapter_idx_), page_pos_.paragraph,
-                                           display_title_(), progress_pct(), chapter_progress_pct(),
-                                           wgb_.chapter_count());
+          app_->quickmenu()->populate(std::move(chapters), page_, display_title_(), progress_pct(), chapter_pct);
           app_->push_screen(ScreenId::Quickmenu);
           return;
+        }
         default:
           break;
       }
@@ -303,143 +324,97 @@ void ReaderScreen::update(const ButtonState& buttons, DrawBuffer& buf, IRuntime&
       changed = prev_page_() || changed;
   }
 
+  if (page_delta != 0)
+    last_step_ = changed ? static_cast<int8_t>(page_delta > 0 ? 1 : -1) : 0;
+
   if (changed) {
+    pixels_stale_ = false;
     // One ADC read per page turn, not per frame. A pre-drawn page carries the
     // sample taken when it was drawn, so the bar can lag one turn.
     sample_battery_(runtime);
     // A forward turn may already have the page drawn and waiting.
     if (page_delta <= 0 || !take_predrawn_(buf))
       render_page_(buf);
+    stage_next_page_(buf);
     buf.refresh();
     // The panel is now busy for a few hundred ms and the reader is
     // overwhelmingly likely to go forward next — after a backward turn too,
     // where "forward" is the page just left. The CPU would only be waiting out
     // the waveform otherwise.
-    prerender_next_page_(buf, runtime);
+    prerender_next_page_(buf);
     prerender_pending_ = false;
   } else if (prerender_pending_) {
     prerender_pending_ = false;
-    prerender_next_page_(buf, runtime);
+    prerender_next_page_(buf);
+  } else if (predraw_after_idle_ && !buf.display().is_busy()) {
+    prerender_next_page_(buf);
   }
 }
 
-// Lay out *and draw* the page after the current one, into the offscreen buffer,
-// while the panel is still running this page's waveform.
+// The card shares SPI2 with the panel, so every read here waits the waveform
+// out first (docs/display.md). A page already in page_buf_ costs nothing.
+bool ReaderScreen::load_page_(DrawBuffer& buf, uint8_t layout, uint32_t index) {
+  if (loaded_.valid && loaded_.layout == layout && loaded_.index == index)
+    return true;
+  loaded_.valid = false;
+  WgbPage rec;
+  if (!page_buf_ || !wgb_.page(layout, index, rec))
+    return false;
+  buf.wait_panel_idle();
+  if (!wgb_.read_page(rec, page_buf_, kWgbMaxPageBytes))
+    return false;
+  page_len_ = rec.dl_size;
+  loaded_ = Loaded{true, layout, index};
+  return true;
+}
+
+// Read the next page's display list while the panel is idle, right before the
+// refresh that puts page_ up, so prerender_next_page_ can draw it during the
+// waveform without touching the card. One small read, a few ms.
+void ReaderScreen::stage_next_page_(DrawBuffer& buf) {
+  if (open_ok_ && page_ + 1 < wgb_.page_count(layout_))
+    load_page_(buf, layout_, page_ + 1);
+}
+
+bool ReaderScreen::page_has_image_() const {
+  WgbPageView v(page_buf_, page_len_);
+  uint8_t tag;
+  while (v.peek(tag)) {
+    if (tag == kWgbItemImage)
+      return true;
+    v.skip();
+  }
+  return false;
+}
+
+// Draw the page after the current one into the offscreen buffer, while the
+// panel is still running this page's waveform.
 //
-// The next forward turn then costs a memcpy and an SPI write: no layout, no
-// glyph blitting. It is the same idea as the quick-menu snapshot, applied
-// forwards, and it is free in power terms because the CPU would otherwise be
-// idle waiting for the waveform.
-//
-// Restoring state afterwards is the fiddly part. render_page_() works on page_
-// and page_pos_, so the next page is made current for the duration of the draw
-// and then put back. `page_` keeps only positional metadata either way — its
-// LayoutWord::text pointers into WgbChapterSource's 32-slot paragraph window are
-// dead the moment the window slides, which is exactly what laying out the next
-// page does. See "Page-turn latency" in docs/display.md.
-void ReaderScreen::prerender_next_page_(DrawBuffer& buf, IRuntime& runtime) {
+// The next forward turn then costs a memcpy and an SPI write: no glyph
+// blitting. It is free in power terms because the CPU would otherwise be idle
+// waiting for the waveform. See "Page-turn latency" in docs/display.md.
+void ReaderScreen::prerender_next_page_(DrawBuffer& buf) {
   predrawn_.valid = false;
-  if (!open_ok_ || !chapter_src_ || page_.at_chapter_end)
-    return;  // a chapter crossing needs load_chapter_(); not worth doing speculatively
-
-  // Same step as next_page_(), so the drawn page is the one the next turn will
-  // ask for.
-  PagePosition next = layout_engine_.next_page_start(page_pos_, page_.end);
-  if (next == page_pos_)
+  predraw_after_idle_ = false;
+  if (!open_ok_ || page_ + 1 >= wgb_.page_count(layout_))
     return;
-
-  // **Bail out before laying anything out when there is no spare to draw into.**
-  // The whole point of this function is to have the next page *drawn* by the
-  // time the user asks for it; without the spare the draw cannot happen, and
-  // the layout below is speculative work whose only product is a cached page.
-  //
-  // It used to fall through to begin_offscreen() at the draw step instead, so
-  // with a radio up — which is exactly when the spare is released — every
-  // forward turn still paid a full speculative layout and cached its result.
-  // That is a whole page's worth of line and word vectors allocated on a heap
-  // that has none to spare, and it is where split_words' reserve threw
-  // std::bad_alloc (an abort, with exceptions off).
-  if (!buf.can_offscreen())
+  // Only what stage_next_page_ already read: reading now would put card
+  // traffic under the running waveform.
+  if (!loaded_.valid || loaded_.layout != layout_ || loaded_.index != page_ + 1)
     return;
-
-  // **Skip the speculative page when the heap is low.** This whole function is
-  // an optimisation — it lays out and draws the *next* page so a forward turn
-  // is a memcpy — but it doubles the layout memory live at once, and on a book
-  // with long paragraphs (the Odyssey) that is what tips the device over:
-  // free heap fell 51 KB -> 14 KB within three page turns and the next
-  // allocation aborted, with this function on the stack every time.
-  //
-  // Skipping costs a slower page turn. Not skipping costs a reboot mid-book,
-  // so the trade is not close. The threshold is well above one page's layout
-  // so that the *real* page after this one still has room.
-  if (runtime.largest_free_block_bytes() < kPrerenderMinBlockBytes)
-    return;
-
-  const PagePosition cur_pos = page_pos_;
-  const PageContent cur_meta{{}, {}, page_.start, page_.end, page_.at_chapter_end};
-
-  layout_engine_.set_position(next);
-  PageContent pc = layout_engine_.layout();
-
-  // Drawing an image reads the book off the SD card, and the card shares SPI2
-  // with the panel — draw_image_() therefore drains the waveform first. Doing
-  // that *here* would block the UI loop for the couple of hundred milliseconds
-  // the page we just showed is still painting, so an image page gets its layout
-  // cached and nothing more. Text pages, which is nearly all of them, are drawn.
-  bool has_image = false;
-  for (const auto& ci : pc.items) {
-    if (std::get_if<PageImageItem>(&ci)) {
-      has_image = true;
-      break;
-    }
-    if (const PageTextItem* ti = std::get_if<PageTextItem>(&ci)) {
-      if (ti->inline_image.has_value()) {
-        has_image = true;
-        break;
-      }
-    }
-  }
-
-  page_pos_ = next;
-  cache_page_(std::move(pc));
-
-  // No spare (released to the heap for the BLE stack) means no pre-draw — the
-  // layout above is still cached, so the turn is a normal render rather than a
-  // memcpy. Must not fall through: begin_offscreen would otherwise leave
-  // draw_target_ pointing at the live buffer.
-  // **Re-check before drawing.** The layout above is itself the largest
-  // allocation this function makes, so the guard at the top of the function was
-  // testing the heap as it stood *before* the speculative page existed. Drawing
-  // now runs render_page_, which allocates again — and if its own guard fires it
-  // drops the page cache this function just filled, so the draw re-lays the same
-  // page out with even less room. Bail instead: the layout stays cached, so the
-  // next turn is a normal render rather than a memcpy.
-  if (runtime.largest_free_block_bytes() < kLayoutMinBlockBytes) {
-    page_ = cur_meta;
-    page_pos_ = cur_pos;
-    layout_engine_.set_position(cur_pos);
+  // An image page needs the card to draw, and the card shares SPI2 with the
+  // panel: draw it on the first frame after the waveform instead (update()).
+  // The loop runs frames while the panel is busy, so that frame comes ~25 ms
+  // after the refresh ends — long before the reader turns again.
+  if (page_has_image_() && buf.display().is_busy()) {
+    predraw_after_idle_ = true;
     return;
   }
-
-  if (!has_image && buf.begin_offscreen()) {
-    in_prerender_draw_ = true;
-    render_page_(buf);  // consumes the cached layout and draws into the spare buffer
-    in_prerender_draw_ = false;
-    buf.end_offscreen();
-
-    predrawn_.valid = true;
-    predrawn_.chapter_idx = chapter_idx_;
-    predrawn_.request = next;  // pre-resolve, which is what next_page_() will produce
-    predrawn_.start = page_.start;
-    predrawn_.end = page_.end;
-    predrawn_.at_chapter_end = page_.at_chapter_end;
-    predrawn_.opts = last_opts_;
-    predrawn_.font_size_idx = reader_settings_.font_size_idx;
-  }
-
-  page_ = cur_meta;
-  page_pos_ = cur_pos;
-  layout_engine_.set_position(cur_pos);
+  if (!buf.begin_offscreen())
+    return;
+  draw_page_(buf);
+  buf.end_offscreen();
+  predrawn_ = PreDrawn{true, layout_, page_ + 1};
 }
 
 // Put the pre-drawn page on screen instead of rendering it. Returns false for any
@@ -448,191 +423,58 @@ void ReaderScreen::prerender_next_page_(DrawBuffer& buf, IRuntime& runtime) {
 bool ReaderScreen::take_predrawn_(DrawBuffer& buf) {
   if (!predrawn_.valid || !buf.has_offscreen())
     return false;
-  if (predrawn_.chapter_idx != chapter_idx_ || !(predrawn_.request == page_pos_))
-    return false;
-  if (predrawn_.font_size_idx != reader_settings_.font_size_idx)
-    return false;
-  const bool landscape = buf.rotation() == Rotation::Deg0;
-  PageOptions opts = make_page_opts(buf.width(), buf.height());
-  opts.padding_bottom = bottom_padding_(landscape);
-  if (!(predrawn_.opts == opts))
+  if (predrawn_.layout != wanted_layout_(buf) || predrawn_.layout != layout_ || predrawn_.index != page_)
     return false;
   if (!buf.commit_offscreen())
     return false;
-
-  page_ = PageContent{{}, {}, predrawn_.start, predrawn_.end, predrawn_.at_chapter_end};
-  page_pos_ = predrawn_.start;
-  last_opts_ = opts;
   predrawn_.valid = false;
   return true;
 }
 
-
-void ReaderScreen::cache_page_(PageContent&& pc) {
-  page_cache_.valid = true;
-  page_cache_.chapter_idx = chapter_idx_;
-  page_cache_.pos = pc.start;
-  page_cache_.opts = last_opts_;
-  page_cache_.font_size_idx = reader_settings_.font_size_idx;
-  page_cache_.page = std::move(pc);
-}
-
-bool ReaderScreen::take_cached_page_(const PagePosition& pos, const PageOptions& opts) {
-  if (!page_cache_.valid || page_cache_.chapter_idx != chapter_idx_ || !(page_cache_.pos == pos) ||
-      !(page_cache_.opts == opts) || page_cache_.font_size_idx != reader_settings_.font_size_idx)
-    return false;
-  // Move, never copy: LayoutWord::text points into WgbChapterSource's paragraph
-  // window, so only one PageContent may be live at a time.
-  page_ = std::move(page_cache_.page);
-  page_cache_ = LaidOutPageCache{};
-  return true;
-}
-
-void ReaderScreen::load_chapter_(size_t idx) {
-  // Rebuilding the source frees every paragraph slot the cached page's words point
-  // into. Nothing in the key can detect that, so it has to be dropped explicitly.
-  page_cache_ = LaidOutPageCache{};
-  history_.clear();
-  chapter_src_.reset();
-  if (idx < wgb_.chapter_count()) {
-    chapter_src_ = std::make_unique<WgbChapterSource>(wgb_, static_cast<uint16_t>(idx));
-    chapter_idx_ = idx;
-    layout_engine_.set_source(*chapter_src_);
-  }
-}
-
 void ReaderScreen::render_page_(DrawBuffer& buf) {
+  sync_layout_(buf);
+  // A record that does not read draws as a blank page (no error text, by rule).
+  if (!load_page_(buf, layout_, page_))
+    page_len_ = 0;
+  draw_page_(buf);
+}
+
+void ReaderScreen::draw_page_(DrawBuffer& buf) {
   const int W = buf.width();
   const int H = buf.height();
-
-  // start() refuses to open a book without the font set, so it is always here.
-  BitmapFontSet& fset = const_cast<BitmapFontSet&>(*ext_font_set_);
-  fset.set_base_size_index(reader_settings_.font_size_idx);
-  IFont& font = fset;
-
-  const bool landscape = buf.rotation() == Rotation::Deg0;
-  PageOptions opts = make_page_opts(W, H);
-  opts.padding_bottom = bottom_padding_(landscape);
-  layout_engine_.set_font(font);
-  layout_engine_.set_options(opts);
-  last_opts_ = opts;
-  // Step back one page on a fresh open (config::kResumeOnePageBack). It has to
-  // land here rather than in start(): prev_page_() runs a backward layout, and
-  // the engine has no font or options until the two calls above.
-  if (resume_back_pending_) {
-    resume_back_pending_ = false;
-    resume_one_page_back_();
-  }
-  // resolve_stable_position can move page_pos_, so the cache is keyed on the
-  // resolved value — checking before this point would match the wrong page.
-  page_pos_ = layout_engine_.resolve_stable_position(page_pos_);
-  layout_engine_.set_position(page_pos_);
-
-  const bool cached = take_cached_page_(page_pos_, opts);
-  if (!cached) {
-    // **Last line of defence before laying out.** Exceptions are off, so a
-    // std::bad_alloc inside layout is an abort() — the device reboots mid-book
-    // with no message, which is what reading with the clicker connected did.
-    // There is no way to recover after the fact, so the only option is to check
-    // before allocating.
-    //
-    // Everything dropped here is a cache that rebuilds on demand, so the cost is
-    // a slower page turn. The page still renders.
-    // Not while drawing a speculative page: prerender_next_page_ has already
-    // made this check and put the layout it wants in page_cache_, so dropping
-    // the cache here would make it lay the same page out again with less room
-    // than the check was made against — the opposite of what the guard is for.
-    if (!in_prerender_draw_ && runtime_) {
-      const uint32_t block = runtime_->largest_free_block_bytes();
-      // **Two stages, because one threshold kept being not quite enough.** The
-      // failures have all been small allocations (192, 256, 1212, 1416 bytes) on
-      // a fragmented heap, which means the margin was thinner than any single
-      // number predicted. Shedding early and cheaply is better than shedding
-      // late and completely.
-      if (block < kLayoutShedBlockBytes) {
-        // Mild pressure: give back the speculative page and the one-page cache.
-        // Both are pure latency optimisations and cost nothing to rebuild.
-        page_cache_ = LaidOutPageCache{};
-        predrawn_.valid = false;
-      }
-      if (block < kLayoutMinBlockBytes) {
-        // Real pressure: also hand back the paragraph cache and stop it
-        // refilling. This is the state the reader runs in with a radio up.
-        layout_engine_.release_cache_memory();
-        layout_engine_.set_cache_limit(1);
-        // The spare framebuffer is deliberately *not* released here. It is 48 KB
-        // and tempting, but render_page_ can be reached from inside an offscreen
-        // draw, and freeing the buffer being drawn into is worse than the abort
-        // this is preventing. Application::release_ram_for_radio() is where the
-        // spare is given back, on a path that owns the whole frame.
-      }
-    }
-    page_ = layout_engine_.layout();
-  }
-
-  // ─────────────────────────────────
-  struct ImageToDraw {
-    uint16_t key;
-    int x, y, w, h;
-    uint32_t offset;
-    uint32_t size;
-    uint16_t src_y = 0;
-    uint16_t clip_h = 0;  // rendered slice height (0 = full)
-  };
-  std::vector<ImageToDraw> images;
-  auto collect_img = [&](const PageImageItem& img_item) {
-    const int img_w = static_cast<int>(img_item.width);
-    const int img_h = static_cast<int>(img_item.height);
-    if (img_w <= 0 || img_h <= 0)
-      return;
-    if (img_item.key >= wgb_.image_count())
-      return;
-    ImageToDraw itd;
-    itd.key = img_item.key;
-    itd.x = static_cast<int>(img_item.x_offset);
-    itd.y = static_cast<int>(img_item.y_offset);  // y_offset is absolute (vertical centering baked in)
-    itd.w = img_w;
-    // Use full_height as max_h so the decoder scales to the correct aspect ratio;
-    // src_y crops to the visible slice within that full render.
-    itd.h = img_item.full_height > 0 ? static_cast<int>(img_item.full_height) : img_h;
-    itd.offset = wgb_.image_ref(img_item.key).data_offset;
-    itd.size = wgb_.image_ref(img_item.key).data_size;
-    itd.src_y = img_item.y_crop;
-    // Clip rendered rows to the slice height so the image doesn't overflow past
-    // its layout-assigned area (e.g. into the page number zone or page N+1).
-    itd.clip_h = static_cast<uint16_t>(img_h);
-    images.push_back(itd);
-  };
-  for (const auto& ci : page_.items) {
-    if (const PageImageItem* img = std::get_if<PageImageItem>(&ci)) {
-      collect_img(*img);
-    } else if (const PageTextItem* ti = std::get_if<PageTextItem>(&ci)) {
-      if (ti->inline_image.has_value())
-        collect_img(*ti->inline_image);
-    }
-  }
-
-  // ── BW rendering
-  // ────────────────────────────────────────────────────────
   buf.fill(true);
 
-  render_text_(buf, fset, reader_settings_.h_padding());
-
-  for (const auto& hr : page_.items) {
-    const PageHrItem* h = std::get_if<PageHrItem>(&hr);
-    if (!h)
-      continue;
-    const int hr_y = static_cast<int>(h->y_offset) + static_cast<int>(h->height) / 2;
-    buf.fill_rect(static_cast<int>(h->x_offset), hr_y - 1, static_cast<int>(h->width), 2, false);
-  }
-
-  for (const auto& itd : images) {
-    if (!draw_image_(itd.offset, itd.size, buf, itd.x, itd.y, static_cast<uint16_t>(itd.w),
-                     static_cast<uint16_t>(itd.h), itd.src_y, itd.clip_h)) {
-      // Leave the space blank rather than filling it black — a book whose image
-      // failed to rasterise at conversion time has a zero-size entry here, and a
-      // black slab per figure is far worse than white space.
-      buf.fill_rect(itd.x, itd.y, itd.w, itd.h, true);
+  // Items are stored in draw order (lines, rules, images); a malformed list
+  // just stops drawing where it goes wrong.
+  WgbPageView v(page_buf_, page_len_);
+  uint8_t tag;
+  while (v.peek(tag)) {
+    if (tag == kWgbItemLine) {
+      WgbLine line;
+      if (!v.read_line(line))
+        break;
+      buf.draw_baked_line(line, v.end(), *ext_font_set_, false);
+    } else if (tag == kWgbItemRule) {
+      WgbRule r;
+      if (!v.read_rule(r))
+        break;
+      buf.fill_rect(r.x, r.y + r.h / 2 - 1, r.w, 2, false);
+    } else if (tag == kWgbItemImage) {
+      WgbImage img;
+      if (!v.read_image(img))
+        break;
+      // The image table is on the card: wait the waveform out before reading it.
+      buf.wait_panel_idle();
+      WgbImageRef ref;
+      if (!wgb_.image_ref(img.key, ref) ||
+          !draw_image_(ref.data_offset, ref.data_size, buf, img.x, img.y, img.w, img.full_h, img.src_y, img.clip_h)) {
+        // Leave the space blank rather than filling it black — a book whose image
+        // failed to rasterise at conversion time has a zero-size entry here, and a
+        // black slab per figure is far worse than white space.
+        buf.fill_rect(img.x, img.y, img.w, img.full_h, true);
+      }
+    } else {
+      break;
     }
   }
 
@@ -643,145 +485,34 @@ void ReaderScreen::render_page_(DrawBuffer& buf) {
     buf.fill_rect(0, H - kLowBatteryBarH, W, kLowBatteryBarH, false);
 }
 
-uint16_t ReaderScreen::bottom_padding_(bool landscape) {
-  return static_cast<uint16_t>(ReaderSettings::bottom_margin() + ReaderSettings::v_padding() +
-                               (landscape ? 2 : 0));
-}
-
-void ReaderScreen::render_text_(DrawBuffer& buf, const BitmapFontSet& fset, int left_padding) {
-  for (const auto& ci : page_.items) {
-    const PageTextItem* item = std::get_if<PageTextItem>(&ci);
-    if (!item)
-      continue;
-    const int baseline_y = static_cast<int>(item->y_offset) + item->baseline;
-    buf.draw_layout_line(left_padding, baseline_y, item->line, fset, false);
-  }
-}
-
 bool ReaderScreen::next_page_() {
-  if (page_.at_chapter_end) {
-    if (chapter_idx_ + 1 < wgb_.chapter_count()) {
-      load_chapter_(chapter_idx_ + 1);
-      page_pos_ = PagePosition{0, 0};
-      return true;
-    }
+  if (page_ + 1 >= wgb_.page_count(layout_))
     return false;
-  }
-  // A page ending mid-image snaps back so the next page shows the whole image
-  // (not when the image started this page — that would never advance).
-  PagePosition next = layout_engine_.next_page_start(page_pos_, page_.end);
-  history_.push(layout_engine_.epoch(), page_pos_, next);
-  page_pos_ = next;
+  ++page_;
   return true;
 }
-
 
 bool ReaderScreen::prev_page_() {
-  if (page_pos_ == PagePosition{0, 0}) {
-    if (chapter_idx_ > 0) {
-      load_chapter_(chapter_idx_ - 1);
-      // Jump to the last page of the previous chapter using backward layout.
-      const uint16_t end_para = static_cast<uint16_t>(chapter_src_->paragraph_count());
-      layout_engine_.set_position(PagePosition{end_para, 0});
-      auto pc = layout_engine_.layout_backward();
-      page_pos_ = pc.start;
-      cache_page_(std::move(pc));
-      return true;
-    }
+  if (page_ == 0)
     return false;
-  }
-
-  // If the current page starts mid-image, snap end to the bottom of that image
-  // so layout_backward produces the page ending at the image bottom — which
-  // naturally includes the full image (rows 0..end) plus whatever text fits above.
-  const PagePosition cur_start = page_pos_;
-
-  // **Same pre-check render_page_ makes, for the same reason.** A backward turn
-  // lays out at least one page and the resync below can lay out three more, and
-  // none of that was guarded — a `std::bad_alloc` here is an abort() and a reboot
-  // mid-book, which is exactly what scrolling back through a book with the
-  // clicker connected produced. The caches dropped are rebuilt on demand.
-  const bool heap_tight = runtime_ && runtime_->largest_free_block_bytes() < kLayoutMinBlockBytes;
-  if (heap_tight) {
-    page_cache_ = LaidOutPageCache{};
-    predrawn_.valid = false;
-    layout_engine_.release_cache_memory();
-    layout_engine_.set_cache_limit(1);
-  }
-
-  // Retracing a forward turn: the exact page the reader came from, one layout.
-  PagePosition back_to;
-  if (history_.pop_to(layout_engine_.epoch(), page_pos_, &back_to)) {
-    layout_engine_.set_position(back_to);
-    PageContent pc = layout_engine_.layout();
-    page_pos_ = pc.start;
-    cache_page_(std::move(pc));
-    return true;
-  }
-
-  PagePosition end = layout_engine_.snap_to_image_end(page_pos_);
-  layout_engine_.set_position(end);
-  auto pc = layout_engine_.layout_backward();
-
-  // Forward and backward now share one line-fitting rule (see
-  // require_full_height in TextLayout), which removed the systematic
-  // disagreement. What is left is structural: a page ending at a PageBreak, or
-  // at the end of a chapter's content, can legitimately be reached from several
-  // starts, and backward picks the fullest rather than the one the reader came
-  // from. Left alone that still *skips text* — measured at 1-2 places per book.
-  //
-  // Resolve it by stepping back one further page for an anchor, then walking
-  // forward and keeping the last page that ends at or before cur_start. Forward
-  // is deterministic, so from a start that precedes the true predecessor it
-  // lands on it exactly.
-  //
-  // **Bounded on purpose.** Anchoring at the chapter start instead also works
-  // and gives perfect agreement, but walking the chapter drags
-  // WgbChapterSource's 32-slot paragraph window across it and peaked around
-  // 31 KB — with the clicker resident that reintroduced the heap abort, and it
-  // put a per-chapter walk on the book-open path. One extra step back costs one
-  // layout_backward and at most three forward boundary collections, and removes
-  // every skip across all four test books.
-  //
-  // **Skipped entirely when the heap is tight.** It is a refinement — backward's
-  // own answer is a real page, just occasionally not the one the reader came
-  // from — and it is the most allocation-hungry part of a backward turn.
-  if (!heap_tight) {
-    const PagePosition best = layout_engine_.predecessor_start(cur_start, pc.start, kPrevPageProbeLimit);
-    if (!(best == pc.start)) {
-      layout_engine_.set_position(best);
-      pc = layout_engine_.layout();
-    }
-  }
-
-  page_pos_ = pc.start;
-  // The page we just navigated to is fully laid out right here. Keep it instead of
-  // making render_page_ lay out the identical page a second time.
-  cache_page_(std::move(pc));
+  --page_;
   return true;
 }
 
-// Step back one page on a fresh open so the last page read is shown again.
-// Driven by resume_back_pending_, which start() sets and render_page_ consumes
-// once the layout engine has a font and options. Every wake reaches this —
-// deep-sleep wake is a full boot.
-//
-// prev_page_() is reused rather than reimplemented: it already handles the
-// chapter crossing, the mid-image snap, and caching the laid-out page so
-// render_page_() does not lay the same page out twice. Its own guard covers the
-// very start of the book (page_pos_ {0,0} in chapter 0 → false, no move).
-void ReaderScreen::resume_one_page_back_() {
-  if (!open_ok_ || !chapter_src_)
-    return;
-  // Note `page_` is not populated yet — render_page_() runs after this — so the
-  // end-of-book test cannot use page_.at_chapter_end. The saved position being
-  // at the very start is handled by prev_page_() itself, which returns false
-  // without moving. The end of the book needs no guard either: a saved position
-  // is the *start* of the last page, so there is always a page behind it.
-  prev_page_();
-  // Keep the .pos dedup key matching the file, not the page now shown, so this
-  // does not walk the bookmark backwards one page per wake when nothing is read.
-  // save_position_() writes only if the position moves past it.
+int ReaderScreen::chapter_progress_pct_(const std::vector<uint32_t>& chapter_pages) const {
+  uint32_t first = 0;
+  uint32_t end = wgb_.page_count(layout_);
+  for (uint32_t p : chapter_pages) {
+    if (p <= page_)
+      first = p;
+    else if (p < end) {
+      end = p;
+      break;
+    }
+  }
+  if (end <= first || page_ + 1 >= end)
+    return 100;
+  return static_cast<int>(static_cast<uint64_t>(page_ - first) * 100u / (end - first));
 }
 
 // ---------------------------------------------------------------------------
@@ -791,43 +522,43 @@ void ReaderScreen::resume_one_page_back_() {
 void ReaderScreen::save_position_() {
   if (pos_path_.empty())
     return;
+  WgbPage p;
+  if (!wgb_.page(layout_, page_, p))
+    return;
   // Skip the write when the position has not moved since it was loaded or last
   // written — opening a book and backing straight out, or paging forward and
-  // back to where you started, then costs the card nothing. The file is four
-  // numbers but a flash erase block is not.
-  const PosKey now{chapter_idx_, page_pos_.paragraph, page_pos_.offset, page_pos_.text_offset};
+  // back to where you started, then costs the card nothing.
+  const PosKey now{p.para_offset, p.text_offset};
   if (pos_written_valid_ && now == pos_written_)
     return;
   FILE* f = std::fopen(pos_path_.c_str(), "w");
   if (!f)
     return;
-  // Position only: chapter, paragraph, offset, text offset. Reading statistics
-  // are not tracked at all, so nothing else needs persisting.
-  std::fprintf(f, "%u %u %u %u\n", static_cast<unsigned>(chapter_idx_),
-               static_cast<unsigned>(page_pos_.paragraph), static_cast<unsigned>(page_pos_.offset),
-               static_cast<unsigned>(page_pos_.text_offset));
+  // Where the page starts, independent of font size and rotation: the
+  // paragraph record's offset in the WGB and the text offset within it.
+  std::fprintf(f, "%u %u\n", static_cast<unsigned>(now.para_offset), static_cast<unsigned>(now.text_offset));
   if (std::fclose(f) == 0) {
     pos_written_ = now;
     pos_written_valid_ = true;
   }
 }
 
-void ReaderScreen::load_position_() {
+bool ReaderScreen::load_position_(PosKey& out) {
   if (pos_path_.empty())
-    return;
+    return false;
   FILE* f = std::fopen(pos_path_.c_str(), "r");
   if (!f)
-    return;
-  unsigned ch = 0, para = 0, line = 0, to = 0;
-  const int scanned = std::fscanf(f, "%u %u %u %u", &ch, &para, &line, &to);
+    return false;
+  unsigned para = 0, to = 0;
+  const int scanned = std::fscanf(f, "%u %u", &para, &to);
   std::fclose(f);
-  if (scanned >= 3) {
-    saved_chapter_idx_ = ch;
-    saved_page_pos_ = PagePosition{static_cast<uint16_t>(para), static_cast<uint16_t>(line), static_cast<uint32_t>(to)};
-    // Seed the write-dedup key: this is what the file already contains.
-    pos_written_ = PosKey{ch, static_cast<uint16_t>(para), static_cast<uint16_t>(line), to};
-    pos_written_valid_ = true;
-  }
+  if (scanned != 2 || to > 0xFFFF)
+    return false;
+  out = PosKey{static_cast<uint32_t>(para), static_cast<uint16_t>(to)};
+  // Seed the write-dedup key: this is what the file already contains.
+  pos_written_ = out;
+  pos_written_valid_ = true;
+  return true;
 }
 
 }  // namespace wintergreen

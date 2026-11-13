@@ -233,7 +233,7 @@ void ListMenuScreen::draw_list_(DrawBuffer& buf, int W, int H, int header_h) con
       if (get_item_thumb(i, t) && t.bits && t.w > 0 && t.h > 0) {
         const int tx = bx + (thumb_w - t.w) / 2;
         const int ty = by + (thumb_box_h - t.h) / 2;
-        buf.blit_1bit(tx, ty, t.bits, t.w, t.h, (t.w + 7) / 8);
+        buf.blit_1bit_cols(tx, ty, t.bits, t.w, t.h);
       } else {
         buf.fill_rect(bx, by, thumb_w, 1, sel);
         buf.fill_rect(bx, by + thumb_box_h - 1, thumb_w, 1, sel);
@@ -249,6 +249,7 @@ void ListMenuScreen::draw_list_(DrawBuffer& buf, int W, int H, int header_h) con
       buf.fill_rect(0, y + slot_h - 1, W, 1, false);
     y += slot_h;
   }
+  end_thumbs();
 
   // Scrollbar
   if (has_scrollbar) {
@@ -294,24 +295,31 @@ void ListMenuScreen::update(const ButtonState& buttons, DrawBuffer& buf, IRuntim
   while (buttons.next_press(btn)) {
     if (btn == logical_up_front || btn == logical_up_side) {
       if (n > 0) {
+        undo_selected_ = selected_;
         move_up();
         moved = true;
       }
     } else if (btn == logical_down_front || btn == logical_down_side) {
       if (n > 0) {
+        undo_selected_ = selected_;
         move_down();
         moved = true;
       }
     } else {
       switch (btn) {
-        case Button::Button0:
-          // Flush any pending move before back so the screen redraws correctly
-          // if on_back() decides to stay.
-          if (moved) {
-            draw_all_(buf, runtime.battery_percentage());
-            buf.refresh();
-            moved = false;
+        case Button::Undo:
+          if (undo_selected_ >= 0 && undo_selected_ < n && undo_selected_ != selected_) {
+            selected_ = undo_selected_;
+            ensure_visible_();
+            moved = true;
           }
+          undo_selected_ = -1;
+          break;
+
+        case Button::Button0:
+          // Back first, draw after: a pending move (an Undo from a clicker
+          // hold) must not cost a refresh of a screen that is about to go. If
+          // on_back() stays, `moved` still draws it below.
           on_back();
           if (app_ && app_->has_pending_transition()) {
             return;

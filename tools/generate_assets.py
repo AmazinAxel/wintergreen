@@ -66,16 +66,12 @@ if len(blob) < 8:
 font = zlib.decompress(blob[4:])
 if len(font) != raw_size:
     _fail("font size prefix says %d, inflated %d" % (raw_size, len(font)))
-if font[:4] != b"WGFS":
-    _fail("inflated font does not start with WGFS")
 _check_fits("font", font)
 
 # --- sleep: raw MGR2, copied verbatim ---------------------------------------
 src = os.path.join(PROJECT_DIR, "resources", "sleep.mgr")
 with open(src, "rb") as f:
     sleep = f.read()
-if sleep[:4] != b"MGR2":
-    _fail("%s does not start with MGR2" % src)
 _check_fits("sleep", sleep)
 
 images = []

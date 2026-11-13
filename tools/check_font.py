@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Validate a WGF1 blob / WGFS bundle the way BitmapFont.h parses it.
+"""Validate a WGFS bundle (compressed, or raw from --raw-out) the way BitmapFont.h parses it.
 
 Catches layout mistakes that would silently render blank on device. Also draws
 a sample string so the rasterization can be eyeballed without a flash.
@@ -12,15 +12,17 @@ import sys
 import zlib
 
 
-HEADER_SIZE = 49
+HEADER_SIZE = 45
 STYLE_NAMES = ["Regular", "Bold", "Italic", "BoldItalic"]
 
 def load(path):
+    """No magic: a [u32 size][zlib] file inflates; anything else is a raw bundle."""
     raw = open(path, "rb").read()
-    if raw[:4] in (b"WGFS", b"WGF1"):
+    try:
+        out = zlib.decompress(raw[4:])
+    except zlib.error:
         return raw
     size = struct.unpack_from("<I", raw, 0)[0]
-    out = zlib.decompress(raw[4:])
     assert len(out) == size, f"length prefix {size} != actual {len(out)}"
     return out
 
@@ -28,12 +30,11 @@ def load(path):
 class Wgf:
     def __init__(self, d, base=0):
         self.d, self.b = d, base
-        (magic, self.glyph_h, self.baseline, self.yadv, self.dadv,
-         self.style_flags, self.n_ranges, self.n_glyphs, self.nominal) = struct.unpack_from("<IBBBBBHHH", d, base)
-        assert magic == 0x31464757, f"bad magic {magic:#x} (expected WGF1)"
+        (self.glyph_h, self.baseline, self.yadv, self.dadv,
+         self.style_flags, self.n_ranges, self.n_glyphs, self.nominal) = struct.unpack_from("<BBBBBHHH", d, base)
         (self.kern_len, self.bmp_off, self.bold_off, self.italic_off,
-         self.bi_off, self.kern_off, self.lsb_off, self.msb_off) = struct.unpack_from("<8I", d, base + 15)
-        self.ul_pos, self.ul_th = struct.unpack_from("<bB", d, base + 47)
+         self.bi_off, self.kern_off, self.lsb_off, self.msb_off) = struct.unpack_from("<8I", d, base + 11)
+        self.ul_pos, self.ul_th = struct.unpack_from("<bB", d, base + 43)
 
     def style(self, which):
         """(ranges_off, glyphs_off, n_ranges, n_glyphs, kern_len, kern_off)."""
@@ -166,21 +167,16 @@ def main():
     text = sys.argv[2] if len(sys.argv) > 2 else "Wave AVATAR, To fj. “quick”"
     d = load(path)
     ok = True
-    if d[:4] == b"WGFS":
-        n = d[4]
-        sizes = [struct.unpack_from("<I", d, 8 + 4 * i)[0] for i in range(n)]
-        print(f"WGFS: {n} size(s), {len(d):,} bytes")
-        o = 8 + 4 * n
-        for i, s in enumerate(sizes):
-            m = Wgf(d, o)
-            ok &= check(m, f"  [{i}] {s:,}B")
-            o += s
-        m = Wgf(d, 8 + 4 * n)
-        draw(m, text)
-    else:
-        m = Wgf(d, 0)
-        ok &= check(m, path)
-        draw(m, text)
+    n = d[0]
+    sizes = [struct.unpack_from("<I", d, 4 + 4 * i)[0] for i in range(n)]
+    print(f"WGFS: {n} size(s), {len(d):,} bytes")
+    o = 4 + 4 * n
+    for i, s in enumerate(sizes):
+        m = Wgf(d, o)
+        ok &= check(m, f"  [{i}] {s:,}B")
+        o += s
+    m = Wgf(d, 4 + 4 * n)
+    draw(m, text)
     print("OK" if ok else "FAILED")
     sys.exit(0 if ok else 1)
 

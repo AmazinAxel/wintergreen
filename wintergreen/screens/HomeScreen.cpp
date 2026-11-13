@@ -13,8 +13,7 @@ namespace wintergreen {
 
 // Largest bitmap load_cover_ accepts: it never scales beyond the layout box, so
 // this bounds every cover, and it has to fit the spare it is read into.
-static constexpr size_t kCoverBytesMax =
-    static_cast<size_t>((kHomeCoverW + 7) / 8) * kHomeCoverH;
+static constexpr size_t kCoverBytesMax = cover_cols_bytes(kHomeCoverW, kHomeCoverH);
 static_assert(kCoverBytesMax <= DrawBuffer::kBufSize, "home cover must fit the spare framebuffer");
 
 // Filled diamond (a square on its corner), one fill_rect per row. Hard edges —
@@ -65,31 +64,28 @@ static void draw_centred(DrawBuffer& buf, int cx, int baseline, const char* text
   buf.draw_text_proportional(cx - tw / 2, baseline, t.data(), t.size(), f, false);
 }
 
-// Border outline around a rectangle, `t` pixels thick, growing inwards.
-static void draw_outline(DrawBuffer& buf, int x, int y, int w, int h, int t = 1) {
-  if (w <= 0 || h <= 0) return;
-  t = std::min(t, std::min(w, h));
-  buf.fill_rect(x,         y,         w, t, false);
-  buf.fill_rect(x,         y + h - t, w, t, false);
-  buf.fill_rect(x,         y,         t, h, false);
-  buf.fill_rect(x + w - t, y,         t, h, false);
-}
-
 void HomeScreen::load_cover_(DrawBuffer& buf, int i, int box_w, int box_h) const {
   cover_slot_ = i;
   cover_w_ = cover_h_ = 0;
   cover_bits_ = nullptr;
-  if (i < 0 || i >= num_books_ || slots_[i].home_path.empty())
+  if (i < 0 || i >= num_books_)
     return;
-  FILE* f = std::fopen(slots_[i].home_path.c_str(), "rb");
+  // cover_home.bin beside the book, built on the stack (CoverPaths.cpp's rule).
+  const std::string_view p = slots_[i].path;
+  const size_t slash = p.rfind('/');
+  static constexpr char kName[] = "/cover_home.bin";
+  char path[320];
+  if (slash == std::string_view::npos || slash + sizeof(kName) > sizeof(path))
+    return;
+  std::memcpy(path, p.data(), slash);
+  std::memcpy(path + slash, kName, sizeof(kName));
+  FILE* f = std::fopen(path, "rb");
   if (!f)
     return;
   uint16_t hdr[2] = {};
   bool ok = std::fread(hdr, 2, 2, f) == 2 && hdr[0] > 0 && hdr[1] > 0 && hdr[0] <= box_w && hdr[1] <= box_h;
-  const size_t need = ok ? static_cast<size_t>((hdr[0] + 7) / 8) * hdr[1] : 0;
+  const size_t need = ok ? cover_cols_bytes(hdr[0], hdr[1]) : 0;
   ok = ok && need <= kCoverBytesMax;
-  // Claimed after the last allocation (newlib takes the FILE buffer on the
-  // first fread), so the OOM handler cannot release it between here and use.
   uint8_t* dst = ok ? buf.claim_spare_cache(this) : nullptr;
   // Exactly the declared size: anything else is not a cover (a truncated
   // download, or an HTML error page saved under the name).
@@ -123,8 +119,8 @@ void HomeScreen::on_start() {
   for (int i = 0; i < kMaxBooks; ++i)
     slots_[i] = BookSlot{};
   // slots_ is about to be rebuilt from the book index, so a cached slot index
-  // is meaningless even where the number is unchanged — a sync or a serial
-  // upload reorders the recents under us.
+  // is meaningless even where the number is unchanged — a sync reorders the
+  // recents under us.
   cover_slot_ = -1;
   cover_bits_ = nullptr;
   cover_w_ = cover_h_ = 0;
@@ -193,11 +189,10 @@ void HomeScreen::on_start() {
   clear_items();
   for (int i = 0; i < num_books_; ++i) {
     const BookIndexEntry& e = entries[chosen[i]];
-    slots_[i].path = e.path.to_string(pool);
-    slots_[i].title.assign(e.title.view(pool));
-    slots_[i].author.assign(e.author.view(pool));
-    slots_[i].home_path = cover_home_bin_path(slots_[i].path.c_str());
-    add_item(slots_[i].title);
+    slots_[i].path = e.path.view(pool);
+    slots_[i].title = e.title.view(pool);
+    slots_[i].author = e.author.view(pool);
+    add_item_view(slots_[i].title);
   }
 
   // The book just closed is now first, and on a cold boot the first entry is the
@@ -207,8 +202,9 @@ void HomeScreen::on_start() {
 
 void HomeScreen::on_select(int index) {
   if (!app_ || index < 0 || index >= num_books_) return;
-  app_->record_book_opened(slots_[index].path);
-  app_->reader()->set_path(slots_[index].path.c_str());
+  const std::string path(slots_[index].path);  // once per open, not per visit
+  app_->record_book_opened(path);
+  app_->reader()->set_path(path.c_str());
   app_->push_screen(ScreenId::Reader);
 }
 
@@ -269,9 +265,13 @@ void HomeScreen::update(const ButtonState& buttons, DrawBuffer& buf, IRuntime& r
   }
 
   if (back_down) {
+    // The first down frame counts nothing: its dt can be a whole idle wait
+    // from before the press (see HoldRepeat::tick).
+    const bool first_down = !back_was_down_;
     back_was_down_ = true;
     if (!back_consumed_) {
-      back_hold_ms_ += runtime.frame_time_ms();
+      if (!first_down)
+        back_hold_ms_ += runtime.frame_time_ms();
       // The hidden list opens as soon as the hold is long enough, without
       // waiting for the release. Safe because presses are rising edges only:
       // MainMenu sees no Button0 event from a button that was already down when
@@ -365,7 +365,7 @@ void HomeScreen::draw_all_(DrawBuffer& buf, std::optional<uint8_t> battery_pct) 
   if (have_cover_(buf)) {
     const int cx = kPad + (box_w - cover_w_) / 2;
     const int cy = box_y + (box_h - cover_h_) / 2;
-    buf.blit_1bit(cx, cy, cover_bits_, cover_w_, cover_h_, (cover_w_ + 7) / 8);
+    buf.blit_1bit_cols(cx, cy, cover_bits_, cover_w_, cover_h_);
     draw_outline(buf, cx - inset, cy - inset, cover_w_ + 2 * inset, cover_h_ + 2 * inset, kFrameW);
   } else {
     // No cover on the card — a placeholder box keeps the layout intact.
@@ -379,7 +379,7 @@ void HomeScreen::draw_all_(DrawBuffer& buf, std::optional<uint8_t> battery_pct) 
   // Only the lines actually drawn advance y, so the author always sits directly
   // under the last line of the title rather than under a reserved second line.
   {
-    const std::string& t = slots_[sel].title;
+    const std::string_view t = slots_[sel].title;
     size_t off = 0;
     for (int line = 0; line < 2; ++line) {
       if (off >= t.size()) break;
@@ -402,7 +402,7 @@ void HomeScreen::draw_all_(DrawBuffer& buf, std::optional<uint8_t> battery_pct) 
 
   // ── Author ───────────────────────────────────────────────────────────────
   y += kAuthorGap;
-  const std::string& a = slots_[sel].author;
+  const std::string_view a = slots_[sel].author;
   if (!a.empty())
     draw_centred(buf, W / 2, y + af.baseline(), a.data(), a.size(), af, W - 2 * kPad);
 

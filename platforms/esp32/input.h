@@ -12,9 +12,6 @@
 #include "bluetooth_clicker.h"
 #include "ui_wake.h"
 
-// Defined in serial_communication.h — serial command button injection.
-extern volatile uint8_t g_serial_buttons;
-
 // ---- Button hardware configuration ----
 //
 // ADC1 channel 1 (GPIO1): 4 buttons via resistor ladder
@@ -82,11 +79,9 @@ class Esp32InputSource final : public wintergreen::IInputSource {
       if (result.press_history_count < wintergreen::ButtonState::kMaxPressHistory)
         result.press_history[result.press_history_count++] = btn_idx;
     }
-    // Merge presses injected from off-device: serial commands, and the BLE
-    // page-turner. Both arrive as edges only — nothing sets `current`, so a
-    // clicker press can never look "held" and drive the auto-repeat.
-    merge_injected_(result, g_serial_buttons);
-    g_serial_buttons = 0;
+    // Merge presses from the BLE page-turner. They arrive as edges only —
+    // nothing sets `current`, so a clicker press can never look "held" and
+    // drive the auto-repeat.
     // The clicker keeps its own ring buffer rather than a mask, so a burst of
     // clicks between two polls arrives as separate presses instead of
     // collapsing into one. Drained the same way as press_queue_ above.
@@ -151,19 +146,6 @@ class Esp32InputSource final : public wintergreen::IInputSource {
   uint8_t press_queue_[kQueueSize] = {};
   uint8_t pq_head_ = 0;  // next read position
   uint8_t pq_tail_ = 0;  // next write position
-
-  // Fold a bitmask of injected presses into a poll result as rising edges.
-  static void merge_injected_(wintergreen::ButtonState& result, uint8_t mask) {
-    if (!mask)
-      return;
-    for (uint8_t i = 0; i < kNumButtons; ++i) {
-      if (mask & static_cast<uint8_t>(1u << i)) {
-        result.pressed_latch |= static_cast<uint8_t>(1u << i);
-        if (result.press_history_count < wintergreen::ButtonState::kMaxPressHistory)
-          result.press_history[result.press_history_count++] = i;
-      }
-    }
-  }
 
   static void sample_timer_cb(void* arg) {
     static_cast<Esp32InputSource*>(arg)->sample();

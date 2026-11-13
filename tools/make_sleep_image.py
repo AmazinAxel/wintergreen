@@ -3,8 +3,7 @@
 
 MGR2 is a tiny 4-level-grayscale format read by DrawBuffer::Mgr2Source_:
 
-    "MGR2"            4 bytes
-    width             uint16 LE
+    width             uint16 LE  (no magic: built and flashed with the firmware)
     height            uint16 LE
     pixel data        2 bits per pixel, row-major, stride = ceil(width / 4),
                       packed MSB-first within each byte:
@@ -126,11 +125,10 @@ def main():
             data[row + (x // 4)] |= lvl << (6 - (x % 4) * 2)
 
     with open(args.output, "wb") as f:
-        f.write(b"MGR2")
         f.write(struct.pack("<HH", w, h))
         f.write(data)
 
-    print(f"{args.output}: {w}x{h}, {8 + len(data):,} bytes")
+    print(f"{args.output}: {w}x{h}, {4 + len(data):,} bytes")
 
 
 if __name__ == "__main__":
