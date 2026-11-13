@@ -19,7 +19,6 @@ class HomeScreen final : public ListMenuScreen {
   HomeScreen() = default;
 
   void draw_all_(DrawBuffer& buf, std::optional<uint8_t> battery_pct = std::nullopt) const override;
-  int get_visible_count_(int H, int scroll_off) const override { return count(); }
 
   void update(const ButtonState& buttons, DrawBuffer& buf, IRuntime& runtime) override;
 

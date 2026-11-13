@@ -562,8 +562,12 @@ def main():
     h.add_argument("--size", type=int, required=True)
     h.add_argument("--symbol", required=True, help="e.g. ui_small -> kFontData_ui_small_wgf")
     h.add_argument("--out", required=True)
+    h.add_argument("--digits", action="store_true", help="only 0-9 (e.g. the quick menu's chapter numbers)")
 
     args = ap.parse_args()
+    if getattr(args, "digits", False):
+        global RANGES
+        RANGES = [(0x0030, 10)]
 
     faces = {}
     kern_sources = {}

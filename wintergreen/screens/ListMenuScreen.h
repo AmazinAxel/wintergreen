@@ -216,13 +216,15 @@ class ListMenuScreen : public IScreen {
   }
 
   virtual void draw_all_(DrawBuffer& buf, std::optional<uint8_t> battery_pct = std::nullopt) const;
-  virtual void ensure_visible_();
+  void ensure_visible_();
   void set_buf_rotation_(Rotation r) { if (buf_) buf_->set_rotation(r); }
-  void center_on_selected_();
 
-  // Returns the number of visual indices visible from scroll_off given screen height H.
-  // Override in subclasses whose draw_all_() uses a custom header or item height.
-  virtual int get_visible_count_(int H, int scroll_off) const;
+  // Scroll offset that puts the selection mid-list, clamped so neither end of
+  // the list leaves the screen part-empty. At the end, `shift` (px) lifts the
+  // list so the last row ends on the panel edge; the top row slides under the
+  // header. Override in subclasses whose draw_all_() lays rows out differently.
+  virtual int centred_offset_(int H, int& shift) const;
+  int scroll_shift() const { return scroll_shift_; }
 
  private:
   std::vector<std::string_view> labels_;
@@ -232,6 +234,7 @@ class ListMenuScreen : public IScreen {
   int selected_ = 0;
   int undo_selected_ = -1;  // cursor before the last press move; Button::Undo returns to it
   int scroll_offset_ = 0;
+  int scroll_shift_ = 0;
   HoldRepeat hold_up_;
   HoldRepeat hold_down_;
   int hold_reps_up_ = 0;    // repeats fired so far this hold; drives the step size

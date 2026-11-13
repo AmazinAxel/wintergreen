@@ -24,7 +24,8 @@ Moved here from `PLAN.md` (deleted 2026-11-12). Owner's call unless noted.
   records and pre-cut titles (sort and `fit_prefix` are sub-ms; would change the API).
 - B1 light-sleep experiment, B2 `min_freq_mhz = 40`: both contradict CLAUDE.md "never
   break" rows.
-- Ammeter only: B3 deep-sleep current, B8 current with the clicker connected.
+- B3 deep-sleep pin holds: removed 2026-11-12 (drain rose; see docs/power-and-input.md).
+- Ammeter only: B8 current with the clicker connected.
 - R8: NimBLE host stack high-water mark never read (task not found by that name).
 - Not flashed: final sync build (47 KB spare as the download buffer; expect ~300 KB/s).
 - Never device-tested: sync started while the clicker is still connecting (code review

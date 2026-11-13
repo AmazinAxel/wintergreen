@@ -16,8 +16,15 @@ namespace wintergreen {
 // spacing and publisher font sizes defer to the book's own CSS.
 inline constexpr uint16_t kReaderHPadding = 12;
 inline constexpr uint16_t kReaderVPadding = 4;
-// Breathing room above the panel edge. Nothing is drawn in it.
-inline constexpr uint16_t kReaderBottomMargin = 6;
+// Height of the low-battery bar ReaderScreen paints along the bottom edge.
+inline constexpr uint16_t kLowBatteryBarH = 5;
+// Deepest glyph extent below the baseline in the reader font (Libron 36 px,
+// any style). The last baseline sits this far above the bar, so descenders
+// never reach it. Font change = re-measure.
+inline constexpr uint16_t kReaderMaxDescender = 10;
+// Last baseline to panel edge: descender room plus the bar. Nothing else is
+// drawn in it.
+inline constexpr uint16_t kReaderBottomMargin = kReaderMaxDescender + kLowBatteryBarH;
 inline constexpr uint16_t kReaderParaSpacing = 8;
 
 // Landscape is Rotation::Deg0 (the panel's native 793 × 480); portrait Deg90.

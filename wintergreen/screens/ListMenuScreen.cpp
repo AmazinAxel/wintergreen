@@ -12,9 +12,6 @@
 namespace wintergreen {
 
 static constexpr int kHeaderBottomGap = 4;  // gap between last header line and first list item
-// Nothing is drawn at the bottom of a list any more — only a breathing margin so
-// the last row isn't flush against the panel edge.
-static constexpr int kBottomPad = 8;
 
 void ListMenuScreen::start(DrawBuffer& buf, IRuntime& runtime) {
   buf_ = &buf;
@@ -28,12 +25,9 @@ void ListMenuScreen::start(DrawBuffer& buf, IRuntime& runtime) {
   // (e.g. returning from a sub-screen after navigating away).
   if (!on_start_set_selection_ && prev_selected > 0 && prev_selected < count())
     selected_ = prev_selected;
-  if (on_start_set_selection_ || selected_ > 0)
-    center_on_selected_();
-  else
-    ensure_visible_();
   while (selected_ < count() && !is_item_focusable(selected_))
     ++selected_;
+  ensure_visible_();
   draw_all_(buf, runtime.battery_percentage());
 }
 
@@ -56,47 +50,45 @@ int ListMenuScreen::wintergreen_visible_from_(int scroll_off, int available_h) c
   return cnt;
 }
 
-int ListMenuScreen::get_visible_count_(int H, int scroll_off) const {
-  return wintergreen_visible_from_(scroll_off, H - header_h_() - kBottomPad);
-}
-
 void ListMenuScreen::ensure_visible_() {
   if (!ui_font_.valid() || count() == 0 || !buf_) return;
-  const int H = buf_->height();
-  int visible = get_visible_count_(H, scroll_offset_);
-  if (visible <= 0) return;
-  if (selected_ < scroll_offset_)
-    scroll_offset_ = selected_;
-  else if (selected_ >= scroll_offset_ + visible)
-    scroll_offset_ = selected_ - visible + 1;
-  // Recompute from the updated offset: separators at different positions mean
-  // the actual count at the new offset can differ from the pre-adjustment count.
-  visible = get_visible_count_(H, scroll_offset_);
-  static constexpr int kPad = 2;
-  if (selected_ - scroll_offset_ < kPad && scroll_offset_ > 0)
-    scroll_offset_ = std::max(0, selected_ - kPad);
-  else if (selected_ - scroll_offset_ > visible - 1 - kPad) {
-    const int max_scroll = count() > visible ? count() - visible : 0;
-    scroll_offset_ = std::min(max_scroll, selected_ - (visible - 1 - kPad));
-  }
+  scroll_offset_ = centred_offset_(buf_->height(), scroll_shift_);
 }
 
-void ListMenuScreen::center_on_selected_() {
-  if (!ui_font_.valid() || count() == 0 || !buf_) return;
-  const int visible = get_visible_count_(buf_->height(), 0);
-  if (visible <= 0) return;
-  const int max_scroll = count() > visible ? count() - visible : 0;
-  scroll_offset_ = std::max(0, std::min(max_scroll, selected_ - visible / 2));
+// Walks up from the selection while whole rows fit in the half above it, then
+// pulls further up while everything from there to the end fits: O(rows on
+// screen), no per-offset recount.
+int ListMenuScreen::centred_offset_(int H, int& shift) const {
+  const int n = count();
+  const int avail = H - header_h_();
+  auto h = [&](int i) { return is_separator(i) ? kSeparatorH : wintergreen_slot_h_(i); };
+  int so = selected_;
+  int room = (avail - h(so)) / 2;
+  while (so > 0 && h(so - 1) <= room)
+    room -= h(--so);
+  int tail = 0;
+  for (int i = so; i < n && tail <= avail; ++i)
+    tail += h(i);
+  while (so > 0 && tail + h(so - 1) <= avail)
+    tail += h(--so);
+  shift = 0;
+  if (so > 0 && tail < avail) {
+    --so;
+    shift = h(so) - (avail - tail);
+  }
+  return so;
 }
 
 void ListMenuScreen::draw_all_(DrawBuffer& buf, std::optional<uint8_t> battery_pct) const {
   const int W = buf.width();
   const int H = buf.height();
   buf.fill(true);
+  draw_list_(buf, W, H, header_h_());
+  if (scroll_shift_)
+    buf.fill_rect(0, 0, W, header_h_(), true);  // covers the lifted top row
   // Battery percentage and nothing else: no wordmark, and no rule under it.
   // Same helper the home screen calls, so the two land on the same pixel.
   draw_battery_(buf, W, battery_pct);
-  draw_list_(buf, W, H, header_h_());
 }
 
 void ListMenuScreen::draw_battery_(DrawBuffer& buf, int W, std::optional<uint8_t> battery_pct) const {
@@ -128,11 +120,10 @@ void ListMenuScreen::draw_list_(DrawBuffer& buf, int W, int H, int header_h) con
   static constexpr int kLM = 14, kRM = 12;
   const int title_h = ui_font_.y_advance();
   const BitmapFont& sub_font = section_font_;
-  const int available_h = H - header_h - kBottomPad;
+  const int available_h = H - header_h;
 
   const int visible = wintergreen_visible_from_(scroll_offset_, available_h);
   if (visible <= 0) return;
-  const int end = std::min(scroll_offset_ + visible, n);
   const bool has_scrollbar = (n > visible);
   const int sb_reserved = has_scrollbar ? 8 : 0;
 
@@ -144,8 +135,10 @@ void ListMenuScreen::draw_list_(DrawBuffer& buf, int W, int H, int header_h) con
   const int thumb_box_h = wintergreen_slot_h_(-1) - 1 - 2 * kThumbPad;
   const int thumb_w = prepare_thumbs(thumb_box_h);
 
-  int y = header_h;
-  for (int i = scroll_offset_; i < end; ++i) {
+  int y = header_h - scroll_shift_;
+  // Runs to the panel edge: a row that only partly fits is drawn clipped, so
+  // the next item shows before it is reached and no row-sized gap sits empty.
+  for (int i = scroll_offset_; i < n && y < H; ++i) {
     const bool sel = (i == selected_);
 
     if (is_separator(i)) {

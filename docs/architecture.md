@@ -100,7 +100,7 @@ to the next row's left cell; up reverses. Every cell has a 1 px box, the selecte
 `ListMenuScreen.h`), never an inverted fill — fewer pixels flip per move, so less ghosting.
 Settings rows keep the inverted selection. Scrolling is item-indexed (base class), but the
 grid always draws and counts whole rows from the row holding `scroll_offset()`
-(`first_grid_row_()`); `get_visible_count_` and `draw_all_` must agree on that.
+(`first_grid_row_()`); `centred_offset_` and `draw_all_` must agree on that.
 
 **Item 0 *is* the header block** — book title, chapter and their two percentages.
 Selecting it pops back to the book. It is **not** the default selection: a power-button
@@ -112,7 +112,7 @@ case, so navigation, wrap-around and `on_select` dispatch work without changes. 
 is *not* is a row: `draw_all_` paints it at the top and inverts the whole block when
 `selected() == kIdxBack`, and the list loop starts at `kIdxBack + 1`. Two places must
 agree that it costs no height, or the last chapter becomes unreachable:
-`get_visible_count_` gives index `kIdxBack` a row height of 0, and `draw_all_`'s `total_h`
+`centred_offset_` gives index `kIdxBack` no line, and `draw_all_`'s `total_h`
 starts from `(settings_end - 1) * row_h_()`.
 
 Its header is drawn entirely by its own `draw_all_` — the base class's card header is
@@ -124,7 +124,7 @@ UI fonts have no kerning) and each carries its
 percentage right-aligned on its **first** line, set in the *same font as the text beside
 it* so the pair reads as one line. The chapter is a size down (`chapter_font_()` =
 `section_font_`). `header_h_()` measures that block from the wrapped lines computed in
-`on_start()`, and `get_visible_count_()` calls it — the two used to re-derive the height
+`on_start()`, and `centred_offset_()` calls it — the two used to re-derive the height
 independently, which is how scroll bugs get in.
 
 A hairline divides settings from chapters, drawn in a `kSeparatorH` gap of its own. Row height is `row_h_()` = the list font's `y_advance()` + padding, not a
@@ -264,7 +264,7 @@ carried its own `kSepH` — 8, 12 and 14.
 
 Row height is per-row, not per-list: `wintergreen_slot_h_(index)` returns the one-line
 height where `is_single_line_row(index)` is true (MainMenu's Sync action) and the
-two-line height otherwise. `wintergreen_visible_from_` asks per index too, so scrolling
+two-line height otherwise. `centred_offset_` asks per index too, so scrolling
 stays consistent with what is drawn.
 
 No screen draws button labels, nav-arrow glyphs or a battery icon: the labelled `Back |
@@ -284,8 +284,8 @@ screen on purpose: when the carousel had its own copy of the maths it drifted by
 pixels in both axes, visible as a jump when moving between screens. Don't reintroduce a
 per-screen `W - pad - pw`.
 
-Drawing is `draw_battery_` → `draw_list_`. `get_visible_count_` and `draw_list_` both
-measure rows through `wintergreen_visible_from_`; keep it that way, divergence causes
+Drawing is `draw_battery_` → `draw_list_`. `centred_offset_` and `draw_list_` both
+measure rows through `wintergreen_slot_h_`; keep it that way, divergence causes
 scroll bugs.
 
 ### Sorting — never use std::sort here

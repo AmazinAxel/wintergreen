@@ -48,7 +48,8 @@ class QuickmenuScreen final : public ListMenuScreen {
                 int book_progress_pct, int chapter_progress_pct);
 
   void draw_all_(DrawBuffer& buf, std::optional<uint8_t> battery_pct = std::nullopt) const override;
-  int get_visible_count_(int H, int scroll_off) const override;
+  int centred_offset_(int H, int& shift) const override;
+  void draw_header_(DrawBuffer& buf, int W) const;
 
   // Row height follows the font rather than being a constant: the list font is
   // the 32 px header face, and the old fixed 28 px was shorter than a line of it.
@@ -66,16 +67,19 @@ class QuickmenuScreen final : public ListMenuScreen {
   static constexpr int kHeaderTop = 16;
   int header_top_() const { return kHeaderTop; }
 
-  // Chapter grid: two columns of boxed numbers inside kLM/kRM. Every cell has a
-  // 1 px box; the selected one a kCellSelW frame (the home cover's frame width),
-  // never an inverted fill — a frame flips far fewer pixels per move. Cells are
-  // a little taller than a settings row.
+  // Chapter grid: two columns of boxed numbers, kCellGap from the sides. Every cell has a
+  // 1 px box; the selected one is filled and its number inverted, exactly as a
+  // selected list row. The gap between cells (both ways) is half the side
+  // margin, the hairline's clearance; the padding above and below the
+  // number's ink is kLM.
+  // Numbers are digit_font_ (40 px Iosevka Slab, digits only); the number is
+  // centred on its ink (glyph_height), not on the line box.
   static constexpr int kGridCols = 2;
-  static constexpr int kCellGap = 8;   // between columns and between rows
-  static constexpr int kCellPadV = 10; // above and below the number
-  static constexpr int kCellSelW = 2;
-  int cell_h_() const { return ui_font_.y_advance() + 2 * kCellPadV; }
+  static constexpr int kCellGap = kLM / 2;
+  static constexpr int kCellPadV = kLM;
+  int cell_h_() const { return digit_font_.glyph_height() + 2 * kCellPadV; }
   int cell_pitch_() const { return cell_h_() + kCellGap; }
+  BitmapFont digit_font_;
 
   // The chapter is a subtitle to the book title: one step down in size, in the
   // same font the settings rows use.

@@ -25,28 +25,20 @@
 // Wake is the power button, level-triggered on LOW.
 static constexpr gpio_num_t kPowerPin = GPIO_NUM_3;
 
-// Chip-selects and the panel reset, driven high and held through deep sleep
-// (B3). Floating, a CS can drift low and select its device, and a floating
-// panel RST can pulse it out of its own deep sleep; either costs current for
-// the whole night. SD_CS is sdcard.h's GPIO12.
-//
-// **Released first thing in app_main.** A hold survives the wake, and a held
-// CS cannot be driven: panel and card would both be dead.
-static constexpr gpio_num_t kSleepHoldPins[] = {GPIO_NUM_12, EPD_CS, EPD_RST};
+// No pin is held through deep sleep. Firmware from 2026-11-11 held SD CS
+// (GPIO12), panel CS and panel RST high; deep-sleep drain rose with it (GPIO12
+// sits in the VDD_SPI pad group). Released first thing in app_main so a device
+// that went to sleep under that firmware gets its pins back: a held CS cannot
+// be driven.
+static constexpr gpio_num_t kOldSleepHoldPins[] = {GPIO_NUM_12, EPD_CS, EPD_RST};
 
 static void release_sleep_holds_() {
   gpio_deep_sleep_hold_dis();
-  for (gpio_num_t p : kSleepHoldPins)
+  for (gpio_num_t p : kOldSleepHoldPins)
     gpio_hold_dis(p);
 }
 
 [[noreturn]] static void deep_sleep_now_() {
-  for (gpio_num_t p : kSleepHoldPins) {
-    gpio_set_direction(p, GPIO_MODE_OUTPUT);
-    gpio_set_level(p, 1);
-    gpio_hold_en(p);
-  }
-  gpio_deep_sleep_hold_en();
   esp_sleep_enable_gpio_wakeup_on_hp_periph_powerdown(1ULL << kPowerPin, ESP_GPIO_WAKEUP_GPIO_LOW);
   esp_deep_sleep_disable_rom_logging();
   esp_deep_sleep_start();

@@ -7,7 +7,7 @@ Mostly negative knowledge: hardware-tested failures. "Don't" = cost a debug sess
 ## Notes index (read matching `docs/` file before touching area)
 | File | Covers | Never break |
 |---|---|---|
-| `docs/power-and-input.md` | idle power, DFS, input sampling, holds, power button | no tickless idle / light sleep (kills ADC buttons on battery); `min_freq_mhz` stays 80; never measure hold in frames; first down frame of a hold adds no dt (idle loop: dt = wait before press); async state change → `ui_wake()` or it shows at next deadline (≤1 s); `pdMS_TO_TICKS(1)` = 0 ticks; wait GPIO3 HIGH before deep sleep; sleep pin holds released first in `app_main` |
+| `docs/power-and-input.md` | idle power, DFS, input sampling, holds, power button | no tickless idle / light sleep (kills ADC buttons on battery); `min_freq_mhz` stays 80; never measure hold in frames; first down frame of a hold adds no dt (idle loop: dt = wait before press); async state change → `ui_wake()` or it shows at next deadline (≤1 s); `pdMS_TO_TICKS(1)` = 0 ticks; wait GPIO3 HIGH before deep sleep; no pin holds in deep sleep (`release_sleep_holds_()` at boot only clears old ones) |
 | `docs/display.md` | refresh latency, paging, spare framebuffer, panel health | every `EInkDisplay` entry starts `wakeIfNeeded(); waitWhileBusy();` (BUSY falling-edge ISR, not tick poll); SD shares SPI2 → `wait_panel_idle()` before card access; keep half-refresh `0x5A` temp write; no idle rail power-down; device never lays out: page = one baked display list read into `ReaderScreen::page_buf_` (`stage_next_page_` reads next one before refresh, never under a waveform) |
 | `docs/architecture.md` | screens, stack, home/list/quick menu, sorting | `ScreenManager::pop()` keeps last screen; screens pushed from press inherit held button; no `std::sort` (34 KB) |
 | `docs/bluetooth.md` | BLE clicker host, heap | raw NimBLE, no esp_hidh (removed): encrypt, then own CCCD writes, keys = notifications in `conn_cb`; `L2CAP_UPDATE_REQ` has null `self_params` (edit `peer_params`); waits on events only (event group); NimBLE never torn down; never `esp_bt_controller_deinit` (clicker gone till reboot); nothing freed for radios (index, page buffer stay; spare only lent to sync downloads, see docs/sync.md) |
@@ -137,6 +137,7 @@ wintergreen/               portable core
     DrawBuffer.h           IDisplay + draw buffer + fills/spare (host-safe constants)
     DrawBuffer.cpp         text + 1-bit blit (byte-packed, both rotations; column-major/band paths for portrait); firmware CMake only
     ui_font_{large,header}.h   Iosevka Slab Medium 24/32 px
+    ui_font_digits.h       Iosevka Slab Medium 40 px, 0-9 only (`make_font.py header --digits`): quick-menu chapter numbers
   content/
     BitmapFont{,Format}.h  WGF1 reader / format doc
     ContentModel.h         Paragraph/Run/TextStyle; kMaxFontSizes = 8

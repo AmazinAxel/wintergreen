@@ -7,6 +7,7 @@
 
 #include "../Application.h"
 #include "../content/BookIndex.h"
+#include "../display/ui_font_digits.h"
 
 namespace wintergreen {
 
@@ -145,6 +146,7 @@ void QuickmenuScreen::on_start() {
   // Use the list/menu rotation rather than inheriting whatever rotation the
   // reader view was using.
   set_buf_rotation_(Rotation::Deg90);
+  digit_font_.init(kFontData_ui_digits_wgf, kFontData_ui_digits_wgf_size);
 
   // The header is drawn entirely by this screen's own draw_all_. The author was
   // dropped — it is on the home screen and the book list, and says nothing here.
@@ -276,46 +278,48 @@ void QuickmenuScreen::refresh_items_(int restore_selection) {
   on_start();  // on_start() calls set_selected().
 }
 
-int QuickmenuScreen::get_visible_count_(int H, int scroll_off) const {
-  int available_h = H - header_h_();
-  // The settings/chapters hairline takes a row-sized bite out of the list.
-  if (first_chapter_ > 0)
-    available_h -= kSeparatorH;
-  int h = 0, cnt = 0;
+// Same walk as the base, over lines rather than items: settings rows (item
+// kIdxBack is the header, not a line), then grid rows. The hairline is drawn
+// only while a settings row is on screen, so it rides on the last settings
+// line; the last grid row has no gap below it.
+int QuickmenuScreen::centred_offset_(int H, int& shift) const {
+  shift = 0;
   const int n = count();
-  const int settings_end = first_chapter_ >= 0 ? first_chapter_ : n;
-  for (int i = scroll_off; i < settings_end; ++i) {
-    // The header item occupies the header, not a list row, so it costs no
-    // height here — otherwise the list would think it had one row fewer than
-    // it draws and the last chapter would be unreachable.
-    const int rh = (i == kIdxBack) ? 0 : row_h_();
-    if (h + rh > available_h) return cnt;
-    h += rh;
-    cnt++;
+  const int fc = first_chapter_ >= 0 ? first_chapter_ : n;
+  const int S = fc - 1;
+  const int lines = S + (first_chapter_ >= 0 ? (n - fc + kGridCols - 1) / kGridCols : 0);
+  const int sel = selected();
+  if (sel == kIdxBack || lines == 0)
+    return 0;
+  const int avail = H - header_h_() - kLM;  // must match draw_all_'s bottom
+  auto h = [&](int l) {
+    if (l < S)
+      return row_h_() + (l == S - 1 && lines > S ? kSeparatorH : 0);
+    return l == lines - 1 ? cell_h_() : cell_pitch_();
+  };
+  int top = sel < fc ? sel - 1 : S + (sel - fc) / kGridCols;
+  int room = (avail - h(top)) / 2;
+  while (top > 0 && h(top - 1) <= room)
+    room -= h(--top);
+  int tail = 0;
+  for (int l = top; l < lines && tail <= avail; ++l)
+    tail += h(l);
+  while (top > 0 && tail + h(top - 1) <= avail)
+    tail += h(--top);
+  if (top > 0 && tail < avail) {
+    --top;
+    shift = h(top) - (avail - tail);
   }
-  if (first_chapter_ < 0)
-    return cnt;
-  // Grid: whole rows from the one holding scroll_off (draw_all_ starts there
-  // too). Cells of that row left of scroll_off are drawn but not counted.
-  const int rows = (n - first_chapter_ + kGridCols - 1) / kGridCols;
-  for (int r = first_grid_row_(scroll_off); r < rows; ++r) {
-    if (h + cell_h_() > available_h) break;
-    h += cell_pitch_();
-    const int row_first = first_chapter_ + r * kGridCols;
-    const int row_end = std::min(row_first + kGridCols, n);
-    cnt += row_end - std::max(row_first, scroll_off);
-  }
-  return cnt;
+  if (top == 0)
+    return 0;
+  return top < S ? top + 1 : fc + (top - S) * kGridCols;
 }
 
-void QuickmenuScreen::draw_all_(DrawBuffer& buf, std::optional<uint8_t> battery_pct) const {
-  const int W = buf.width();
-  const int H = buf.height();
-  buf.fill(true);
-
-  if (!ui_font_.valid()) return;
-
-  (void)battery_pct;  // no battery here — see kHeaderTop
+// Painted after the list: a lifted list (scroll_shift()) slides its top row
+// under the header, so the header's whole band is cleared first.
+void QuickmenuScreen::draw_header_(DrawBuffer& buf, int W) const {
+  if (scroll_shift())
+    buf.fill_rect(0, 0, W, header_h_(), true);
   const BitmapFont& tfont = title_font_();
   const BitmapFont& cfont = chapter_font_();
   int y = (header_h_() - kSeparatorH - header_content_h_()) / 2;
@@ -360,7 +364,17 @@ void QuickmenuScreen::draw_all_(DrawBuffer& buf, std::optional<uint8_t> battery_
   // Same helper, same geometry as every other hairline — see header_h_().
   y = header_h_() - kSeparatorH;
   draw_separator_(buf, W, y);
-  y += kSeparatorH;  // must match header_h_()
+}
+
+void QuickmenuScreen::draw_all_(DrawBuffer& buf, std::optional<uint8_t> battery_pct) const {
+  const int W = buf.width();
+  const int H = buf.height();
+  buf.fill(true);
+
+  if (!ui_font_.valid()) return;
+
+  (void)battery_pct;  // no battery here — see kHeaderTop
+  int y = header_h_();
 
   // ── Item list ────────────────────────────────────────────────────────────
   const int n = count();
@@ -371,10 +385,15 @@ void QuickmenuScreen::draw_all_(DrawBuffer& buf, std::optional<uint8_t> battery_
   int total_h = (settings_end - 1) * row_h_();
   if (grid_rows > 0)
     total_h += (first_chapter_ > 0 ? kSeparatorH : 0) + grid_rows * cell_pitch_() - kCellGap;
-  const int so = (total_h <= H - y) ? 0 : scroll_offset();
+  // The list stops kLM above the panel edge, the side margin.
+  const int bottom = H - kLM;
+  const bool scrolls = total_h > bottom - y;
+  const int so = scrolls ? scroll_offset() : 0;
+  if (scrolls)
+    y -= scroll_shift();
 
   // Settings rows: "Label: Value", inverted when selected.
-  for (int i = (so > kIdxBack ? so : kIdxBack + 1); i < settings_end && y < H; ++i) {
+  for (int i = (so > kIdxBack ? so : kIdxBack + 1); i < settings_end && y < bottom; ++i) {
     const bool sel = (i == selected());
     const std::string_view label = get_item_label(i);
     std::string_view display_label = label;
@@ -406,7 +425,7 @@ void QuickmenuScreen::draw_all_(DrawBuffer& buf, std::optional<uint8_t> battery_
   }
 
   if (grid_rows == 0)
-    return;
+    return draw_header_(buf, W);
 
   // Hairline between the settings and the chapters, in its own gap.
   if (so < first_chapter_) {
@@ -415,21 +434,28 @@ void QuickmenuScreen::draw_all_(DrawBuffer& buf, std::optional<uint8_t> battery_
   }
 
   // ── Chapter grid ─────────────────────────────────────────────────────────
-  const int cell_w = (W - kLM - kRM - (kGridCols - 1) * kCellGap) / kGridCols;
-  for (int r = first_grid_row_(so); r < grid_rows && y + cell_h_() <= H; ++r) {
+  // Grid sides use the cell gap, not kLM: same clearance on every side of a cell.
+  const int cell_w = (W - (kGridCols + 1) * kCellGap) / kGridCols;
+  for (int r = first_grid_row_(so); r < grid_rows && y < bottom; ++r) {
     for (int c = 0; c < kGridCols; ++c) {
       const int i = first_chapter_ + r * kGridCols + c;
       if (i >= n)
         break;
-      const int x = kLM + c * (cell_w + kCellGap);
-      draw_outline(buf, x, y, cell_w, cell_h_(), i == selected() ? kCellSelW : 1);
+      const int x = kCellGap + c * (cell_w + kCellGap);
+      const bool sel = (i == selected());
+      if (sel)
+        buf.fill_rect(x, y, cell_w, cell_h_(), false);
+      else
+        draw_outline(buf, x, y, cell_w, cell_h_());
       const std::string_view label = get_item_label(i);
-      const int tw = ui_font_.word_width(label.data(), label.size(), FontStyle::Regular);
-      const int text_y = y + kCellPadV + ui_font_.baseline();
-      buf.draw_text_proportional(x + (cell_w - tw) / 2, text_y, label.data(), label.size(), ui_font_, false);
+      const int tw = digit_font_.word_width(label.data(), label.size(), FontStyle::Regular);
+      const int text_y = y + kCellPadV + digit_font_.glyph_height();
+      buf.draw_text_proportional(x + (cell_w - tw) / 2, text_y, label.data(), label.size(), digit_font_, sel);
     }
     y += cell_pitch_();
   }
+  buf.fill_rect(0, bottom, W, kLM, true);  // clips a part-shown row at the margin
+  draw_header_(buf, W);
 }
 
 void QuickmenuScreen::on_select(int index) {

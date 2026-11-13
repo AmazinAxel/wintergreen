@@ -5,6 +5,7 @@
 
 #include "../Input.h"
 #include "../content/BitmapFont.h"
+#include "../content/PageGeometry.h"
 #include "../content/wgb/WgbReader.h"
 #include "../display/DrawBuffer.h"
 #include "IScreen.h"
@@ -88,7 +89,6 @@ class ReaderScreen final : public IScreen {
   // Latches at or below the threshold until the next boot — see
   // sample_battery_().
   static constexpr int kLowBatteryBarPct = 15;
-  static constexpr int kLowBatteryBarH = 5;
   bool low_battery_ = false;
   void sample_battery_(IRuntime& runtime);
 

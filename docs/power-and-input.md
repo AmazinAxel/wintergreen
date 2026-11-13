@@ -177,16 +177,14 @@ only yields, so any wait loop using it spins the CPU flat out. `epd.h`'s
 `waitWhileBusy` had this bug; it now blocks on the BUSY falling-edge interrupt instead
 (`docs/display.md`).
 
-### Deep sleep pin holds (B3, 2026-11-11)
+### Deep sleep pin holds (B3): removed 2026-11-12
 
-`deep_sleep_now_()` drives SD CS (GPIO12), panel CS (GPIO21) and panel RST (GPIO5) high
-and holds them (`gpio_hold_en` + `gpio_deep_sleep_hold_en`): floating, a CS can drift low
-and select its device and a floating RST can pulse the panel out of its deep sleep, both
-for the whole night. **`app_main` releases them first thing** (`release_sleep_holds_()`,
-before anything touches a pin): a hold survives the wake and a held CS cannot be driven,
-which would leave panel and card dead. Device-checked by function (wake, panel, card,
-book list); the current saving is unmeasured (no ammeter). Card standby current itself
-is not reachable from firmware.
+Added 2026-11-11: `deep_sleep_now_()` drove SD CS (GPIO12), panel CS (GPIO21) and panel
+RST (GPIO5) high and held them (`gpio_hold_en` + `gpio_deep_sleep_hold_en`). Never
+measured; deep-sleep drain was visibly worse with it (GPIO12 is in the VDD_SPI pad
+group). Removed: nothing is held, sleep is the pre-B3 path. `app_main` still calls
+`release_sleep_holds_()` first so a device that slept under the old firmware gets its
+pins back (a held CS cannot be driven). Don't re-add without an ammeter.
 
 ## The power button
 
