@@ -74,6 +74,7 @@ A session can write nothing: same book, read, sleep → `mark_opened` / `set_pro
 | `WG_BLUETOOTH_PAGE_TURNER` | defined | `#define`, clicker MAC `"AA:BB:CC:DD:EE:FF"`. Undefined = no NimBLE, no quick-menu row. |
 | `WG_WIFI_SYNC` | defined | `#define`. Undefined drops Wi-Fi, lwIP, `esp_http_client` and the book list's Sync row. |
 | `kWifiName` / `kWifiPassword` / `syncServer` | `""` | Read by `platforms/esp32/wifi_sync.h`. `syncServer`: literal IP, router-DNS name, or `.local` (lwIP one-shot mDNS query, `CONFIG_LWIP_DNS_SUPPORT_MDNS_QUERIES`; no `esp_mdns`). Resolved IP cached in NVS per name; failed sync re-resolves once. |
+| `kSyncToken` | `""` | `Authorization: Bearer` on every sync request (homelab `BOOKSYNC_TOKEN`); `""` sends none. `wifi_sync.h` `sync_once_()`. |
 | `kSunlightFadingFix` | `false` | Panel off after every full refresh (restores sunlight contrast). No periodic full refreshes → affects sleep image + boot paint only. `Application::start`. |
 | `kAutoSleepMinutes` | `1` | `Application::update`. |
 | `kResumeOnePageBack` | `false` | Fresh open steps back one page (re-shows last page read). `ReaderScreen::resume_one_page_back_`. |

@@ -712,6 +712,11 @@ inline bool sync_once_() {
   g_http = esp_http_client_init(&hc);
   if (!g_http)
     return false;
+  // The server's BOOKSYNC_TOKEN. Set once: headers stay on the handle for the
+  // POST and every GET.
+  if (wintergreen::config::kSyncToken[0] != '\0')
+    esp_http_client_set_header(g_http, "Authorization",
+                               (std::string("Bearer ") + wintergreen::config::kSyncToken).c_str());
   const bool ok = run_sync_();
   esp_http_client_cleanup(g_http);
   g_http = nullptr;

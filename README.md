@@ -51,6 +51,7 @@ namespace wintergreen::config {
   inline constexpr const char* kWifiName = "";
   inline constexpr const char* kWifiPassword = "";
   inline constexpr const char* syncServer = ""; // an IP, a hostname, or a .local name
+  inline constexpr const char* kSyncToken = ""; // the server's BOOKSYNC_TOKEN, "" sends none
 
   inline constexpr bool kSunlightFadingFix = false;
   inline constexpr uint8_t kAutoSleepMinutes = 1;
