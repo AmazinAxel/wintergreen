@@ -1,17 +1,16 @@
-// books [book.epub ...]
+// books
 //
-// Review every EPUB in ~/Downloads/books: title, author, cover, chapters. The
-// reviewed EPUB replaces the original in place; the WGB is baked in a temp dir,
-// uploaded to the homelab and never kept on this machine.
+// Review every EPUB in ~/Downloads/books: title, author, cover, chapters. Each
+// is baked to WGB in a temp dir; the WGB goes to the homelab library and the
+// reviewed EPUB to its backup folder as "<title> by <author>.epub". Once the
+// upload succeeds the uploaded EPUBs are deleted here, so nothing is kept on
+// this machine. Books that fail stay in ~/Downloads/books.
 //
 // Chapters are decided here, not on the device: each kept entry becomes one
 // WGB chapter, which the device shows only as its number (1, 2, 3... in kept
 // order; names never leave this machine), and content of dropped chapters
-// never reaches the WGB. The reviewed EPUB carries
-// the same list as wg.ncx, dropped entries marked, so a re-review starts from it.
-//
-// With no arguments, EPUBs already reviewed (they contain wg.ncx) are skipped;
-// name a file to review it again.
+// never reaches the WGB. The backed-up EPUB carries the same list as wg.ncx,
+// dropped entries marked, so reviewing it again starts from it.
 
 #include <termios.h>
 #include <unistd.h>
@@ -24,13 +23,11 @@
 #include <ctime>
 #include <filesystem>
 #include <fstream>
-#include <iostream>
 #include <regex>
 #include <string>
 #include <vector>
 
 #include "labels.h"
-#include "miniz.h"
 #include "review.h"
 #include "wintergreen/content/Book.h"
 #include "wintergreen/content/CoverPaths.h"
@@ -42,6 +39,9 @@ namespace {
 
 constexpr const char* kHost = "alec@alechomelab";
 constexpr const char* kRemote = "/media/books";
+// Backup EPUBs. A dot dir: booksync.js never lists or serves those, and the
+// device only ever fetches book.wgb + covers by name anyway.
+constexpr const char* kEpubDir = ".epubs";
 
 fs::path g_tmp;
 
@@ -60,8 +60,7 @@ void cleanup() {
 // ── line editor ──────────────────────────────────────────────────────────────
 //
 // Raw termios with the default already in the buffer, so a title is fixed by
-// editing it rather than retyping it. Piped input (tests) reads plain lines,
-// where an empty line keeps the default.
+// editing it rather than retyping it.
 
 size_t cp_start(const std::string& s, size_t i) {  // start of the codepoint before i
   while (i > 0 && (static_cast<unsigned char>(s[i - 1]) & 0xC0) == 0x80)
@@ -88,14 +87,6 @@ size_t columns(const std::string& s, size_t a, size_t b) {
 // Returns the edited line; exits on Ctrl-C, or on Ctrl-D / EOF.
 std::string edit_line(const std::string& prompt, const std::string& initial) {
   std::fflush(stdout);
-  if (!isatty(STDIN_FILENO)) {
-    std::printf("%s", prompt.c_str());
-    std::string line;
-    if (!std::getline(std::cin, line))
-      quit();
-    std::printf("%s\n", line.c_str());
-    return line.empty() ? initial : line;
-  }
   termios old{};
   tcgetattr(STDIN_FILENO, &old);
   termios raw = old;
@@ -260,7 +251,23 @@ void print_chapters(const Review& r) {
     std::printf("%3zu %s %s\n", i + 1, r.chapters[i].keep ? "[x]" : "[ ]", r.chapters[i].label.c_str());
 }
 
-bool process(const fs::path& epub, const fs::path& out) {
+// "Dune by Frank Herbert.epub". Kept within one ustar name field (100 bytes)
+// so the tar stream needs no long-name extension.
+std::string epub_name(const Review& r, const fs::path& epub) {
+  std::string s = r.title.empty() ? epub.stem().string() : r.title;
+  if (!r.author.empty())
+    s += " by " + r.author;
+  for (char& c : s)
+    if (c == '/' || static_cast<unsigned char>(c) < 0x20)
+      c = '-';
+  if (s.size() > 94)
+    s.erase(cp_start(s, 95));
+  while (!s.empty() && (s.back() == ' ' || s.back() == '.'))
+    s.pop_back();
+  return s + ".epub";
+}
+
+bool process(const fs::path& epub, const fs::path& out, const fs::path& epubs) {
   Review r;
   if (const std::string err = r.open(epub.string()); !err.empty()) {
     std::printf("  %s, skipped\n", err.c_str());
@@ -337,33 +344,19 @@ bool process(const fs::path& epub, const fs::path& out) {
   if (name.empty()) {
     std::error_code ec;
     fs::remove_all(out / books::slug(r.title), ec);
-    std::printf("  %s, original kept\n", summary.c_str());
+    std::printf("  %s, skipped\n", summary.c_str());
     return false;
   }
+  const std::string backup = epub_name(r, epub);
   std::error_code ec;
-  fs::copy_file(reviewed, epub, fs::copy_options::overwrite_existing, ec);
+  fs::rename(reviewed, epubs / backup, ec);
   if (ec) {
-    std::printf("  baked, but replacing %s failed: %s\n", epub.c_str(), ec.message().c_str());
+    fs::remove_all(out / name, ec);
+    std::printf("  staging the EPUB failed, skipped\n");
     return false;
   }
-  std::printf("  ok  %s: %s\n", name.c_str(), summary.c_str());
+  std::printf("  ok  %s: %s\n      %s\n", name.c_str(), summary.c_str(), backup.c_str());
   return true;
-}
-
-bool already_reviewed(const fs::path& epub) {
-  mz_zip_archive z{};
-  if (!mz_zip_reader_init_file(&z, epub.c_str(), 0))
-    return false;
-  bool found = false;
-  const mz_uint n = mz_zip_reader_get_num_files(&z);
-  for (mz_uint i = 0; i < n && !found; ++i) {
-    char name[1024];
-    mz_zip_reader_get_filename(&z, i, name, sizeof name);
-    const std::string s = name;
-    found = s == "wg.ncx" || (s.size() > 7 && s.compare(s.size() - 7, 7, "/wg.ncx") == 0);
-  }
-  mz_zip_reader_end(&z);
-  return found;
 }
 
 // ── upload: ustar stream into ssh ────────────────────────────────────────────
@@ -397,46 +390,51 @@ bool tar_header(FILE* f, const std::string& path, size_t size, bool dir) {
   return std::fwrite(h, 1, 512, f) == 512;
 }
 
-bool write_tar(FILE* f, const fs::path& root, const std::vector<std::string>& names) {
-  static const char zeros[1024] = {};
-  for (const auto& n : names) {
-    if (!tar_header(f, n + "/", 0, true))
+// Every file of `dir` as "<prefix>/<name>", after a header for the directory.
+bool tar_dir(FILE* f, const fs::path& dir, const std::string& prefix) {
+  static const char zeros[512] = {};
+  if (!tar_header(f, prefix + "/", 0, true))
+    return false;
+  std::vector<fs::path> files;
+  for (const auto& e : fs::directory_iterator(dir))
+    files.push_back(e.path());
+  std::sort(files.begin(), files.end());
+  for (const auto& p : files) {
+    std::ifstream in(p, std::ios::binary);
+    std::string data((std::istreambuf_iterator<char>(in)), std::istreambuf_iterator<char>());
+    const size_t pad = (512 - data.size() % 512) % 512;
+    if (!tar_header(f, prefix + "/" + p.filename().string(), data.size(), false) ||
+        std::fwrite(data.data(), 1, data.size(), f) != data.size() || std::fwrite(zeros, 1, pad, f) != pad)
       return false;
-    std::vector<fs::path> files;
-    for (const auto& e : fs::directory_iterator(root / n))
-      files.push_back(e.path());
-    std::sort(files.begin(), files.end());
-    for (const auto& p : files) {
-      std::ifstream in(p, std::ios::binary);
-      std::string data((std::istreambuf_iterator<char>(in)), std::istreambuf_iterator<char>());
-      if (!tar_header(f, n + "/" + p.filename().string(), data.size(), false) ||
-          std::fwrite(data.data(), 1, data.size(), f) != data.size() ||
-          std::fwrite(zeros, 1, (512 - data.size() % 512) % 512, f) != (512 - data.size() % 512) % 512)
-        return false;
-    }
   }
-  return std::fwrite(zeros, 1, 1024, f) == 1024;
+  return true;
+}
+
+// Books under .incoming/<dir>/, EPUBs straight into their backup folder.
+bool write_tar(FILE* f, const fs::path& out, const std::vector<std::string>& names, const fs::path& epubs) {
+  static const char zeros[1024] = {};
+  for (const auto& n : names)
+    if (!tar_dir(f, out / n, ".incoming/" + n))
+      return false;
+  return tar_dir(f, epubs, kEpubDir) && std::fwrite(zeros, 1, 1024, f) == 1024;
 }
 
 }  // namespace
 
-int main(int argc, char** argv) {
+int main() {
   std::signal(SIGPIPE, SIG_IGN);
   const char* home = std::getenv("HOME");
   const fs::path src = fs::path(home ? home : "") / "Downloads" / "books";
 
-  std::vector<fs::path> epubs;
-  const bool explicit_args = argc > 1;
-  for (int i = 1; i < argc; ++i)
-    epubs.push_back(fs::absolute(argv[i]));
-  if (!explicit_args) {
+  std::vector<fs::path> sources;
+  {
     std::error_code ec;
     for (const auto& e : fs::directory_iterator(src, ec)) {
       const std::string ext = e.path().extension().string();
       if (ext == ".epub" || ext == ".EPUB")
-        epubs.push_back(e.path());
+        sources.push_back(e.path());
     }
-    std::sort(epubs.begin(), epubs.end());
+    std::sort(sources.begin(), sources.end());
   }
 
   const char* tmpdir = std::getenv("TMPDIR");
@@ -448,14 +446,14 @@ int main(int argc, char** argv) {
   g_tmp = tmpl;
   std::atexit(cleanup);
   const fs::path out = g_tmp / "out";
+  const fs::path epubs = g_tmp / "epubs";
   fs::create_directories(out);
+  fs::create_directories(epubs);
 
   std::vector<fs::path> done;
-  for (const auto& e : epubs) {
-    if (!explicit_args && already_reviewed(e))
-      continue;
+  for (const auto& e : sources) {
     std::printf("\n== %s\n", e.filename().c_str());
-    if (process(e, out))
+    if (process(e, out, epubs))
       done.push_back(e);
   }
 
@@ -466,26 +464,30 @@ int main(int argc, char** argv) {
   if (names.empty())
     return 0;
 
-  // Staged in .incoming (dot dirs are never listed by booksync.js), then moved
-  // into place, so the reader never syncs a half-uploaded book. The remote
+  // Books staged in .incoming (dot dirs are never listed by booksync.js), then
+  // moved into place, so the reader never syncs a half-uploaded book. EPUB
+  // names never appear in the command, only in the tar stream. The remote
   // login shell may be fish: only syntax valid in both (&&, single quotes).
   const std::string r = kRemote;
-  std::string cmd = "mkdir -p " + r + "/.incoming && tar -C " + r + "/.incoming -xf - && chmod -R a+rX " + r +
-                    "/.incoming";
+  const std::string e = r + "/" + kEpubDir;
+  std::string cmd = "mkdir -p " + r + "/.incoming " + e + " && tar -C " + r + " -xf - && chmod -R a+rX " + r +
+                    "/.incoming " + e;
   for (const auto& n : names)
     cmd += " && rm -rf '" + r + "/" + n + "' && mv '" + r + "/.incoming/" + n + "' '" + r + "/" + n + "'";
   std::printf("\nuploading %zu book(s) to %s\n", names.size(), kHost);
   std::fflush(stdout);
   FILE* ssh = popen((std::string("ssh ") + kHost + " \"" + cmd + "\"").c_str(), "w");
-  bool ok = ssh && write_tar(ssh, out, names);
+  bool ok = ssh && write_tar(ssh, out, names, epubs);
   if (ssh)
     ok = pclose(ssh) == 0 && ok;
-  if (ok) {
-    std::printf("done\n");
-    return 0;
+  if (!ok) {
+    std::fprintf(stderr, "upload failed, nothing deleted\n");
+    return 1;
   }
-  std::fprintf(stderr, "upload failed; the EPUBs are already reviewed, so rerun with them named:\n");
-  for (const auto& e : done)
-    std::fprintf(stderr, "  books '%s'\n", e.c_str());
-  return 1;
+  std::error_code ec;
+  for (const auto& d : done)
+    fs::remove(d, ec);
+  fs::remove(src, ec);  // only if now empty
+  std::printf("done\n");
+  return 0;
 }

@@ -168,7 +168,7 @@ tools/
   check_font.py            validate bundle, ASCII-render sample
   make_sleep_image.py      PNG → MGR2
   merge-bin.sh             single flash-at-0x0 release image
-  books/                   `books` (flake package): review EPUBs in ~/Downloads/books (title/author/cover sixel/chapters), rewrite in place (wg.ncx, dropped = class="wgdrop"), bake, tar | ssh to homelab. Own CMakeLists, explicit sources; no flags
+  books/                   `books` (flake package): review every EPUB in ~/Downloads/books (title/author/cover sixel/chapters), bake, one tar | ssh: WGB → `/media/books/<slug>/`, reviewed EPUB (wg.ncx, dropped = class="wgdrop") → `/media/books/.epubs/<Title> by <Author>.epub`; uploaded EPUBs then deleted locally (failed ones stay). Nothing kept on PC. Own CMakeLists, explicit sources; no arguments, no flags
   tests/                   host checks; run.sh
 ```
 

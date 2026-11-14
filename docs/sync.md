@@ -96,8 +96,8 @@ Ordering is the entire safety property:
 
 1. device sends `done[]` (books at `progress_pct >= 100`)
 2. server appends to `finished` in `.sync.json` and **fsyncs**
-3. only then does the server move the book to `/media/books/.read/<dir>/` (kept, never
-   listed or served again), and reply with `delete[]`
+3. only then does the server delete `/media/books/<dir>/` (WGB + covers; the EPUB backup
+   in `.epubs/` stays), and reply with `delete[]`
 4. only on seeing `delete[]` does the device unlink
 
 A crash at any step leaves the book present somewhere. `finished` is append-only and never
@@ -232,13 +232,16 @@ internal block) read 1800 B. Where that happened is not known.
 ### The server side
 
 In the flake repo (`snowflake`), not here: `hosts/alechomelab/webserver/booksync.js` bolted
-onto the existing bun server (no new service, no new port). **The homelab never converts
-and never sees an EPUB.** `books` (`tools/books` in this repo, packaged by `flake.nix`,
-installed by snowflake's `modules/desktop.nix`) reviews EPUBs in `~/Downloads/books`,
-rewrites them in place, bakes locally, and uploads `/media/books/<dir>/` over ssh: a tar
-stream (written by `books` itself) into `/media/books/.incoming/`, then `mv` into place, so
-a half-uploaded book is never visible to a concurrent sync. The WGB is not kept on the
-desktop.
+onto the existing bun server (no new service, no new port). **The homelab never converts.**
+`books` (`tools/books` in this repo, packaged by `flake.nix`, installed by snowflake's
+`modules/desktop.nix`, no arguments) reviews every EPUB in `~/Downloads/books`, bakes
+locally, and uploads over ssh in one tar stream (written by `books` itself): books into
+`/media/books/.incoming/`, then `mv` into place, so a half-uploaded book is never visible
+to a concurrent sync; reviewed EPUBs straight into `/media/books/.epubs/` as
+`<Title> by <Author>.epub` (backup only, never served; the device fetches book files by
+fixed name). Only after the upload succeeds are the uploaded EPUBs deleted from
+`~/Downloads/books` (and the folder, if empty); nothing is kept on the desktop. To re-bake,
+copy the backup EPUB back into `~/Downloads/books`: its `wg.ncx` restores the chapter picks.
 
 Removed, don't re-add: `books.nix` (path unit converting on the Pi) and
 `scripts/convertBooks.fish`. The `DirectoryNotEmpty` retrigger loop that unit once had is
@@ -247,7 +250,7 @@ moot with it.
 Endpoints: `POST /booksync` (the whole negotiation) and `GET /booksync/<dir>/<file>` (one
 book file). Book directory names are validated against `/^[A-Za-z0-9 ._-]+$/` and rejected
 if they contain `..` or start with `.` — they are used as path segments, and dot dirs
-(`.read`, `.incoming`) must never be listed or served. `books::slug` (`tools/books/labels.cpp`)
+(`.epubs`, `.incoming`) must never be listed or served. `books::slug` (`tools/books/labels.cpp`)
 produces names that pass.
 
 Book names contain spaces, so anything built on them must encode them.
