@@ -2,7 +2,7 @@
 
 // WGB — Wintergreen Book. Built on a computer, read directly by the device:
 // every page of every layout already laid out as a display list, and images
-// already rasterised to the 1-bit bitmaps the panel wants.
+// already rasterised to the 3-level two-plane bitmaps the panel wants.
 //
 // File layout (all values little-endian):
 //
@@ -145,10 +145,12 @@ inline int wgb_read_glyph(const uint8_t*& p, const uint8_t* end) {
 static constexpr size_t kWgbRuleItemSize = 1 + 8;
 static constexpr size_t kWgbImageItemSize = 1 + 14;
 
-// Largest display list the bake accepts, and the size of the device's one
-// page buffer. paginate_book_test prints the maximum: 879 B over two novels
-// (2026-11-11), so this is ~4x headroom for dense pages.
-static constexpr size_t kWgbMaxPageBytes = 4 * 1024;
+// Largest display list the bake accepts. The device reads it into the tail of
+// a DrawBuffer draw list (kArenaBytes, 6 KB) beside the page's line ops, so
+// the bound is what keeps a page, its ops and the quick menu's parked copy in
+// one list. paginate_book_test prints the maximum: 879 B over two novels
+// (2026-11-11), ~2.3x headroom for dense pages.
+static constexpr size_t kWgbMaxPageBytes = 2 * 1024;
 
 // Where one reviewed chapter begins, as the converter hands it to the
 // paginator: spine-file unit and paragraph index within it. Not stored; the
@@ -177,11 +179,10 @@ static constexpr uint16_t kWgbImageBoxH = 772;
 // Image reference entry (12 bytes each)
 // ---------------------------------------------------------------------------
 
-// Images are stored as raw 1-bit bitmaps, already scaled and dithered by the
-// converter to fit kWgbImageBoxW x kWgbImageBoxH. width/height are the stored
-// bitmap's dimensions — which are also the dimensions it is drawn at, since
-// scale_image() never enlarges — and the data is (width+7)/8 bytes per row,
-// MSB first, bit clear = ink.
+// Images are stored already scaled and blue-noise dithered by the converter to
+// three levels (white, gray, black) to fit kWgbImageBoxW x kWgbImageBoxH.
+// width/height are the stored bitmap's dimensions — which are also the
+// dimensions it is drawn at, since scale_image() never enlarges.
 //
 // They used to be the original JPEG/PNG bytes, decoded and dithered on the
 // device on first view and memoised to the SD card. Rasterising on the build
@@ -189,24 +190,31 @@ static constexpr uint16_t kWgbImageBoxH = 772;
 // from the firmware entirely, made an image page turn as fast as a text one, and
 // stopped the reader writing image caches to the card.
 //
-// Followed directly by a portrait copy in 8-row bands (wgb_image_bands_bytes):
-// band b is `width` bytes, byte c = column c's pixels in rows 8b..8b+7, top
-// MSB (padding rows white). In portrait a column is a panel row, so each band
-// is a byte copy per column instead of a bit transpose, and a page's slice of
-// the image is still one contiguous read. Landscape reads the rows.
+// Two copies, both two planes (hi = gray or black, lo = black; set = ink, MSB
+// first), so a strip of the panel is one contiguous read and a byte copy in
+// either orientation (DrawBuffer's PixelLayout):
+//
+//   rows (landscape): row r = ceil(w/8) hi bytes then ceil(w/8) lo bytes
+//   cols (portrait):  column c = ceil(h/8) hi bytes then ceil(h/8) lo bytes,
+//                     top pixel MSB; a column is a panel row in portrait
+//
+// data_size is exactly wgb_image_bytes (WgbWriter::set_image_data builds both).
 struct WgbImageRef {
-  uint32_t data_offset;  // offset of the bitmap within this WGB
-  uint32_t data_size;    // (width+7)/8 * height + wgb_image_bands_bytes
+  uint32_t data_offset;  // offset of the rows copy within this WGB; the cols copy follows
+  uint32_t data_size;    // wgb_image_bytes(width, height)
   uint16_t width;
   uint16_t height;
 };
 static_assert(sizeof(WgbImageRef) == 12, "WgbImageRef must be 12 bytes");
 
 inline uint32_t wgb_image_rows_bytes(uint32_t w, uint32_t h) {
-  return (w + 7) / 8 * h;
+  return 2 * ((w + 7) / 8) * h;
 }
-inline uint32_t wgb_image_bands_bytes(uint32_t w, uint32_t h) {
-  return (h + 7) / 8 * w;
+inline uint32_t wgb_image_cols_bytes(uint32_t w, uint32_t h) {
+  return 2 * ((h + 7) / 8) * w;
+}
+inline uint32_t wgb_image_bytes(uint32_t w, uint32_t h) {
+  return wgb_image_rows_bytes(w, h) + wgb_image_cols_bytes(w, h);
 }
 
 // ---------------------------------------------------------------------------

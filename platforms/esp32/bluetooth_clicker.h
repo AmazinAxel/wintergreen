@@ -218,8 +218,8 @@ inline bool g_host_up = false;       // host synced with the controller; false a
 // The BT controller wants a contiguous block of internal DRAM, and a shortage
 // shows as "esp_bt_controller_init -4" (ESP_ERR_NO_MEM) or, with slightly more
 // room, "BLE assert emi.c 164" plus an interrupt-watchdog reboot. Nothing is
-// handed back for it any more (the spare framebuffer, the book index and the
-// reader caches used to be): with pages fully baked the reader holds no layout
+// handed back for it any more (DrawBuffer's spare framebuffer, the book index
+// and the reader caches used to be): with pages fully baked the reader holds no layout
 // memory, so the heap has the room. If either symptom returns, that is a RAM
 // budget regression, not a reason to start releasing buffers again.
 

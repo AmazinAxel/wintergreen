@@ -14,6 +14,7 @@
 #include "wintergreen/display/DrawBuffer.h"
 #include "runtime.h"
 #include "sdcard.h"
+#include "usb_books.h"
 
 // Every deep-sleep entry goes through here. The ROM bootloader prints its banner
 // (chip, reset reason, boot mode, entry point — a few hundred characters at
@@ -127,8 +128,8 @@ static void verify_battery(const Esp32Runtime& runtime) {
   deep_sleep_now_();
 }
 
-// No out-of-memory rescue. Every long-lived buffer (both framebuffers, the
-// reader's page buffer, the book index) is claimed at boot and kept; a page
+// No out-of-memory rescue. Every long-lived buffer (DrawBuffer's draw lists
+// and strips, the book index) is claimed at boot and kept; a page
 // turn allocates nothing; the radios come and go beside them without anything
 // being handed back. See docs/history.md "OOM rescue".
 extern "C" void app_main(void) {
@@ -150,8 +151,8 @@ extern "C" void app_main(void) {
   // Before anything touches the panel or the card.
   verify_battery(runtime);
 
-  // The sleep image is a raw partition written by esptool, so this is an mmap
-  // and nothing else — no copy, no inflate, no SD access on the sleep path.
+  // The wordmark is a raw partition written by esptool, a whole 4-level panel
+  // frame: an mmap and nothing else — no copy, no SD access on the sleep path.
   static RawPartition sleep_part;
   if (sleep_part.map("sleep"))
     buf.set_sleep_image(sleep_part.data, sleep_part.size);
@@ -165,7 +166,7 @@ extern "C" void app_main(void) {
   const bool sd_ok = sd_init();
   epd.finish_begin();
   if (!sd_ok) {
-    buf.show_sleep_image_embedded();
+    buf.show_sleep_image();
     buf.deep_sleep();
     wait_power_release_();
     deep_sleep_now_();
@@ -183,6 +184,8 @@ extern "C" void app_main(void) {
   wg_sync::bind(app, buf);
 
   app.start(buf, runtime);
+  // After start: the receiver writes to the card and the index from its own task.
+  wg_usb::start(app, buf);
 
   // Discard the power-button press that woke us from deep sleep.
   input.clear_button(wintergreen::Button::Power);
@@ -198,12 +201,13 @@ extern "C" void app_main(void) {
     // the radio with files half written), and reconnect the clicker once a
     // sync that dropped it has finished.
     wg_sync::poll();
+    wg_usb::poll();
 
-    // Every button is dead while a sync runs, power included (owner's call): no
-    // sleeping or navigating away mid-download. The sync always ends on its own
-    // (HTTP and Wi-Fi timeouts).
+    // Every button is dead while a sync or USB copy runs, power included (owner's
+    // call): no sleeping or navigating away mid-download. Both always end on their
+    // own (HTTP and Wi-Fi timeouts; the USB stall bound).
     wintergreen::ButtonState buttons = input.poll_buttons();
-    if (wg_sync::active())
+    if (wg_sync::active() || wg_usb::active())
       buttons = {};
     app.update(buttons, runtime.frame_time_ms(), buf, runtime);
 

@@ -1,6 +1,7 @@
 // JpegDecoder.cpp
 //
-// Minimal streaming baseline JPEG decoder producing 1-bit Atkinson-dithered
+// Minimal streaming baseline JPEG decoder producing 8-bit grayscale (the caller
+// quantises to panel levels with blue noise: wintergreen/content/ImageDecoder.h),
 // bitmaps. Ported from TrustyReader (Rust) to C++17.
 //
 // Single-pass header parse: markers are read segment-by-segment from a
@@ -837,51 +838,21 @@ static void idct(const int32_t block[64], uint8_t out[64]) {
 }
 
 // ---------------------------------------------------------------------------
-// Atkinson dithering (one MCU row → 1-bit output)
-// Distributes 6/8 of error to 6 neighbors; intentionally loses 1/4.
-// Requires 3 error rows: cur (this row), nxt (next), nxt2 (row+2).
+// One MCU row → one 8-bit output row (scaled, tone-mapped)
 // ---------------------------------------------------------------------------
 
-static void dither_row(const uint8_t* row, uint32_t x_step, int out_w, int16_t* err_cur, int16_t* err_nxt,
-                       int16_t* err_nxt2, uint8_t* out_row, ToneLut tone_lut = nullptr,
+static void sample_row(const uint8_t* row, uint32_t x_step, int out_w, uint8_t* out_row, ToneLut tone_lut = nullptr,
                        ToneHistogram* tone_hist = nullptr) {
   uint32_t sx_fp = 0;
-  uint8_t acc = 0, bit = 0x80;
   for (int ox = 0; ox < out_w; ++ox) {
     uint8_t s = row[sx_fp >> 16];
+    sx_fp += x_step;
     if (tone_hist)
       ++tone_hist->bins[s];
     if (tone_lut)
       s = tone_lut[s];
-    int16_t g = static_cast<int16_t>(s);
-    sx_fp += x_step;
-    int16_t val = static_cast<int16_t>(g + err_cur[ox + 1]);
-    if (val < 0)
-      val = 0;
-    if (val > 255)
-      val = static_cast<int16_t>(255);
-    bool white = val >= 128;
-    int16_t e = white ? static_cast<int16_t>(val - 255) : val;
-    int16_t q = static_cast<int16_t>(e >> 3);  // 1/8 of error
-
-    if (white)
-      acc |= bit;
-    bit >>= 1;
-    if (!bit) {
-      *out_row++ = acc;
-      acc = 0;
-      bit = 0x80;
-    }
-
-    err_cur[ox + 2] = static_cast<int16_t>(err_cur[ox + 2] + q);    // (x+1, y)
-    err_cur[ox + 3] = static_cast<int16_t>(err_cur[ox + 3] + q);    // (x+2, y)
-    err_nxt[ox] = static_cast<int16_t>(err_nxt[ox] + q);            // (x-1, y+1)
-    err_nxt[ox + 1] = static_cast<int16_t>(err_nxt[ox + 1] + q);    // (x,   y+1)
-    err_nxt[ox + 2] = static_cast<int16_t>(err_nxt[ox + 2] + q);    // (x+1, y+1)
-    err_nxt2[ox + 1] = static_cast<int16_t>(err_nxt2[ox + 1] + q);  // (x,   y+2)
+    out_row[ox] = s;
   }
-  if (bit != 0x80)
-    *out_row = acc;
 }
 
 // ---------------------------------------------------------------------------
@@ -920,7 +891,7 @@ static const char* decode_baseline(const JpegState& st, BitReader& r, uint16_t m
 
   uint32_t x_step = (static_cast<uint32_t>(w) << 16) / static_cast<uint32_t>(out_w);
   uint32_t y_step = (static_cast<uint32_t>(h) << 16) / static_cast<uint32_t>(out_h);
-  int out_stride = (out_w + 7) / 8;
+  const int out_stride = out_w;
 
   // Non-interleaved scan (single component): MCU = 1 data unit (8×8 block).
   // Interleaved scan (multiple components): MCU = max_h×max_v blocks.
@@ -944,11 +915,7 @@ static const char* decode_baseline(const JpegState& st, BitReader& r, uint16_t m
     std::fill(out.data.begin(), out.data.end(), uint8_t(0));
   }
 
-  auto err_cur = std::unique_ptr<int16_t[]>(new (std::nothrow) int16_t[out_w + 4]());
-  auto err_nxt = std::unique_ptr<int16_t[]>(new (std::nothrow) int16_t[out_w + 4]());
-  auto err_nxt2 = std::unique_ptr<int16_t[]>(new (std::nothrow) int16_t[out_w + 4]());
-  if (!err_cur || !err_nxt || !err_nxt2)
-    return "jpeg: OOM for dither buffers";
+  std::vector<uint8_t> temp_row(sink ? static_cast<size_t>(out_w) : 0);
 
   int32_t dc_pred[MAX_COMP] = {};
   int32_t block[64];
@@ -1009,7 +976,7 @@ static const char* decode_baseline(const JpegState& st, BitReader& r, uint16_t m
       }
     }
 
-    // Dither this MCU row to 1-bit output
+    // This MCU row to 8-bit output rows
     for (int py = 0; py < mcu_h; ++py) {
       int src_y = mcu_row * mcu_h + py;
       if (src_y >= h || out_y >= out_h)
@@ -1020,20 +987,13 @@ static const char* decode_baseline(const JpegState& st, BitReader& r, uint16_t m
         if (target_src_y != src_y)
           break;
         if (sink) {
-          uint8_t temp_row[128];  // byte accumulator writes all bytes; no zero-init needed
-          dither_row(y_row.get() + py * row_w, x_step, out_w, err_cur.get(), err_nxt.get(), err_nxt2.get(), temp_row,
-                     tone_lut, tone_hist);
-          sink->emit_row(sink->ctx, static_cast<uint16_t>(out_y), temp_row, static_cast<uint16_t>(out_w));
+          sample_row(y_row.get() + py * row_w, x_step, out_w, temp_row.data(), tone_lut, tone_hist);
+          sink->emit_row(sink->ctx, static_cast<uint16_t>(out_y), temp_row.data(), static_cast<uint16_t>(out_w));
         } else {
-          uint8_t* out_row = out.data.data() + out_y * out_stride;
-          dither_row(y_row.get() + py * row_w, x_step, out_w, err_cur.get(), err_nxt.get(), err_nxt2.get(), out_row,
-                     tone_lut, tone_hist);
+          sample_row(y_row.get() + py * row_w, x_step, out_w, out.data.data() + out_y * out_stride, tone_lut,
+                     tone_hist);
         }
         ++out_y;
-        // Rotate three error rows: cur←nxt, nxt←nxt2, nxt2←fresh
-        std::swap(err_cur, err_nxt);
-        std::swap(err_nxt, err_nxt2);
-        std::fill(err_nxt2.get(), err_nxt2.get() + out_w + 4, int16_t(0));
       }
     }
   }

@@ -42,8 +42,9 @@ is gone because `start()`'s `full_refresh()` writes both planes anyway; and
 **resuming into a book does not build the home screen** — `ScreenManager::push_inactive`
 puts it under the reader unstarted, and the index is read by `record_book_progress()`
 (or the home screen's own resume) only when something needs it. The reader then
-pre-draws the next page on its first frame (`prerender_pending_`, also set on book open
-and quick-menu return), so the first turn after waking is a memcpy. Going to sleep,
+stages the next page's display list on the first frame after the waveform
+(`stage_pending_`, also set on book open and quick-menu return), so the first turn after
+waking reads nothing from the card. Going to sleep,
 `do_sleep_()` puts the sleep screen up **before** stopping the reader and saving, so
 those SD writes are not latency; the panel's `deep_sleep()` is sent last.
 

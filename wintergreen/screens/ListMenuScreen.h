@@ -64,19 +64,6 @@ inline std::string_view ellipsize(const IFont& f, const char* text, size_t len, 
   return {out, cp + 3};
 }
 
-// Border outline around a rectangle, `t` pixels thick, growing inwards. The
-// selection mark on the home carousel and the quick menu's chapter grid: a frame
-// changes far fewer pixels than an inverted fill, so the move refreshes cleaner.
-inline void draw_outline(DrawBuffer& buf, int x, int y, int w, int h, int t = 1) {
-  if (w <= 0 || h <= 0) return;
-  if (t > w) t = w;
-  if (t > h) t = h;
-  buf.fill_rect(x,         y,         w, t, false);
-  buf.fill_rect(x,         y + h - t, w, t, false);
-  buf.fill_rect(x,         y,         t, h, false);
-  buf.fill_rect(x + w - t, y,         t, h, false);
-}
-
 // Base class for screens that show a list of selectable items: the item
 // storage, up/down navigation with wrapping and hold-repeat, scrolling, and the
 // battery header. Its own draw pass is the book list's two-line rows; the home
@@ -146,7 +133,7 @@ class ListMenuScreen : public IScreen {
   // wherever it appears. Do not re-declare a local kSepH.
   static constexpr int kSeparatorH = 14;
   static void draw_separator_(DrawBuffer& buf, int W, int y) {
-    buf.fill_rect(0, y + kSeparatorH / 2, W, 1, false);
+    buf.fill_rect(0, y + kSeparatorH / 2, W, 1, Level::Gray);
   }
   virtual int count() const {
     return static_cast<int>(labels_.size());
@@ -170,10 +157,11 @@ class ListMenuScreen : public IScreen {
   // Right-aligned text on the subtitle line (the reading percentage).
   virtual std::string_view get_item_right(int index) const { return {}; }
 
-  // A 1 bpp image at the right-hand end of a row (MainMenu's covers).
-  // MSB first, bit clear = ink, rows (w + 7) / 8 bytes apart.
+  // An image at the right-hand end of a row (MainMenu's covers): pixels in
+  // PixelLayout::Cols behind `src`, read only while the panel refreshes.
   struct Thumb {
-    const uint8_t* bits = nullptr;
+    PixelSource* src = nullptr;
+    uint32_t item = 0, gen = 0, base = 0;
     int w = 0, h = 0;
   };
   // Called once per draw with the height every two-line row offers the image.
@@ -184,8 +172,6 @@ class ListMenuScreen : public IScreen {
   // The image for row `index`, already fitted to the box. False draws an empty
   // frame in its place.
   virtual bool get_item_thumb(int index, Thumb& out) const { return false; }
-  // After the last get_item_thumb of a draw: release anything held for it.
-  virtual void end_thumbs() const {}
 
   // Called during start(). Call add_item() to populate the list.
   virtual void on_start() = 0;

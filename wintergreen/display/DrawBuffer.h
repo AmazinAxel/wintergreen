@@ -1,9 +1,7 @@
 #pragma once
 
-#include <algorithm>
 #include <cstddef>
 #include <cstdint>
-#include <cstdlib>
 #include <cstring>
 
 #include "../content/BitmapFont.h"
@@ -12,454 +10,335 @@
 namespace wintergreen {
 
 // Deg90 is portrait (every list, and the reader's default); Deg0 is the reader's
-// landscape. The reversed orientations were dropped — see rotation_from_setting.
+// landscape.
 enum class Rotation { Deg0 = 0, Deg90 = 90 };
 
-// Refresh mode for full-screen updates.
-enum class RefreshMode { Full, Half };
+// What one panel pixel shows. A normal update can produce White, Gray and Black
+// (one of the four waveform slots must be HOLD, see epd.h); Light exists only in
+// a full refresh, where every pixel is driven anyway (the sleep frame).
+//
+// Two bit planes carry it everywhere (fonts, images, covers, the strip scratch):
+// `hi` = level bit 1, `lo` = level bit 0. White 00, Light 01, Gray 10, Black 11,
+// so black ink composites with OR, and a glyph's black plane is inside its gray
+// plane.
+enum class Level : uint8_t { White = 0, Light = 1, Gray = 2, Black = 3 };
 
-// Physical screen constants and bit-packed pixel helpers (used internally by DrawBuffer).
+// How text meets what is under it. Black: the glyph's gray and black pixels are
+// added (OR). White: the reverse, for text on a black fill (a selected row): the
+// glyph's black core clears to white and its antialiasing edge to gray.
+enum class Ink : uint8_t { Black = 0, White = 1 };
+
+// Physical screen constants.
 struct DisplayFrame {
   // 7 + 793 = 800: the panel's hidden columns are all at the leading edge, not
   // split across both. This said 10 + 786 once, leaving 4 columns that no
-  // drawing code could reach — they kept the buffers' 0xFF init and showed as a
-  // white bar along the top in portrait, most visible against a dark cover.
-  // Determined on hardware: dropping the offset to 7 moved the bar wholesale to
-  // the trailing edge rather than splitting it, so nothing is hidden there.
+  // drawing code could reach — they showed as a white bar along the top in
+  // portrait, most visible against a dark cover. Determined on hardware:
+  // dropping the offset to 7 moved the bar wholesale to the trailing edge rather
+  // than splitting it, so nothing is hidden there.
   static constexpr int kPhysicalWidth = 793;  // visible app-space width
   static constexpr int kPanelOffsetX = 7;     // hidden columns at the leading edge of the 800px panel
   static constexpr int kPanelWidth = 800;
   static constexpr int kPhysicalHeight = 480;
-  static constexpr int kStride = kPanelWidth / 8;  // 100 bytes/row (800 divisible by 8)
-  static constexpr std::size_t kPixelBytes = static_cast<std::size_t>(kStride) * kPhysicalHeight;  // 48000
+  static constexpr int kStride = kPanelWidth / 8;  // 100 bytes per plane row
+  static constexpr std::size_t kPixelBytes = static_cast<std::size_t>(kStride) * kPhysicalHeight;  // 48000, one plane
+  // A whole 4-level frame (sleep cover, wordmark): per physical row, the hi
+  // plane's 100 bytes then the lo plane's.
+  static constexpr std::size_t kFrameBytes = 2 * kPixelBytes;  // 96000
 };
-// Display driver interface. EInkDisplay is the only implementation left now that
-// the desktop build is gone — see "Investigated and rejected" in docs/history.md.
+
+enum class UpdateKind : uint8_t {
+  Turn,  // page turn, menus: HOLD / to-white / to-gray / to-black per pixel
+  Full,  // boot paint, sleep: every pixel cleared, then set to its level
+};
+
+// The panel driver, as the strip renderer sees it. EInkDisplay (epd.h) on the
+// device; a simulated controller in the host tests.
+//
+// An update is begin_update, any number of write_window calls, then fire.
+// Controller RAM keeps what was written between updates, which is what lets an
+// update write only the windows that changed (DrawBuffer tracks what RAM may
+// still hold, see dirty_).
 class IDisplay {
  public:
   virtual ~IDisplay() = default;
 
-  // Full physical refresh. `pixels` is the new frame; `prev` is the one currently
-  // on the glass, or nullptr when it is not known.
-  //
-  // RefreshMode::Full drives each pixel from its actual old state to its new one,
-  // which needs `prev` in RED RAM — see EInkDisplay::full_refresh. Half ignores
-  // `prev` entirely and is the boot paint; don't change what it does.
-  virtual void full_refresh(const uint8_t* pixels, const uint8_t* prev, RefreshMode mode,
-                            bool turnOffScreen = false) = 0;
+  // Wait out any running waveform, wake the controller, load the LUT for `kind`.
+  virtual void begin_update(UpdateKind kind) = 0;
+  // Block until at most one window transfer is in flight, so the strip buffer
+  // the one before it used may be refilled.
+  virtual void await_strip_slot() = 0;
+  // Queue a window of controller RAM: physical rows [row0, row0 + rows), plane
+  // bytes [xb0, xb0 + xbytes) of each. `bw` and `red` are rows x xbytes, packed;
+  // they must stay untouched until await_strip_slot() has been called twice
+  // more, or finish_writes(). For a Turn update each pixel's 2 bits are its slot
+  // (RED << 1 | BW); for Full they are its level.
+  virtual void write_window(int row0, int rows, int xb0, int xbytes, const uint8_t* bw, const uint8_t* red) = 0;
+  // Block until every queued write is on the controller: the bus (shared with
+  // the SD card) is free.
+  virtual void finish_writes() = 0;
+  // Run the waveform. Turn returns at once (the panel stays busy); Full waits,
+  // and powers the panel down at the end when `turn_off`.
+  virtual void fire(UpdateKind kind, bool turn_off) = 0;
 
-  // Partial refresh: new_pixels -> BW RAM, then fire the waveform without waiting.
-  virtual void partial_refresh(const uint8_t* new_pixels) = 0;
-
-  // Put the display controller into deep sleep (low-power mode).
   virtual void deep_sleep() {}
-
-  // Returns true if the display hardware is currently busy refreshing.
-  virtual bool is_busy() const {
-    return false;
-  }
-
-  // Block until any outstanding refresh has finished. Refreshes are fired without
-  // waiting, so callers that are about to use a bus the panel shares (SD on SPI2)
-  // must drain first — concurrent SD traffic corrupts an in-flight update.
+  // True while a waveform runs.
+  virtual bool is_busy() const { return false; }
+  // Block until any outstanding waveform has finished. The SD card shares SPI2
+  // with the panel and traffic during a waveform corrupts it: call before SD.
   virtual void wait_idle() {}
 };
 
-// Framebuffer with simple draw helpers.
+// Pixels that live outside RAM — on the card (covers, reader images, the sleep
+// cover) or in flash (the wordmark) — read while a refresh renders, a strip at a
+// time, so they never need a buffer of their own.
+class PixelSource {
+ public:
+  // Read `n` bytes at `offset` of item `item` into `dst`. False leaves those
+  // pixels white.
+  virtual bool read(uint32_t item, uint32_t offset, uint8_t* dst, size_t n) = 0;
+  // After a refresh that read from it: close whatever read() opened.
+  virtual void release() {}
+
+ protected:
+  ~PixelSource() = default;
+};
+
+// How a source's pixels are laid out (all two planes, bit set = ink).
+enum class PixelLayout : uint8_t {
+  Cols,   // portrait: column c = ceil(h/8) hi bytes then ceil(h/8) lo bytes, top MSB
+  Rows,   // landscape: row r = ceil(w/8) hi bytes then ceil(w/8) lo bytes, left MSB
+  Frame,  // a whole panel frame: physical row = 100 hi bytes then 100 lo bytes
+};
+
+// Everything drawn, as a draw list rather than pixels.
 //
-// Uses Deg90 (portrait) rotation: logical 480x793, physical 793x480.
-// One draw buffer: refresh() sends it to the panel and does not flip. The
-// controller keeps the pixels in its own RAM and the SPI write is synchronous,
-// so the buffer is free to draw into as soon as refresh() returns, and between
-// refreshes it holds the frame on the glass. Every draw path starts from
-// fill() or from a whole-buffer swap, so nothing reads the previous frame.
-// A second host copy of the displayed frame (there used to be one) had no
-// reader: the fast waveform never takes RED RAM from the host, and
-// RefreshMode::Full, the only mode that would, has no caller. A future Full
-// caller must keep its own copy of the old frame.
+// There is no framebuffer. Screens draw through the calls below exactly as
+// before; each call is recorded into the current list (cur_). refresh() then
+// knows two lists — what is on the glass (prev_) and what should be — and:
 //
-// The framebuffers are never loaned out as scratch: image decoding and EPUB
-// conversion, the two things that used to borrow them, are both gone from the
-// firmware.
+//   1. matches them op by op; only the bounding boxes of ops that differ can
+//      have changed pixels (damage);
+//   2. walks the panel in strips of kStripRows physical rows; inside the damage
+//      it replays both lists into two small scratch strips, compares them, and
+//      gives every changed pixel its target slot (to-white / to-gray / to-black)
+//      and every other pixel HOLD;
+//   3. writes only those windows (plus whatever controller RAM may still hold a
+//      drive slot from the last update) and fires one waveform.
 //
-// The text and bitmap routines live in DrawBuffer.cpp, firmware only. Defined
-// inline here they were cloned into every screen's TU — four copies of the glyph
-// loop in the image — and the host converter, which includes this header only
-// for kWidth/kHeight, never calls them.
+// So a page turn is one panel update with all of its grays already in it, a
+// cursor move renders and sends two rows, and an unchanged screen costs nothing.
+// See docs/display.md "Draw lists and strips".
+//
+// Every buffer is claimed once at construction (heap, see buf_), ~26 KB in all.
 class DrawBuffer {
  public:
   // Logical portrait dimensions.
   static constexpr int kWidth = DisplayFrame::kPhysicalHeight;
   static constexpr int kHeight = DisplayFrame::kPhysicalWidth;
-  static constexpr size_t kBufSize = DisplayFrame::kPixelBytes;
 
-  explicit DrawBuffer(IDisplay& display) : display_(display) {
-    memset(buf_, 0xFF, kBufSize);
-  }
+  // Strip geometry. 16 rows: 30 strips, 3,200 B per two-plane scratch strip.
+  static constexpr int kStripRows = 16;
+  static constexpr int kStrips = DisplayFrame::kPhysicalHeight / kStripRows;
+  static_assert(DisplayFrame::kPhysicalHeight % kStripRows == 0, "strips must tile the panel");
+  static constexpr size_t kPlaneBytes = static_cast<size_t>(kStripRows) * DisplayFrame::kStride;
+  static constexpr size_t kStripBytes = 2 * kPlaneBytes;
+  // One draw list. Holds the ops of a screen and, at its tail, the reader's
+  // display list (or the page parked under the quick menu). Sized from the
+  // largest real screens (tools/tests/drawlist_test.cpp prints them).
+  static constexpr size_t kArenaBytes = 6 * 1024;
+  // Card/flash pixels for one strip. A strip that would need more is processed
+  // in fewer rows at a time.
+  static constexpr size_t kFetchBytes = 4096;
+  // Damage intervals kept per strip before neighbours merge.
+  static constexpr int kMaxIntervals = 4;
 
-  ~DrawBuffer() {
-    std::free(buf_);
-    std::free(spare_);
-  }
-
-  // Owns a raw allocation; copying would double-free. There is exactly one
-  // DrawBuffer and it lives for the whole session, so deleting these costs
-  // nothing and makes the mistake unrepresentable.
+  explicit DrawBuffer(IDisplay& display);
+  ~DrawBuffer();
   DrawBuffer(const DrawBuffer&) = delete;
   DrawBuffer& operator=(const DrawBuffer&) = delete;
 
-  IDisplay& display() {
-    return display_;
-  }
-  const IDisplay& display() const {
-    return display_;
+  IDisplay& display() { return display_; }
+  const IDisplay& display() const { return display_; }
+
+  // Logical rotation of every draw call. The panel is always written in
+  // physical coordinates; the transform is applied when a call is recorded.
+  void set_rotation(Rotation r) { rotation_ = r; }
+  Rotation rotation() const { return rotation_; }
+  int width() const { return rotation_ == Rotation::Deg0 ? DisplayFrame::kPhysicalWidth : kWidth; }
+  int height() const { return rotation_ == Rotation::Deg0 ? DisplayFrame::kPhysicalHeight : kHeight; }
+
+  // -- Drawing (logical coordinates) -----------------------------------------
+
+  // Start a new screen: the list restarts with the whole panel at `level`.
+  // The tail (reader display list, parked page) is kept.
+  void fill(Level level = Level::White);
+  // A rectangle at an exact level.
+  void fill_rect(int x, int y, int w, int h, Level level);
+  // A `t`-pixel frame growing inwards.
+  void draw_outline(int x, int y, int w, int h, int t, Level level);
+  // Diamond (a square on its corner) centred on (cx, cy) with radius r,
+  // antialiased. t = 0: filled; otherwise an outline t pixels thick.
+  void draw_diamond(int cx, int cy, int r, int t = 0);
+
+  // UTF-8 text with its baseline at `baseline_y`; returns the x after it.
+  int draw_text(int x, int baseline_y, const char* text, size_t len, const BitmapFont& font, Ink ink = Ink::Black,
+                FontStyle style = FontStyle::Regular);
+  int draw_text(int x, int baseline_y, const char* text, const BitmapFont& font, Ink ink = Ink::Black,
+                FontStyle style = FontStyle::Regular) {
+    return draw_text(x, baseline_y, text, text ? strlen(text) : 0, font, ink, style);
   }
 
-  // Set the logical rotation used by every draw call. There is no driver-side
-  // rotation: the panel is always written in physical coordinates and the
-  // transform is applied here.
-  void set_rotation(Rotation r) {
-    rotation_ = r;
-  }
-  int width() const {
-    return rotation_ == Rotation::Deg0 ? DisplayFrame::kPhysicalWidth : kWidth;
-  }
-  int height() const {
-    return rotation_ == Rotation::Deg0 ? DisplayFrame::kPhysicalHeight : kHeight;
-  }
+  // One baked line (WgbFormat.h). Its words must lie in the tail (claim_tail),
+  // which is where the reader reads the page's display list.
+  void draw_baked_line(const WgbLine& line, const uint8_t* end, const BitmapFontSet& fonts);
 
-  Rotation rotation() const {
-    return rotation_;
-  }
+  // Pixels from a source, w x h, top-left (x, y); only source rows
+  // [keep_lo, keep_hi) are drawn. Cols needs portrait, Rows landscape.
+  // (src, item, gen, base) identify the pixels: equal identity = equal pixels,
+  // so bump `gen` whenever the bytes behind an item may have changed.
+  void blit(PixelSource* src, uint32_t item, uint32_t gen, uint32_t base, PixelLayout layout, int x, int y, int w,
+            int h, int keep_lo = 0, int keep_hi = 0x7FFF);
 
-  // -- Draw helpers (logical coordinates)
-  // ----------------------------------------
-
-  // Fill the entire draw buffer.
-  void fill(bool white = true) {
-    memset(draw_(), white ? 0xFF : 0x00, kBufSize);
-  }
-
-  // Fill a logical rectangle.
-  void fill_rect(int lx, int ly, int lw, int lh, bool white) {
-    if (rotation_ == Rotation::Deg0)
-      fill_rect_physical_(draw_(), lx, ly, lw, lh, white);
-    else
-      fill_rect_physical_(draw_(), ly, DisplayFrame::kPhysicalHeight - lx - lw, lh, lw, white);
-  }
-
-  // Blit a 1-bit image (MSB first, bit set = white, rows `stride` bytes apart)
-  // with its top-left at logical (lx, ly). Clipped to the panel.
+  // -- The tail ---------------------------------------------------------------
   //
-  // Whole images rather than one row per call: in portrait a logical row is a
-  // physical *column*, so per-row blitting could only ever set one bit at a
-  // time. Given the rows together it packs eight of them into each output byte,
-  // the same transpose the glyph path does.
-  void blit_1bit(int lx, int ly, const uint8_t* data, int w, int h, size_t stride);
+  // Bytes at the end of the list being recorded, kept across fill(): the
+  // reader reads a page's display list straight into it and records lines that
+  // point there. `tag` says what it holds (0 = nothing), so a page already
+  // there — staged after the last waveform — is not read again. Claiming
+  // starts a new screen: the list's ops are dropped, fill() comes next.
+  uint8_t* claim_tail(size_t n, uint32_t tag);
+  uint32_t tail_tag() const { return cur().tail_tag; }
+  const uint8_t* tail_data() const { return cur().base + kArenaBytes - cur().tail_len; }
+  size_t tail_size() const { return cur().tail_len; }
 
-  // Same, from column-major data: logical column c is ceil(h / 8) bytes of its h
-  // pixels, top first. In portrait each column is one physical row, so this is
-  // a shifted byte copy. Home and list covers are baked this way.
-  void blit_1bit_cols(int lx, int ly, const uint8_t* cols, int w, int h);
+  // -- The quick menu's snapshot ------------------------------------------------
+  //
+  // save_snapshot() parks what is on the glass (the reader's page: ops and
+  // display list) at the tail of the lists the overlay records into; no extra
+  // buffer. restore_snapshot() makes it the current list again, ready for
+  // refresh() — no card read, no redraw. False when it was dropped to make
+  // room (the overlay then needed the whole list) or never taken.
+  void save_snapshot();
+  bool restore_snapshot();
+  bool has_snapshot() const { return parked_; }
+  void drop_snapshot();
 
-  // One 8-row band of a reader image (WgbFormat.h, portrait copy): w bytes, each
-  // the band's 8 pixels of one column, top MSB. Top-left at (lx, ly); only band
-  // rows [keep_lo, keep_hi) are drawn.
-  void blit_1bit_bands(int lx, int ly, const uint8_t* band, int w, int keep_lo, int keep_hi);
+  // -- Display operations -----------------------------------------------------
 
-  // The draw target as the panel's own frame (kStride bytes per physical row,
-  // kBufSize bytes): a baked full-screen frame is read straight into it.
-  uint8_t* frame() {
-    return draw_();
-  }
-
-  // -- Text & Glyph rendering --
-
-  // Draw proportional text using a BitmapFont. Cursor starts at (x, baseline_y)
-  // where baseline_y is the Y position of the text baseline.
-  // Returns the X position after the last character (cursor advance).
-  int draw_text_proportional(int x, int baseline_y, const char* text, size_t len, const BitmapFont& font, bool white,
-                             FontStyle style = FontStyle::Regular);
-
-  // Convenience overload for null-terminated strings.
-  int draw_text_proportional(int x, int baseline_y, const char* text, const BitmapFont& font, bool white,
-                             FontStyle style = FontStyle::Regular) {
-    return draw_text_proportional(x, baseline_y, text, text ? strlen(text) : 0, font, white, style);
-  }
-
-  // Render all words of a baked line (see WgbFormat.h), each in its own font
-  // and style. `end` bounds the display list the line lives in.
-  void draw_baked_line(const WgbLine& line, const uint8_t* end, const BitmapFontSet& fonts, bool white);
-
+  // One normal update from what is on the glass to the current list. Returns at
+  // once; the waveform runs on (every panel entry waits it out first).
+  void refresh();
+  // Every pixel driven, four levels (boot paint, sleep). Waits for the end.
+  void full_refresh(bool turn_off = false);
   void set_sunlight_fading_fix(bool v) { sunlight_fading_fix_ = v; }
 
-  // -- Display operations
-  // --------------------------------------------------
-
-  // Push the draw buffer to the panel. No flip: see the class comment.
-  //
-  // **There is no periodic full-refresh flush**, and this is the third and final
-  // position on that question. A run of fast partial waveforms is not
-  // DC-balanced — each leaves a little residual charge, which accumulates as
-  // ghosting — so the obvious design promotes every Nth update to a full
-  // refresh, and that is what this used to do.
-  //
-  // It was removed because on this device the flush is redundant and the flash
-  // is not. Deep-sleep wake is a full boot, so a session is bracketed by two
-  // full-panel waveforms anyway: the sleep image on the way down and
-  // Application::start()'s full_refresh() on the way up. With
-  // kAutoSleepMinutes = 1 that happens every time the device is put down. The
-  // in-session flush only ever added an interruption the sleep cycle had already
-  // made unnecessary — inline it landed mid page turn, deferred it landed mid
-  // *sentence*, and pushed out far enough not to be felt it never ran at all.
-  //
-  // Gone with it: partials_since_full_, flush_pending(), flush_ghosting(),
-  // Application::kGhostFlushIdleMs and config::kFullRefreshEveryNUpdates. To
-  // bring it back, count here and call full_refresh(RefreshMode::Full) from
-  // wherever the interruption is acceptable — but read "Panel health" first.
-  void refresh() {
-    display_.partial_refresh(buf_);
-  }
-
-  // Full hardware refresh of the draw buffer. No previous frame is passed: no
-  // host copy of it exists (class comment), and Half ignores it anyway.
-  void full_refresh(RefreshMode mode = RefreshMode::Half, bool turnOffScreen = false) {
-    display_.full_refresh(buf_, nullptr, mode, turnOffScreen || sunlight_fading_fix_);
-  }
-
-
-  // -- Spare buffer: snapshot and offscreen draw ---------------------------
-  //
-  // One extra 48 KB framebuffer serving two jobs that never overlap in time:
-  //
-  //   Snapshot   a copy of the displayed frame, so a screen overlaying another
-  //              (the quick menu over the reader) can be dismissed without the
-  //              screen underneath rebuilding its content.
-  //   Offscreen  a place to draw the *next* page while the panel is still
-  //              running the current page's waveform, so a forward turn becomes
-  //              a memcpy plus an SPI write — no layout and no glyph blitting.
-  //
-  // They share storage because a reader is either in the quick menu or turning
-  // pages, never both, and 48 KB is worth more as heap than as a second spare.
-  // spare_use_ records which one is live; claiming it for one purpose silently
-  // invalidates the other, and both consumers re-check validity before trusting
-  // it (see ReaderScreen::resume and take_predrawn_).
-  //
-  // The framebuffers are never loaned out as scratch, so nothing else can
-  // clobber this.
-  enum class Spare : uint8_t { None, Snapshot, Offscreen, Cache };
-
-  // The spare is claimed at construction and never given back, radios
-  // included. The null checks below only cover a boot-time malloc failure.
-
-  // Lend the spare to another task until return_spare(): the sync's download
-  // buffers (wifi_sync.h). The caller is not on the UI thread, so every other
-  // claim (cache, snapshot, pre-draw)
-  // refuses while it is out, and the screens draw without it: the book list
-  // shows no thumbnails until it comes back. Both calls happen on the UI thread
-  // (wg_sync::poll), so the flag needs no lock. What the spare held is lost.
-  uint8_t* lend_spare() {
-    if (!spare_ || spare_lent_)
-      return nullptr;
-    spare_use_ = Spare::None;
-    spare_lent_ = true;
-    return spare_;
-  }
-  void return_spare() {
-    spare_lent_ = false;
-  }
-
-  // Lend the spare as a cache that may outlive the screen using it: the book
-  // list keeps its cover thumbnails here. Nothing draws into it while the list
-  // is up, so the reader's two uses never overlap it. Like them it is
-  // invalidated by any other claim — a snapshot, a pre-draw, a sync's loan.
-  //
-  // Validity is a generation, not just the enum: each time the spare *enters*
-  // cache use its contents are garbage and the generation moves, so a cache that
-  // was displaced and re-claimed cannot mistake its old slots for live ones. The
-  // owner trusts what it wrote only while
-  // spare_cache_valid(the generation it wrote under).
-  //
-  // `owner` distinguishes the two caches that use it — the book list's
-  // thumbnails and the home screen's cover — so one claiming it moves the
-  // generation and invalidates the other, rather than both trusting slots the
-  // other has overwritten.
-  uint8_t* claim_spare_cache(const void* owner) {
-    if (!spare_ || spare_lent_) {
-      spare_use_ = Spare::None;
-      return nullptr;
-    }
-    if (spare_use_ != Spare::Cache || spare_owner_ != owner) {
-      spare_use_ = Spare::Cache;
-      spare_owner_ = owner;
-      ++spare_cache_gen_;
-    }
-    return spare_;
-  }
-  uint32_t spare_cache_gen() const {
-    return spare_cache_gen_;
-  }
-  bool spare_cache_valid(uint32_t gen) const {
-    return spare_use_ == Spare::Cache && gen == spare_cache_gen_;
-  }
-
-  // The draw buffer holds the displayed frame, so a snapshot is a pointer
-  // swap: the page becomes the spare and the overlay draws into what the spare
-  // held (every draw starts with fill()). No 48 KB copy either way.
-  void save_snapshot() {
-    if (!spare_ || spare_lent_)
-      return;
-    std::swap(buf_, spare_);
-    spare_use_ = Spare::Snapshot;
-  }
-
-  bool has_snapshot() const {
-    return spare_use_ == Spare::Snapshot;
-  }
-
-  // Swap the snapshot back into the draw buffer, ready for the caller's
-  // refresh(). The spare then holds the overlay's frame, which is garbage.
-  bool restore_snapshot() {
-    if (spare_use_ != Spare::Snapshot)
-      return false;
-    std::swap(buf_, spare_);
-    spare_use_ = Spare::None;
-    return true;
-  }
-
-  // Redirect every draw call into the spare buffer until end_offscreen(). The
-  // draw buffer (the displayed frame) is untouched meanwhile.
-  // Returns false when there is no spare; the caller must then skip the
-  // pre-draw entirely rather than drawing into the live buffer.
-  bool begin_offscreen() {
-    if (!spare_ || spare_lent_)
-      return false;
-    draw_target_ = spare_;
-    spare_use_ = Spare::None;  // not usable until end_offscreen says so
-    return true;
-  }
-
-  void end_offscreen() {
-    draw_target_ = nullptr;
-    spare_use_ = Spare::Offscreen;
-  }
-
-  bool has_offscreen() const {
-    return spare_use_ == Spare::Offscreen;
-  }
-
-  // Swap the offscreen frame into the draw buffer, ready for refresh().
-  bool commit_offscreen() {
-    if (spare_use_ != Spare::Offscreen)
-      return false;
-    std::swap(buf_, spare_);
-    spare_use_ = Spare::None;
-    return true;
-  }
+  // The wordmark, a Frame mapped from the `sleep` partition (font_partition.h).
+  void set_sleep_image(const uint8_t* data, size_t size);
+  // Full refresh of a whole Frame (the wordmark, or a book's cover_sleep.bin)
+  // and panel power-down. The wordmark variant returns false without an image.
+  void show_frame(PixelSource* src, uint32_t item);
+  bool show_sleep_image();
 
   // Block until the panel has finished any outstanding refresh. Call before SD
-  // access: the card shares SPI2 with the display and concurrent traffic corrupts
-  // an update in flight.
-  void wait_panel_idle() {
-    display_.wait_idle();
-  }
+  // access: the card shares SPI2 with the display.
+  void wait_panel_idle() { display_.wait_idle(); }
+  void deep_sleep() { display_.deep_sleep(); }
 
-  // Put the display into deep sleep (low-power mode). Call after a full refresh.
-  void deep_sleep() {
-    display_.deep_sleep();
-  }
-
-
-  // Point at the MGR2 sleep image. On device this is the mmapped `sleep`
-  // partition (see font_partition.h) — no copy, no decompression, no file I/O
-  // at sleep time, which matters because the SD card shares SPI2 with the panel.
-  void set_sleep_image(const uint8_t* data, size_t size) {
-    sleep_img_ = data;
-    sleep_img_size_ = size;
-  }
-
-  // Show the sleep image (MGR2, thresholded to 1 bit). Leaves the panel awake;
-  // the caller sends deep_sleep() once it is done with the card.
-  bool show_sleep_image_embedded();
+  // -- Introspection (host tests) ----------------------------------------------
+  struct Stats {
+    uint32_t ops = 0, ops_bytes = 0, tail_bytes = 0;
+    bool overflowed = false;
+  };
+  // The list being recorded, or (glass) the one on the panel.
+  Stats current_stats(bool glass = false) const;
+  // Rasterise the current list into a full 2-plane frame (kFrameBytes, the
+  // Frame layout), through the same strip code. Host previews and tests.
+  void render_current(uint8_t* frame);
 
  private:
+  struct Arena {
+    uint8_t* base = nullptr;
+    size_t used = 0;          // op records, from base
+    size_t tail_len = 0;      // bytes at the end
+    uint32_t tail_tag = 0;
+    size_t parked_ops = 0;    // when parked: op bytes at the start of the tail block
+    bool overflowed = false;
+  };
+  struct Interval {
+    uint8_t lo, hi;  // plane bytes [lo, hi)
+  };
+  struct Fetch {
+    uint32_t op;           // record offset in cur_
+    const uint8_t* data;   // first unit fetched
+    int first;             // first unit (column, row) it holds
+  };
+
   IDisplay& display_;
-  // **Heap, not BSS, and this is what makes the BLE controller fit.** As
-  // member arrays the framebuffers were 96 KB of .bss, and .bss lands in the one ~50 KB
-  // contiguous DRAM pool the BT controller must allocate from (the boot log's
-  // "At 3FCB3490 len 0000CB70 (50 KiB): RAM" — the other ~123 KB is retention
-  // RAM, which .bss does not reach). The controller therefore had nowhere to
-  // go and reported "esp_bt_controller_init -4" / ESP_ERR_NO_MEM.
-  //
-  // On the heap the allocator is free to place them in the retention pool and
-  // leave the scarce region for the radio. Allocated once at construction and
-  // never freed.
-  uint8_t* buf_ = static_cast<uint8_t*>(std::malloc(kBufSize));
-  // Heap for the same reason, and likewise kept for the whole boot. Snapshot
-  // and offscreen commit swap it with buf_, so neither pointer is tied to one
-  // allocation.
-  uint8_t* spare_ = static_cast<uint8_t*>(std::malloc(kBufSize));
-  Spare spare_use_ = Spare::None;
-  bool spare_lent_ = false;  // see lend_spare()
-  uint32_t spare_cache_gen_ = 0;  // see claim_spare_cache()
-  const void* spare_owner_ = nullptr;
-  // Non-null while begin_offscreen() is in effect; see draw_().
-  uint8_t* draw_target_ = nullptr;
   Rotation rotation_ = Rotation::Deg90;
   bool sunlight_fading_fix_ = true;
 
-  // MGR2 sleep image, pointing into memory-mapped flash (set_sleep_image).
+  // **Heap, not BSS.** As member arrays the old framebuffers were .bss, which
+  // lands in the one ~50 KB contiguous DRAM pool the BT controller must
+  // allocate from ("esp_bt_controller_init -4"). On the heap the allocator can
+  // place them elsewhere. One block, claimed at construction, never freed until
+  // the destructor (which only the host tests reach).
+  uint8_t* mem_ = nullptr;
+  Arena arenas_[2];
+  int cur_ = 0;           // arenas_[cur_] records; the other is on the glass
+  bool cur_started_ = false;  // fill() since the last refresh
+  bool prev_valid_ = false;   // the glass shows prev(); false = unknown (boot)
+  bool parked_ = false;
+  uint8_t* scratch_new_ = nullptr;   // kStripBytes: hi plane then lo plane
+  uint8_t* scratch_old_[2] = {};     // alternate; each becomes its strip's send buffer
+  uint8_t* fetch_ = nullptr;         // kFetchBytes
+  int send_slot_ = 0;
+
+  // Controller RAM per physical row: plane bytes [lo, hi) may hold a non-HOLD
+  // slot from the last update. Every update rewrites at least this, or the
+  // controller would drive those pixels again (it drives the whole panel from
+  // RAM every time).
+  uint8_t dirty_lo_[DisplayFrame::kPhysicalHeight] = {};
+  uint8_t dirty_hi_[DisplayFrame::kPhysicalHeight] = {};
+
+  // Damage per strip for the refresh in progress.
+  Interval iv_[kStrips][kMaxIntervals] = {};
+  uint8_t iv_n_[kStrips] = {};
+  // Old pixels nobody can reproduce (an image no longer drawn): physical rects
+  // where every pixel is driven to its new level.
+  struct Rect {
+    int16_t r0, r1, b0, b1;
+  };
+  static constexpr int kMaxUnknown = 8;
+  Rect unknown_[kMaxUnknown] = {};
+  int unknown_n_ = 0;
+  bool all_unknown_ = false;
+
+  // Wordmark mapping.
   const uint8_t* sleep_img_ = nullptr;
   size_t sleep_img_size_ = 0;
+  class MemorySource;
+  MemorySource* sleep_src_ = nullptr;
 
-  // Where draw calls land: the draw buffer normally, the spare while an
-  // offscreen pass is in effect. Commit paths (refresh, full_refresh,
-  // restore_snapshot) always use buf_ directly.
-  uint8_t* draw_() {
-    return draw_target_ ? draw_target_ : buf_;
-  }
+  Arena& cur() { return arenas_[cur_]; }
+  const Arena& cur() const { return arenas_[cur_]; }
+  Arena& prev() { return arenas_[cur_ ^ 1]; }
 
-  // Fill a physical horizontal span [x1, x2) on physical row `row`. Physical x
-  // is app space: buffer column = x + kPanelOffsetX.
-  static void fill_row_physical_(uint8_t* buf, int row, int x1, int x2, bool white) {
-    const int lx1 = x1 + DisplayFrame::kPanelOffsetX;
-    const int lx2 = x2 + DisplayFrame::kPanelOffsetX;
-    const int bx1 = lx1 / 8;
-    const int bx2 = (lx2 - 1) / 8;
-    const auto lmask = static_cast<uint8_t>(0xFF >> (lx1 & 7));
-    const auto rmask = static_cast<uint8_t>(0xFF << (7 - ((lx2 - 1) & 7)));
-    uint8_t* rp = buf + row * DisplayFrame::kStride;
-    if (bx1 == bx2) {
-      const auto m = static_cast<uint8_t>(lmask & rmask);
-      if (white)
-        rp[bx1] |= m;
-      else
-        rp[bx1] &= static_cast<uint8_t>(~m);
-    } else {
-      if (white)
-        rp[bx1] |= lmask;
-      else
-        rp[bx1] &= static_cast<uint8_t>(~lmask);
-      if (bx2 > bx1 + 1)
-        memset(rp + bx1 + 1, white ? 0xFF : 0x00, bx2 - bx1 - 1);
-      if (white)
-        rp[bx2] |= rmask;
-      else
-        rp[bx2] &= static_cast<uint8_t>(~rmask);
-    }
-  }
+  // Recording.
+  uint8_t* begin_op_(size_t payload);
+  void ensure_started_();
+  void phys_rect_(int x, int y, int w, int h, int& r0, int& r1, int& b0, int& b1) const;
 
-  // Fill a physical rectangle, clipped to the panel.
-  static void fill_rect_physical_(uint8_t* buf, int rx, int ry, int rw, int rh, bool white) {
-    const int x1 = std::max(rx, 0);
-    const int y1 = std::max(ry, 0);
-    const int x2 = std::min(rx + rw, DisplayFrame::kPhysicalWidth);
-    const int y2 = std::min(ry + rh, DisplayFrame::kPhysicalHeight);
-    if (x1 >= x2 || y1 >= y2)
-      return;
-    for (int row = y1; row < y2; ++row)
-      fill_row_physical_(buf, row, x1, x2, white);
-  }
+  // Refresh machinery (DrawBuffer.cpp).
+  void match_();
+  void add_damage_(int r0, int r1, int b0, int b1);
+  void add_unknown_(int r0, int r1, int b0, int b1);
+  void run_(UpdateKind kind, bool turn_off);
+  bool fetch_chunk_(int ra, int rb, Fetch* fetches, int& nf);
+  void render_(const Arena& a, bool old, int ra, int rb, int xa, int xb, uint8_t* planes, const Fetch* fetches,
+               int nf);
+  void swap_lists_();
+  void release_sources_();
 };
 
 }  // namespace wintergreen

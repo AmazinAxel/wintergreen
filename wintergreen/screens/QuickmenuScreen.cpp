@@ -16,11 +16,11 @@ namespace wintergreen {
 // Truncation advances by whole UTF-8 sequences: cutting mid-sequence would feed
 // draw_text_proportional a partial codepoint.
 static void draw_text_ellipsised(DrawBuffer& buf, int x, int baseline, const char* text, size_t len,
-                                 const BitmapFont& f, int max_w, bool invert) {
+                                 const BitmapFont& f, int max_w, Ink ink) {
   if (len == 0 || max_w <= 0) return;
   char trunc[260];
   const std::string_view t = ellipsize(f, text, len, max_w, trunc);
-  buf.draw_text_proportional(x, baseline, t.data(), t.size(), f, invert);
+  buf.draw_text(x, baseline, t.data(), t.size(), f, ink);
 }
 
 // ---------------------------------------------------------------------------
@@ -97,10 +97,10 @@ int QuickmenuScreen::wrap_(const BitmapFont& f, std::string_view text, int first
 // The UI fonts carry no kerning, so "..." drawn at the line's end cursor is
 // pixel-identical to drawing line + "..." as one string.
 void QuickmenuScreen::draw_line_(DrawBuffer& buf, int x, int baseline, std::string_view text, const Line& l,
-                                 const BitmapFont& f, bool invert) {
-  x = buf.draw_text_proportional(x, baseline, text.data() + l.off, l.len, f, invert);
+                                 const BitmapFont& f, Ink ink) {
+  x = buf.draw_text(x, baseline, text.data() + l.off, l.len, f, ink);
   if (l.ell)
-    buf.draw_text_proportional(x, baseline, "...", 3, f, invert);
+    buf.draw_text(x, baseline, "...", 3, f, ink);
 }
 
 int QuickmenuScreen::header_content_h_() const {
@@ -319,7 +319,7 @@ int QuickmenuScreen::centred_offset_(int H, int& shift) const {
 // under the header, so the header's whole band is cleared first.
 void QuickmenuScreen::draw_header_(DrawBuffer& buf, int W) const {
   if (scroll_shift())
-    buf.fill_rect(0, 0, W, header_h_(), true);
+    buf.fill_rect(0, 0, W, header_h_(), Level::White);
   const BitmapFont& tfont = title_font_();
   const BitmapFont& cfont = chapter_font_();
   int y = (header_h_() - kSeparatorH - header_content_h_()) / 2;
@@ -330,19 +330,19 @@ void QuickmenuScreen::draw_header_(DrawBuffer& buf, int W) const {
   // the *start* of the separator gap, so the block reads as one target rather
   // than as text that happens to be highlighted.
   const bool head_sel = (selected() == kIdxBack);
+  const Ink ink = head_sel ? Ink::White : Ink::Black;
   if (head_sel)
     // Stops where the kSeparatorH gap begins. Running it to the rule instead
     // (header_h_() - kSeparatorH / 2) swallows the gap above the hairline, and
     // the separator loses its clearance on one side.
-    buf.fill_rect(0, 0, W, header_h_() - kSeparatorH, false);
+    buf.fill_rect(0, 0, W, header_h_() - kSeparatorH, Level::Black);
 
   // ── Book title, with the book percentage at the right of its first line ──
   for (int i = 0; i < title_n_; ++i) {
-    draw_line_(buf, kLM, y + tfont.baseline(), book_title_, title_lines_[i], tfont, head_sel);
+    draw_line_(buf, kLM, y + tfont.baseline(), book_title_, title_lines_[i], tfont, ink);
     if (i == 0) {
       const int pw = tfont.word_width(book_pct_buf_.c_str(), book_pct_buf_.size(), FontStyle::Regular);
-      buf.draw_text_proportional(W - kRM - pw, y + tfont.baseline(), book_pct_buf_.c_str(), book_pct_buf_.size(), tfont,
-                                 head_sel);
+      buf.draw_text(W - kRM - pw, y + tfont.baseline(), book_pct_buf_.c_str(), book_pct_buf_.size(), tfont, ink);
     }
     y += tfont.y_advance();
   }
@@ -351,11 +351,11 @@ void QuickmenuScreen::draw_header_(DrawBuffer& buf, int W) const {
   if (chapter_n_ > 0) {
     y += kBlockGap;
     for (int i = 0; i < chapter_n_; ++i) {
-      draw_line_(buf, kLM, y + cfont.baseline(), chapter_title_, chapter_lines_[i], cfont, head_sel);
+      draw_line_(buf, kLM, y + cfont.baseline(), chapter_title_, chapter_lines_[i], cfont, ink);
       if (i == 0) {
         const int pw = cfont.word_width(chapter_pct_buf_.c_str(), chapter_pct_buf_.size(), FontStyle::Regular);
-        buf.draw_text_proportional(W - kRM - pw, y + cfont.baseline(), chapter_pct_buf_.c_str(),
-                                   chapter_pct_buf_.size(), cfont, head_sel);
+        buf.draw_text(W - kRM - pw, y + cfont.baseline(), chapter_pct_buf_.c_str(), chapter_pct_buf_.size(), cfont,
+                      ink);
       }
       y += cfont.y_advance();
     }
@@ -369,7 +369,7 @@ void QuickmenuScreen::draw_header_(DrawBuffer& buf, int W) const {
 void QuickmenuScreen::draw_all_(DrawBuffer& buf, std::optional<uint8_t> battery_pct) const {
   const int W = buf.width();
   const int H = buf.height();
-  buf.fill(true);
+  buf.fill(Level::White);
 
   if (!ui_font_.valid()) return;
 
@@ -395,6 +395,7 @@ void QuickmenuScreen::draw_all_(DrawBuffer& buf, std::optional<uint8_t> battery_
   // Settings rows: "Label: Value", inverted when selected.
   for (int i = (so > kIdxBack ? so : kIdxBack + 1); i < settings_end && y < bottom; ++i) {
     const bool sel = (i == selected());
+    const Ink ink = sel ? Ink::White : Ink::Black;
     const std::string_view label = get_item_label(i);
     std::string_view display_label = label;
     std::string_view display_value;
@@ -405,7 +406,7 @@ void QuickmenuScreen::draw_all_(DrawBuffer& buf, std::optional<uint8_t> battery_
     }
 
     if (sel)
-      buf.fill_rect(0, y, W, row_h_(), false);
+      buf.fill_rect(0, y, W, row_h_(), Level::Black);
 
     const int text_y = y + (row_h_() - ui_font_.y_advance()) / 2 + ui_font_.baseline();
     const int text_x = kLM;
@@ -415,11 +416,11 @@ void QuickmenuScreen::draw_all_(DrawBuffer& buf, std::optional<uint8_t> battery_
     int label_w = W - kRM - text_x;
     if (!display_value.empty()) {
       const int vw = ui_font_.word_width(display_value.data(), display_value.size(), FontStyle::Regular);
-      buf.draw_text_proportional(W - kRM - vw, text_y, display_value.data(), display_value.size(), ui_font_, sel);
+      buf.draw_text(W - kRM - vw, text_y, display_value.data(), display_value.size(), ui_font_, ink);
       label_w -= vw + kValueGap;
     }
 
-    draw_text_ellipsised(buf, text_x, text_y, display_label.data(), display_label.size(), ui_font_, label_w, sel);
+    draw_text_ellipsised(buf, text_x, text_y, display_label.data(), display_label.size(), ui_font_, label_w, ink);
 
     y += row_h_();
   }
@@ -443,18 +444,20 @@ void QuickmenuScreen::draw_all_(DrawBuffer& buf, std::optional<uint8_t> battery_
         break;
       const int x = kCellGap + c * (cell_w + kCellGap);
       const bool sel = (i == selected());
+      // Selected: black, white digits (gray-antialiased). Others: a gray box.
       if (sel)
-        buf.fill_rect(x, y, cell_w, cell_h_(), false);
+        buf.fill_rect(x, y, cell_w, cell_h_(), Level::Black);
       else
-        draw_outline(buf, x, y, cell_w, cell_h_());
+        buf.draw_outline(x, y, cell_w, cell_h_(), 1, Level::Gray);
       const std::string_view label = get_item_label(i);
       const int tw = digit_font_.word_width(label.data(), label.size(), FontStyle::Regular);
       const int text_y = y + kCellPadV + digit_font_.glyph_height();
-      buf.draw_text_proportional(x + (cell_w - tw) / 2, text_y, label.data(), label.size(), digit_font_, sel);
+      buf.draw_text(x + (cell_w - tw) / 2, text_y, label.data(), label.size(), digit_font_,
+                    sel ? Ink::White : Ink::Black);
     }
     y += cell_pitch_();
   }
-  buf.fill_rect(0, bottom, W, kLM, true);  // clips a part-shown row at the margin
+  buf.fill_rect(0, bottom, W, kLM, Level::White);  // clips a part-shown row at the margin
   draw_header_(buf, W);
 }
 

@@ -5,6 +5,8 @@ Portrait text (every list and menu, and the reader in portrait) maps a glyph
 column onto a panel row. From row-major bitmaps that is a bit-by-bit transpose
 per glyph; from a column-major copy it is the same shifted byte copy landscape
 does. The copy is derived from the existing bitmaps, so pixels never change.
+Each glyph is two planes (hi = gray or black, lo = black, bit set = ink); the
+column copy is the hi plane's columns, then the lo plane's.
 
 Idempotent: an existing column section is dropped and rebuilt.
 
@@ -31,11 +33,11 @@ COL_FIELDS = 35  # col_bitmap_offset, col_index_offset
 def _transpose(bits, w, h):
     row_bytes = (w + 7) // 8
     col_bytes = (h + 7) // 8
-    out = bytearray(b"\xff" * (col_bytes * w))
+    out = bytearray(col_bytes * w)
     for r in range(h):
         for c in range(w):
-            if not (bits[r * row_bytes + (c >> 3)] >> (7 - (c & 7))) & 1:
-                out[c * col_bytes + (r >> 3)] &= ~(0x80 >> (r & 7)) & 0xFF
+            if (bits[r * row_bytes + (c >> 3)] >> (7 - (c & 7))) & 1:
+                out[c * col_bytes + (r >> 3)] |= 0x80 >> (r & 7)
     return bytes(out)
 
 
@@ -63,9 +65,11 @@ def add_columns(wgf):
                 index += struct.pack("<I", 0)
                 continue
             if boff not in seen:
-                src = wgf[bitmap_data_offset + boff : bitmap_data_offset + boff + ((w + 7) // 8) * h]
+                plane = ((w + 7) // 8) * h
+                base = bitmap_data_offset + boff
                 seen[boff] = len(pool)
-                pool += _transpose(src, w, h)
+                pool += _transpose(wgf[base : base + plane], w, h)
+                pool += _transpose(wgf[base + plane : base + 2 * plane], w, h)
             index += struct.pack("<I", seen[boff])
 
     col_bitmap = len(wgf)

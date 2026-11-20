@@ -16,7 +16,7 @@ namespace wintergreen {
 // cover ever appeared.
 static_assert(kSleepCoverW == DrawBuffer::kWidth, "sleep cover must be panel width");
 static_assert(kSleepCoverH == DrawBuffer::kHeight, "sleep cover must be panel height");
-static_assert(kSleepFrameBytes == DrawBuffer::kBufSize && kSleepFrameStride == DisplayFrame::kStride &&
+static_assert(kSleepFrameBytes == DisplayFrame::kFrameBytes && kSleepFrameStride == DisplayFrame::kStride &&
                   kSleepFrameRows == DisplayFrame::kPhysicalHeight && kSleepFrameOffX == DisplayFrame::kPanelOffsetX,
               "sleep frame must be the panel's frame");
 
@@ -86,35 +86,31 @@ void Application::auto_open_book(const char* epub_path, DrawBuffer& buf, IRuntim
 // Show `book_path`'s cover as the sleep screen. Returns false when the book has
 // no usable cover_sleep.bin, in which case the caller falls back to the wordmark.
 //
-// The file is composed by `books` (tools/books) as the panel's own frame
-// (CoverPaths.h): artwork scaled, dithered and laid out in physical byte
-// order, so one fread straight into the draw buffer is the whole job. No
-// scratch buffer, no blit. A short file leaves a partial frame, which the
-// caller's wordmark fallback overwrites in full.
+// The file is composed by `books` (tools/books) as the panel's own 4-level
+// frame (CoverPaths.h): artwork trimmed, stretched, blue-noise dithered and laid
+// out in physical byte order. The full refresh streams it from the card a strip
+// at a time; no buffer holds it. Exactly kSleepFrameBytes or it is not a cover.
+namespace {
+struct SleepCoverSource final : PixelSource {
+  FILE* f = nullptr;
+  bool read(uint32_t, uint32_t offset, uint8_t* dst, size_t n) override {
+    return f && std::fseek(f, static_cast<long>(offset), SEEK_SET) == 0 && std::fread(dst, 1, n, f) == n;
+  }
+};
+}  // namespace
+
 static bool show_book_cover_sleep_(DrawBuffer& buf, const char* data_dir, const std::string& book_path) {
   if (!data_dir || book_path.empty()) return false;
 
   const std::string cpath = cover_sleep_bin_path(book_path.c_str());
-  FILE* f = std::fopen(cpath.c_str(), "rb");
-  if (!f) return false;
-  const bool ok = std::fread(buf.frame(), 1, kSleepFrameBytes, f) == kSleepFrameBytes && std::fgetc(f) == EOF;
-  std::fclose(f);
-  if (!ok)
-    return false;
-
-  // Half ignores prev (CTRL1_BYPASS_RED) and paints from `pixels` alone, which
-  // is what keeps it to a single pass and makes the sleep screen appear quietly.
-  //
-  // RefreshMode::Full was tried here for a reported left/right fade on one
-  // cover. It did not fix it and its extra inversion phases were visibly
-  // flashier, so it was reverted. The fade is not a panel artefact: measuring
-  // cover_sleep.bin directly, ink coverage runs 0.52 at the centre column band
-  // down to ~0.30 at both edges, smoothly. That cover's artwork simply has a
-  // vignette and the panel is rendering it faithfully. Other covers are
-  // near-uniform (the hobbit ~0.95, lord of the flies ~0.10) and have no
-  // gradient to show. Don't go looking for a waveform fix for this one.
-  buf.full_refresh(RefreshMode::Half, /*turnOffScreen=*/true);
-  return true;
+  SleepCoverSource src;
+  src.f = std::fopen(cpath.c_str(), "rb");
+  if (!src.f) return false;
+  const bool ok = std::fseek(src.f, 0, SEEK_END) == 0 && std::ftell(src.f) == static_cast<long>(kSleepFrameBytes);
+  if (ok)
+    buf.show_frame(&src, 0);
+  std::fclose(src.f);
+  return ok;
 }
 
 void Application::do_sleep_(DrawBuffer& buf, bool wordmark_image) {
@@ -152,7 +148,7 @@ void Application::do_sleep_(DrawBuffer& buf, bool wordmark_image) {
   if (!cover_book.empty())
     shown = show_book_cover_sleep_(buf, data_dir_, cover_book);
   if (!shown)
-    shown = buf.show_sleep_image_embedded();
+    shown = buf.show_sleep_image();
 
   // Stop the active screen so it can save state (e.g. reading position).
   // The reader now persists position only in stop(), so if a child screen (the
@@ -182,7 +178,7 @@ void Application::update(const ButtonState& buttons, uint32_t dt_ms, DrawBuffer&
   // their own — no driver is involved — so without this a page turn would run at
   // the idle clock. The hold is raised on any button activity or pending screen
   // transition and dropped after kPerfHoldMs of quiet. All the CPU work of a turn
-  // — layout, draw, SPI, and the next page's pre-draw — happens within a frame
+  // — record, strip render, SPI, and staging the next page — happens within a frame
   // or two of the press; what follows is the waveform, which the CPU only waits
   // out, so holding 160 MHz through it was ~7 mA spent on nothing. 750 ms became
   // 300, still a dozen frames past the last of that work.

@@ -468,9 +468,9 @@ static std::vector<LayoutLine> layout_para_lines(const IFont& font, const Layout
 
 // Position an image inside the page, scaling **down** only.
 //
-// Images are rasterised to 1-bit by the converter, already fitted to the portrait
+// Images are rasterised (dithered) by the converter, already fitted to the portrait
 // page box (see kImageBoxW/H in WgbFormat.h), so in portrait this is a no-op and
-// the device blits 1:1. Enlarging a 1-bit dithered bitmap has no detail to
+// the device blits 1:1. Enlarging a dithered bitmap has no detail to
 // recover and only turns grain into blocks, so a landscape page — whose content
 // area is wider — centres the image at its stored size instead of stretching it.
 // The scale-down branches remain for images that are somehow still oversized.

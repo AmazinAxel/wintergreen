@@ -8,7 +8,8 @@ at runtime with esp_partition_mmap, so:
   - the font is no longer stored twice (once in the image, once in the
     partition) and is no longer decompressed into flash on first boot, which is
     what the old "Installing fonts..." progress screen existed for;
-  - the sleep image is read straight out of memory-mapped flash.
+  - the sleep wordmark (a whole 4-level panel frame, the same format as a
+    book's cover_sleep.bin) is read straight out of memory-mapped flash.
 
 The reader font ships as `[uint32 uncompressed size][zlib stream]`; it is
 inflated **here**, on the build machine, so the device never runs an inflate.
@@ -27,8 +28,8 @@ BUILD_DIR = env.subst("$BUILD_DIR")
 
 # Must match platforms/esp32/default_16MB.csv.
 PARTITIONS = {
-    "font": (0xC90000, 0x100000),
-    "sleep": (0xD90000, 0x020000),
+    "font": (0xC90000, 0x200000),
+    "sleep": (0xE90000, 0x020000),
 }
 
 
@@ -68,10 +69,12 @@ if len(font) != raw_size:
     _fail("font size prefix says %d, inflated %d" % (raw_size, len(font)))
 _check_fits("font", font)
 
-# --- sleep: raw MGR2, copied verbatim ---------------------------------------
-src = os.path.join(PROJECT_DIR, "resources", "sleep.mgr")
+# --- sleep: the wordmark frame, copied verbatim -----------------------------
+src = os.path.join(PROJECT_DIR, "resources", "sleep.frame")
 with open(src, "rb") as f:
     sleep = f.read()
+if len(sleep) != 96000:
+    _fail("%s is %d bytes; a panel frame is 96000 (tools/make_sleep_image.py)" % (src, len(sleep)))
 _check_fits("sleep", sleep)
 
 images = []

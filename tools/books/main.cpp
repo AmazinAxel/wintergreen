@@ -12,6 +12,8 @@
 // never reaches the WGB. The backed-up EPUB carries the same list as wg.ncx,
 // dropped entries marked, so reviewing it again starts from it.
 
+#include <fcntl.h>
+#include <poll.h>
 #include <termios.h>
 #include <unistd.h>
 
@@ -176,14 +178,14 @@ std::string edit_line(const std::string& prompt, const std::string& initial) {
 
 // ── cover preview: sixel of the converter's own cover_sleep.bin ─────────────
 
-void sixel(const std::vector<uint8_t>& bits, int w, int h) {
-  const size_t stride = (static_cast<size_t>(w) + 7) / 8;
-  auto white = [&](int x, int y) { return (bits[static_cast<size_t>(y) * stride + (x >> 3)] >> (7 - (x & 7))) & 1; };
+// `levels`: w x h panel levels (0 white .. 3 black), shown in the simulated
+// panel's tones (tools/check_font.py PANEL).
+void sixel(const std::vector<uint8_t>& levels, int w, int h) {
   std::string out = "\x1bP0;1;0q\"1;1;" + std::to_string(w) + ";" + std::to_string(h) +
-                    "#0;2;100;100;100#1;2;0;0;0";
+                    "#0;2;89;89;89#1;2;70;70;70#2;2;50;50;50#3;2;13;13;13";
   for (int y0 = 0; y0 < h; y0 += 6) {
-    for (int color = 0; color < 2; ++color) {
-      out += color ? "#1" : "#0";
+    for (int color = 0; color < 4; ++color) {
+      out += "#" + std::to_string(color);
       char run = 0;
       int n = 0;
       auto flush = [&] {
@@ -196,7 +198,7 @@ void sixel(const std::vector<uint8_t>& bits, int w, int h) {
       for (int x = 0; x < w; ++x) {
         int v = 0;
         for (int k = 0; k < 6 && y0 + k < h; ++k)
-          if (white(x, y0 + k) == (color == 0))
+          if (levels[static_cast<size_t>(y0 + k) * w + x] == color)
             v |= 1 << k;
         const char ch = static_cast<char>(63 + v);
         if (n && ch != run)
@@ -205,7 +207,7 @@ void sixel(const std::vector<uint8_t>& bits, int w, int h) {
         ++n;
       }
       flush();
-      out += color ? "-" : "$";
+      out += color == 3 ? "-" : "$";
     }
   }
   out += "\x1b\\\n";
@@ -235,13 +237,11 @@ void show_cover(const Review& r, const std::string& epub) {
   if (!f)
     return;
   const int w = wintergreen::kSleepCoverW, h = wintergreen::kSleepCoverH;
-  const size_t stride = (static_cast<size_t>(w) + 7) / 8;
-  std::vector<uint8_t> bits(stride * static_cast<size_t>(h), 0xFF);
+  std::vector<uint8_t> levels(static_cast<size_t>(w) * h);
   for (int y = 0; y < h; ++y)
     for (int x = 0; x < w; ++x)
-      if (!wintergreen::sleep_frame_white(frame.data(), x, y))
-        bits[static_cast<size_t>(y) * stride + (x >> 3)] &= static_cast<uint8_t>(~(0x80u >> (x & 7)));
-  sixel(bits, w, h);
+      levels[static_cast<size_t>(y) * w + x] = static_cast<uint8_t>(wintergreen::sleep_frame_level(frame.data(), x, y));
+  sixel(levels, w, h);
 }
 
 // ── one book ─────────────────────────────────────────────────────────────────
@@ -253,10 +253,10 @@ void print_chapters(const Review& r) {
 
 // "Dune by Frank Herbert.epub". Kept within one ustar name field (100 bytes)
 // so the tar stream needs no long-name extension.
-std::string epub_name(const Review& r, const fs::path& epub) {
-  std::string s = r.title.empty() ? epub.stem().string() : r.title;
-  if (!r.author.empty())
-    s += " by " + r.author;
+std::string epub_name(const std::string& title, const std::string& author, const fs::path& epub) {
+  std::string s = title.empty() ? epub.stem().string() : title;
+  if (!author.empty())
+    s += " by " + author;
   for (char& c : s)
     if (c == '/' || static_cast<unsigned char>(c) < 0x20)
       c = '-';
@@ -347,7 +347,7 @@ bool process(const fs::path& epub, const fs::path& out, const fs::path& epubs) {
     std::printf("  %s, skipped\n", summary.c_str());
     return false;
   }
-  const std::string backup = epub_name(r, epub);
+  const std::string backup = epub_name(r.title, r.author, epub);
   std::error_code ec;
   fs::rename(reviewed, epubs / backup, ec);
   if (ec) {
@@ -419,23 +419,253 @@ bool write_tar(FILE* f, const fs::path& out, const std::vector<std::string>& nam
   return tar_dir(f, epubs, kEpubDir) && std::fwrite(zeros, 1, 1024, f) == 1024;
 }
 
+// ── --usb: books straight onto the reader's card ─────────────────────────────
+//
+// Protocol in platforms/esp32/usb_books.h. One chunk in flight: the device's
+// driver drops what does not fit its RX ring.
+
+constexpr size_t kUsbChunk = 4096;
+
+struct Usb {
+  int fd = -1;
+  ~Usb() {
+    if (fd >= 0)
+      close(fd);
+  }
+  bool put(const void* p, size_t n) {
+    auto* b = static_cast<const char*>(p);
+    while (n) {
+      const ssize_t w = write(fd, b, n);
+      if (w <= 0)
+        return false;
+      b += w;
+      n -= static_cast<size_t>(w);
+    }
+    return true;
+  }
+  // The device's one-byte answer; a silent device (asleep mid-session, old
+  // firmware) reads as 0.
+  char get(int timeout_ms = 10000) {
+    pollfd p{fd, POLLIN, 0};
+    char c = 0;
+    if (poll(&p, 1, timeout_ms) != 1 || read(fd, &c, 1) != 1)
+      return 0;
+    return c;
+  }
+  bool name(const std::string& s) {
+    const uint8_t n = static_cast<uint8_t>(s.size());
+    return s.size() < 256 && put(&n, 1) && put(s.data(), s.size());
+  }
+};
+
+// The reader's port, by USB id: the native Serial/JTAG unit (303A:1001).
+std::string usb_port() {
+  std::error_code ec;
+  for (const auto& e : fs::directory_iterator("/dev/serial/by-id", ec))
+    if (e.path().filename().string().find("Espressif") != std::string::npos)
+      return e.path().string();
+  return "";
+}
+
+bool usb_open(Usb& u) {
+  const std::string port = usb_port();
+  if (port.empty())
+    return false;
+  u.fd = open(port.c_str(), O_RDWR | O_NOCTTY);
+  if (u.fd < 0)
+    return false;
+  termios t{};
+  tcgetattr(u.fd, &t);
+  cfmakeraw(&t);
+  tcsetattr(u.fd, TCSANOW, &t);
+  tcflush(u.fd, TCIOFLUSH);
+  return u.put("WGBK", 4) && u.get(3000) == 'R';
+}
+
+bool usb_book(Usb& u, const fs::path& dir) {
+  std::vector<fs::path> files;
+  for (const auto& e : fs::directory_iterator(dir))
+    files.push_back(e.path());
+  std::sort(files.begin(), files.end());
+  const uint8_t count = static_cast<uint8_t>(files.size());
+  if (!u.put("B", 1) || !u.name(dir.filename().string()) || !u.put(&count, 1))
+    return false;
+  for (const auto& p : files) {
+    std::ifstream in(p, std::ios::binary);
+    std::string data((std::istreambuf_iterator<char>(in)), std::istreambuf_iterator<char>());
+    const uint32_t n = static_cast<uint32_t>(data.size());
+    const uint8_t sz[4] = {static_cast<uint8_t>(n), static_cast<uint8_t>(n >> 8), static_cast<uint8_t>(n >> 16),
+                           static_cast<uint8_t>(n >> 24)};
+    if (!u.name(p.filename().string()) || !u.put(sz, 4) || u.get() != 'A')
+      return false;
+    for (size_t off = 0; off < data.size(); off += kUsbChunk)
+      if (!u.put(data.data() + off, std::min(kUsbChunk, data.size() - off)) || u.get() != 'A')
+        return false;
+  }
+  return u.get() == 'O';
+}
+
+// Every book in `out` onto the card. A sleeping reader has no port: wake it
+// and retry, or skip (the books then only go to the homelab).
+void usb_upload(const fs::path& out, const std::vector<std::string>& names) {
+  for (;;) {
+    Usb u;
+    if (!usb_open(u)) {
+      if (edit_line("reader not on USB: wake it, enter retries, s skips ", "") == "s")
+        return;
+      continue;
+    }
+    std::printf("\ncopying %zu book(s) to the reader over USB\n", names.size());
+    bool ok = true;
+    for (const auto& n : names) {
+      std::fflush(stdout);
+      const bool b = ok && usb_book(u, out / n);
+      std::printf("  %s %s\n", b ? "ok  " : "FAIL", n.c_str());
+      ok = ok && b;
+    }
+    if (u.put("E", 1) && u.get() == 'O' && ok)
+      return;
+    if (edit_line("USB copy failed: enter retries, s skips ", "") == "s")
+      return;
+  }
+}
+
+// ── --reuse: unread backups back into ~/Downloads/books ──────────────────────
+//
+// Unread = every EPUB in .epubs except those whose "<title> by <author>.epub"
+// matches an entry of .sync.json's `finished` (the server's read history,
+// keyed on the title and author the device reported, i.e. the reviewed ones).
+
+// The JSON string starting at s[i] == '"'; i ends past its closing quote.
+std::string json_string(const std::string& s, size_t& i) {
+  std::string out;
+  for (++i; i < s.size() && s[i] != '"'; ++i) {
+    if (s[i] != '\\' || i + 1 >= s.size()) {
+      out += s[i];
+      continue;
+    }
+    const char c = s[++i];
+    if (c == 'u' && i + 4 < s.size()) {
+      uint32_t cp = std::strtoul(s.substr(i + 1, 4).c_str(), nullptr, 16);
+      i += 4;
+      if (cp >= 0xD800 && cp < 0xDC00 && i + 6 < s.size() && s[i + 1] == '\\' && s[i + 2] == 'u') {
+        cp = 0x10000 + ((cp - 0xD800) << 10) + (std::strtoul(s.substr(i + 3, 4).c_str(), nullptr, 16) - 0xDC00);
+        i += 6;
+      }
+      if (cp < 0x80) {
+        out += static_cast<char>(cp);
+      } else if (cp < 0x800) {
+        out += static_cast<char>(0xC0 | cp >> 6);
+        out += static_cast<char>(0x80 | (cp & 0x3F));
+      } else if (cp < 0x10000) {
+        out += static_cast<char>(0xE0 | cp >> 12);
+        out += static_cast<char>(0x80 | (cp >> 6 & 0x3F));
+        out += static_cast<char>(0x80 | (cp & 0x3F));
+      } else {
+        out += static_cast<char>(0xF0 | cp >> 18);
+        out += static_cast<char>(0x80 | (cp >> 12 & 0x3F));
+        out += static_cast<char>(0x80 | (cp >> 6 & 0x3F));
+        out += static_cast<char>(0x80 | (cp & 0x3F));
+      }
+      continue;
+    }
+    out += c == 'n' ? '\n' : c == 't' ? '\t' : c == 'r' ? '\r' : c == 'b' ? '\b' : c == 'f' ? '\f' : c;
+  }
+  ++i;
+  return out;
+}
+
+std::string run(const std::string& cmd) {
+  std::string out;
+  FILE* p = popen(cmd.c_str(), "r");
+  if (!p)
+    return out;
+  char buf[4096];
+  size_t n;
+  while ((n = std::fread(buf, 1, sizeof(buf), p)) > 0)
+    out.append(buf, n);
+  pclose(p);
+  return out;
+}
+
+bool reuse(const fs::path& src) {
+  const std::string r = kRemote;
+  const std::string ssh = std::string("ssh ") + kHost + " ";
+  const std::string state = run(ssh + "\"cat " + r + "/.sync.json\"");
+  std::vector<std::string> finished;
+  for (size_t i = 0; (i = state.find("{", i)) != std::string::npos;) {
+    const size_t end = state.find('}', i);
+    std::string title, author;
+    for (const char* key : {"\"title\"", "\"author\""}) {
+      size_t k = state.find(key, i);
+      if (k == std::string::npos || k > end)
+        continue;
+      k = state.find('"', state.find(':', k + std::strlen(key)));
+      if (k == std::string::npos)
+        continue;
+      (key[1] == 't' ? title : author) = json_string(state, k);
+    }
+    if (!title.empty())
+      finished.push_back(epub_name(title, author, ""));
+    i = end == std::string::npos ? state.size() : end;
+  }
+
+  std::vector<std::string> want;
+  const std::string list = run(ssh + "\"ls -1 " + r + "/" + kEpubDir + "\"");
+  for (size_t i = 0; i < list.size();) {
+    const size_t nl = std::min(list.find('\n', i), list.size());
+    const std::string n = list.substr(i, nl - i);
+    i = nl + 1;
+    if (n.size() > 5 && n.compare(n.size() - 5, 5, ".epub") == 0 &&
+        std::find(finished.begin(), finished.end(), n) == finished.end())
+      want.push_back(n);
+  }
+  if (want.empty()) {
+    std::printf("no unread books on %s\n", kHost);
+    return true;
+  }
+
+  // Names go through stdin (tar -T -), never the command line: titles hold quotes.
+  const fs::path names = g_tmp / "reuse.txt";
+  {
+    std::ofstream f(names);
+    for (const auto& n : want)
+      f << n << '\n';
+  }
+  std::error_code ec;
+  fs::create_directories(src, ec);
+  std::printf("fetching %zu unread book(s) from %s\n", want.size(), kHost);
+  std::fflush(stdout);
+  const std::string cmd = ssh + "\"cd " + r + "/" + kEpubDir + " && tar -cf - -T -\" < '" + names.string() +
+                          "' | tar -C '" + src.string() + "' -xf -";
+  if (std::system(cmd.c_str()) != 0) {
+    std::fprintf(stderr, "fetch failed\n");
+    return false;
+  }
+  return true;
+}
+
 }  // namespace
 
-int main() {
+int main(int argc, char** argv) {
   std::signal(SIGPIPE, SIG_IGN);
+  bool use_usb = false, use_reuse = false;
+  for (int i = 1; i < argc; ++i) {
+    const std::string a = argv[i];
+    if (a == "--usb") {
+      use_usb = true;
+    } else if (a == "--reuse") {
+      use_reuse = true;
+    } else {
+      std::fprintf(stderr,
+                   "usage: books [--usb] [--reuse]\n"
+                   "  --usb    also copy the books to the reader over USB\n"
+                   "  --reuse  first fetch every unread EPUB backup from the homelab to rebake\n");
+      return 2;
+    }
+  }
   const char* home = std::getenv("HOME");
   const fs::path src = fs::path(home ? home : "") / "Downloads" / "books";
-
-  std::vector<fs::path> sources;
-  {
-    std::error_code ec;
-    for (const auto& e : fs::directory_iterator(src, ec)) {
-      const std::string ext = e.path().extension().string();
-      if (ext == ".epub" || ext == ".EPUB")
-        sources.push_back(e.path());
-    }
-    std::sort(sources.begin(), sources.end());
-  }
 
   const char* tmpdir = std::getenv("TMPDIR");
   std::string tmpl = std::string(tmpdir && *tmpdir ? tmpdir : "/tmp") + "/books.XXXXXX";
@@ -449,6 +679,20 @@ int main() {
   const fs::path epubs = g_tmp / "epubs";
   fs::create_directories(out);
   fs::create_directories(epubs);
+
+  if (use_reuse && !reuse(src))
+    return 1;
+
+  std::vector<fs::path> sources;
+  {
+    std::error_code ec;
+    for (const auto& e : fs::directory_iterator(src, ec)) {
+      const std::string ext = e.path().extension().string();
+      if (ext == ".epub" || ext == ".EPUB")
+        sources.push_back(e.path());
+    }
+    std::sort(sources.begin(), sources.end());
+  }
 
   std::vector<fs::path> done;
   for (const auto& e : sources) {
@@ -474,6 +718,8 @@ int main() {
                     "/.incoming " + e;
   for (const auto& n : names)
     cmd += " && rm -rf '" + r + "/" + n + "' && mv '" + r + "/.incoming/" + n + "' '" + r + "/" + n + "'";
+  if (use_usb)
+    usb_upload(out, names);
   std::printf("\nuploading %zu book(s) to %s\n", names.size(), kHost);
   std::fflush(stdout);
   FILE* ssh = popen((std::string("ssh ") + kHost + " \"" + cmd + "\"").c_str(), "w");

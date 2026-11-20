@@ -81,9 +81,9 @@ class Book {
     return file_;
   }
 
-  // Extract and write cover image to cover_path as a 1-bit packed bitmap file.
-  // Header: uint16_t width, uint16_t height (LE), then packed row data.
-  // max_w/max_h cap the output dimensions (aspect-ratio-preserving).
+  // Extract and write the cover to cover_path, fitted to max_w x max_h
+  // (aspect-ratio-preserving): u16 width, u16 height (LE), then two-plane
+  // columns, 3 levels (CoverPaths.h).
   // Returns true on success, false if no cover or decode failed.
   bool write_cover_bin(const char* cover_path,
                        int max_w, int max_h,

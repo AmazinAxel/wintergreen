@@ -44,9 +44,19 @@ unit blank_para_test $LAYOUT
 unit book_index_test wintergreen/content/BookIndex.cpp wintergreen/content/CoverPaths.cpp $READER
 # shellcheck disable=SC2086
 unit stretch_lut_test $DECODE
-unit blit_test wintergreen/display/DrawBuffer.cpp
+DRAW="wintergreen/display/DrawBuffer.cpp"
+unit blit_test $DRAW
+unit diff_test $DRAW
+unit drawlist_test $DRAW
+unit lut_test
 # shellcheck disable=SC2086
-unit baked_line_test wintergreen/display/DrawBuffer.cpp $BAKE $LAYOUT $FONT -x c $MINIZ -x none
+unit dither_test $DECODE
+# shellcheck disable=SC2086
+unit frame_test $DRAW $DECODE
+# shellcheck disable=SC2086
+unit font_test $FONT -x c $MINIZ -x none
+# shellcheck disable=SC2086
+unit baked_line_test $DRAW $BAKE $LAYOUT $FONT -x c $MINIZ -x none
 CXX="$CXX -I tools/books" unit labels_test tools/books/labels.cpp wintergreen/content/HtmlEntities.cpp
 
 books=()
@@ -82,7 +92,7 @@ fi
 if ((${#books[@]})); then
   echo "book tests:"
   # shellcheck disable=SC2086
-  $CXX -o "$WORK/paginate" tools/tests/paginate_book_test.cpp $READER
+  $CXX -o "$WORK/paginate" tools/tests/paginate_book_test.cpp $READER wintergreen/display/DrawBuffer.cpp $FONT -x c $MINIZ -x none
   for b in "${books[@]}"; do
     name=$(basename "$(dirname "$b")")
     if out=$("$WORK/paginate" "$b" 2>&1); then

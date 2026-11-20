@@ -8,11 +8,11 @@ Mostly negative knowledge: hardware-tested failures. "Don't" = cost a debug sess
 | File | Covers | Never break |
 |---|---|---|
 | `docs/power-and-input.md` | idle power, DFS, input sampling, holds, power button | no tickless idle / light sleep (kills ADC buttons on battery); `min_freq_mhz` stays 80; never measure hold in frames; first down frame of a hold adds no dt (idle loop: dt = wait before press); async state change → `ui_wake()` or it shows at next deadline (≤1 s); `pdMS_TO_TICKS(1)` = 0 ticks; wait GPIO3 HIGH before deep sleep; no pin holds in deep sleep (`release_sleep_holds_()` at boot only clears old ones) |
-| `docs/display.md` | refresh latency, paging, spare framebuffer, panel health | every `EInkDisplay` entry starts `wakeIfNeeded(); waitWhileBusy();` (BUSY falling-edge ISR, not tick poll); SD shares SPI2 → `wait_panel_idle()` before card access; keep half-refresh `0x5A` temp write; no idle rail power-down; device never lays out: page = one baked display list read into `ReaderScreen::page_buf_` (`stage_next_page_` reads next one before refresh, never under a waveform) |
+| `docs/display.md` | draw lists + strip renderer, waveforms (custom LUTs, tuning checklist), refresh latency, paging, panel health | one panel update per change, never a second pass; normal updates 3 levels (white/gray/black, HOLD = state `00`), full refreshes 4; every `EInkDisplay` entry starts `wakeIfNeeded(); waitWhileBusy();` (BUSY falling-edge ISR, not tick poll); SD shares SPI2 → `wait_panel_idle()` before card access, `finish_writes()` before a pixel source reads; every written window ⊇ RAM that may hold a drive slot (`dirty_`); never LUT_LOAD (custom LUTs uploaded after every init); vendor voltages fixed, only timings tuned; polarity only in `kVsBlack`/`kVsWhite`; no framebuffers, no pixel caches (sources stream per strip; old pixels only from an identical new op's fetch, else unknown); no idle rail power-down; device never lays out: page = one baked display list read into the draw list's tail (staged after the waveform, never under one) |
 | `docs/architecture.md` | screens, stack, home/list/quick menu, sorting | `ScreenManager::pop()` keeps last screen; screens pushed from press inherit held button; no `std::sort` (34 KB) |
-| `docs/bluetooth.md` | BLE clicker host, heap | raw NimBLE, no esp_hidh (removed): encrypt, then own CCCD writes, keys = notifications in `conn_cb`; `L2CAP_UPDATE_REQ` has null `self_params` (edit `peer_params`); waits on events only (event group); NimBLE never torn down; never `esp_bt_controller_deinit` (clicker gone till reboot); nothing freed for radios (index, page buffer stay; spare only lent to sync downloads, see docs/sync.md) |
+| `docs/bluetooth.md` | BLE clicker host, heap | raw NimBLE, no esp_hidh (removed): encrypt, then own CCCD writes, keys = notifications in `conn_cb`; `L2CAP_UPDATE_REQ` has null `self_params` (edit `peer_params`); waits on events only (event group); NimBLE never torn down; never `esp_bt_controller_deinit` (clicker gone till reboot); nothing freed or lent for radios (index, draw lists stay; sync downloads use a 16 KB heap chunk, see docs/sync.md) |
 | `docs/sync.md` | NAS sync over HTTP | radio teardown scope-bound (`WifiGuard`); never call saving `BookIndex` mutators per book; downloads → `.tmp`, must match Content-Length, resume via Range; all buttons dead while syncing; download serial (writer task measured no faster, single core); clicker dropped via `begin_sync()`, reconnected by `wg_sync::poll()` |
-| `docs/content.md` | EPUB→WGB, WGB/WGF formats, books on card, fonts, size budget | no magic/version in any format (WGB, WGF, WGFS, MGR2, index); WGF layout change = regenerate assets same commit; font bundle / `TextLayout` / `PageGeometry.h` / hyphenation change = rebake library same commit (pages fully baked to display lists, unchecked); covers beside literal `book.wgb`; font presets mirror `make_font.py --sizes` |
+| `docs/content.md` | EPUB→WGB, WGB/WGF formats, books on card, fonts, size budget | no magic/version in any format (WGB, WGF, WGFS, sleep frame, index); WGF layout change = regenerate assets same commit; font bundle / `TextLayout` / `PageGeometry.h` / hyphenation change = rebake library same commit (pages fully baked to display lists, unchecked); covers beside literal `book.wgb`; font presets mirror `make_font.py --sizes` |
 | `docs/history.md` | open, rejected, removed | don't resurrect without asking |
 
 ## Build / flash
@@ -22,7 +22,7 @@ pio run -t upload
 pio device monitor      # 115200
 ```
 - `/dev/ttyACM0`, `303A:1001` (native USB JTAG/serial). `upload_port` unset on purpose (autodetect).
-- No desktop build. Only host build = `tools/books`. It and `platforms/esp32/CMakeLists.txt` list core sources explicitly: add/delete core `.cpp` → edit both, else CMake fails at generate naming `idf_component_register`. Exception: `display/DrawBuffer.cpp` is firmware-only (converter includes `DrawBuffer.h` for constants, never draws).
+- No desktop build. Only host build = `tools/books`. It and `platforms/esp32/CMakeLists.txt` list core sources explicitly: add/delete core `.cpp` → edit both, else CMake fails at generate naming `idf_component_register`. Exception: `display/DrawBuffer.cpp` is not in `tools/books` (converter includes `DrawBuffer.h` for constants, never draws); the host tests and `preview.sh` compile it.
 - `ESP_PLATFORM` (IDF macro) = firmware/host-converter seam. Stays.
 - Flash DIO @ 80 MHz (`sdkconfig.defaults`). QIO bricks boot (bootloader quad self-upgrade never finishes). DIO@80 = QIO@40 = 20 MB/s. `board_build.flash_mode` inert under espidf.
 - SD clock (`platforms/esp32/sdcard.h`) divides 80 MHz APB: 80/40/26.7/20 only. 40 fails (12.5 ns half-period < 14 ns card output delay; panel fine at 40, write-only). 26.67 fails (empty book list). 20 = ceiling. Card `input_delay` unreachable via `sdspi_device_config_t` (would need IDF patch).
@@ -89,6 +89,7 @@ A session can write nothing: same book, read, sleep → `mark_opened` / `set_pro
 Everything else hardcoded at call site. Removed `Application` `static constexpr` getters (`rotate_display()`, `show_sleep_text()`, `list_align()`, `menu_font_size()`, `invert_menu_buttons()`, `invert_bottom_paging()`, `invert_side_buttons()`); don't reintroduce.
 - Lists always portrait (`buf.set_rotation(Rotation::Deg90)`), menu font = 32 px header; `ListMenuScreen` `font_size_idx_`/`set_font_size()`/`font_size()`/`apply_ui_font()`/`list_align_` gone.
 - No sleep caption. Sleep shows cover of currently open book unless in `/.hidden/` (hidden books never advertised); else embedded wordmark.
+- Levels (owner, 2026-11-19): selection = black fill + white text (gray antialiasing); secondary text (author, %, battery) black + AA, never gray (gray text cannot be antialiased in a normal update); hairlines, dividers, frames, scrollbar, empty-cover boxes, reader rules and the low-battery bar gray; diamonds antialiased.
 - Battery = header %, never icon. Converted-book marker gone (all books WGB).
 - Images always render; `images_enabled` gone.
 - One reader font (Libron, `font` partition), no picker.
@@ -107,11 +108,13 @@ WintergreenConfig.h        only tunables (gitignored)
 CMakeLists.txt             IDF stub; real source list in platforms/esp32/
 platformio.ini             env esp32c3; pre-build tools/generate_assets.py
 sdkconfig.defaults         checked in; sdkconfig.esp32c3 generated
-resources/                 Libron.bin (reader font), sleep.mgr (wordmark)
+resources/                 Libron.bin (reader font), sleep.frame (wordmark, 4-level panel frame),
+                           wintergreen-source.png (its source)
 
 platforms/esp32/           entry + all drivers, header-only
   main.cpp                 app_main: boot gate, init order, while() loop
-  epd.h                    EInkDisplay: SPI2 panel, LUTs, refresh modes
+  epd.h                    EInkDisplay: SPI2 panel, LUT upload, queued strip windows, temperature band
+  panel_lut.h              Turn/Full waveform tables from named frame counts (host-tested)
   input.h                  Esp32InputSource: 5 ms ADC-ladder sampler, press ring
   runtime.h                Esp32Runtime: frame pacing, battery %
   sdcard.h                 sd_init(): SDSPI on SPI2, 20 MHz
@@ -132,15 +135,16 @@ wintergreen/               portable core
     ListMenuScreen.{h,cpp} base list: header, rows, scroll, hold-repeat, fit_prefix
     HomeScreen.{h,cpp}     recents carousel; overrides draw_all_
     MainMenu.{h,cpp}       book list + Sync row + hidden-books mode
-    ReaderScreen.{h,cpp}   page index, draws baked display lists, images, .pos, pre-draw
+    ReaderScreen.{h,cpp}   page index, records baked display lists, streams images, .pos, staging
     QuickmenuScreen.{h,cpp} in-book menu + numbered chapter grid
   display/
-    DrawBuffer.h           IDisplay + draw buffer + fills/spare (host-safe constants)
-    DrawBuffer.cpp         text + 1-bit blit (byte-packed, both rotations; column-major/band paths for portrait); firmware CMake only
-    ui_font_{large,header}.h   Iosevka Slab Medium 24/32 px
+    DrawBuffer.h           IDisplay, PixelSource, Level/Ink, draw-list API (host-safe constants)
+    DrawBuffer.cpp         recorder, op matching/damage, strip replay + diff + windows; firmware + host tests only
+    ui_font_{large,header}.h   Iosevka Slab Medium 24/32 px, two planes
     ui_font_digits.h       Iosevka Slab Medium 40 px, 0-9 only (`make_font.py header --digits`): quick-menu chapter numbers
   content/
-    BitmapFont{,Format}.h  WGF1 reader / format doc
+    BitmapFont{,Format}.h  WGF reader / format doc (two planes per glyph)
+    BlueNoise.h            host-only: 64x64 threshold map (tools/make_blue_noise.py)
     ContentModel.h         Paragraph/Run/TextStyle; kMaxFontSizes = 8
     TextLayout.{h,cpp}     host-only: line breaking, page fitting, next_page_start
     PageGeometry.h         host-only: reader page options the paginator bakes with
@@ -157,20 +161,21 @@ wintergreen/               portable core
     wgb/WgbConverter.*     host-only EPUB → WGB
     Book/EpubParser/CssParser/XmlReader/HtmlEntities   host-only
     ZipReader.{h,cpp}      host-only
-    ImageDecoder/JpegDecoder/PngDecoder   host-only (streaming; no stb_image)
+    ImageDecoder/JpegDecoder/PngDecoder   host-only (streaming 8-bit gray; blue-noise quantise + plane packers)
     hyphenation/           host-only: Liang, English only (27 KB trie)
 
 docs/                      deep-dive notes (index above)
 
 tools/
   generate_assets.py       pre-build: font/sleep flash images
-  make_font.py             TTF → WGF1 / WGFS; always hinted 1-bit (--mono accepted, no-op)
+  make_font.py             TTF → WGF / WGFS; light hinting + stem darkening, 3 levels in two planes
   wgf_columns.py           append column-major glyph copy to WGFs (Libron.bin, ui_font_*.h); idempotent
-  check_font.py            validate bundle, ASCII-render sample
-  make_sleep_image.py      PNG → MGR2
+  check_font.py            validate bundle/header, ASCII + --png simulated-panel sample
+  make_sleep_image.py      PNG → sleep frame (4 levels, blue noise)
+  make_blue_noise.py       regenerates content/BlueNoise.h (numpy)
   merge-bin.sh             single flash-at-0x0 release image
-  books/                   `books` (flake package): review every EPUB in ~/Downloads/books (title/author/cover sixel/chapters), bake, one tar | ssh: WGB → `/media/books/<slug>/`, reviewed EPUB (wg.ncx, dropped = class="wgdrop") → `/media/books/.epubs/<Title> by <Author>.epub`; uploaded EPUBs then deleted locally (failed ones stay). Nothing kept on PC. Own CMakeLists, explicit sources; no arguments, no flags
-  tests/                   host checks; run.sh
+  books/                   `books` (flake package): review every EPUB in ~/Downloads/books (title/author/cover sixel/chapters), bake, one tar | ssh: WGB → `/media/books/<slug>/`, reviewed EPUB (wg.ncx, dropped = class="wgdrop") → `/media/books/.epubs/<Title> by <Author>.epub`; uploaded EPUBs then deleted locally (failed ones stay). Nothing kept on PC. Own CMakeLists, explicit sources. `--usb`: also copy books to reader over USB (before ssh). `--reuse`: first fetch `.epubs` minus `.sync.json` `finished` into ~/Downloads/books to rebake. Neither by default
+  tests/                   host checks; run.sh; preview.sh (real screens → PNGs on a simulated panel)
 ```
 
 ### Where behaviour lives
@@ -183,9 +188,9 @@ tools/
 | Button behavior | `input.h` thresholds → `Application::update` → screen `update()` |
 | Cover look | `HomeScreen::load_cover_`, `Application::show_book_cover_sleep_` |
 
-## USB = flashing only
-- No serial protocol, no USB driver install, no console. `serial_communication.h` (upload/delete/rename/open/inject commands, `g_index_op` handoff) removed 2026-11-10; don't re-add. Books arrive only by Wi-Fi sync.
-- No USB detection at all (removed 2026-11-11): auto-sleep and low-battery cutoff run while plugged. Flash within `kAutoSleepMinutes` of waking, or start upload and hold power. `keep_awake()` = sync only.
+## USB = flashing + book upload
+- Only protocol: `platforms/esp32/usb_books.h` (owner's call, 2026-11-19), upload-only (`books --usb`): magic `WGBK`, book folders → card via `.tmp`+rename, one 4 KB chunk in flight (driver ISR drops what exceeds its RX ring), index saved once, buttons dead + `keep_awake()` during a session. Receiver task blocks with no timeout; in-session reads bounded 5 s (only exit from a dead host). No console, no commands, nothing read back; old `serial_communication.h` (delete/rename/open/inject, `g_index_op`) stays gone.
+- No USB detection at all (removed 2026-11-11): auto-sleep and low-battery cutoff run while plugged. Flash within `kAutoSleepMinutes` of waking, or start upload and hold power. `keep_awake()` = sync + USB upload only.
 
 ## No logging
 - No log statements anywhere (`ESP_LOGx`, `MR_LOGI`, `HEAP_LOG`; `wintergreen/HeapLog.h` deleted). Temporary ones must be removed.
@@ -197,15 +202,15 @@ Raw partitions in `platforms/esp32/default_16MB.csv`:
 
 | Partition | Offset | Size | Holds |
 |---|---|---|---|
-| `font` | `0xC90000` | 1 MB | inflated WGFS (Libron) incl. column-major copy, 573,486 B |
-| `sleep` | `0xD90000` | 128 KB | `resources/sleep.mgr` verbatim, 96,004 B |
+| `font` | `0xC90000` | 2 MB | inflated WGFS (Libron) two planes incl. column-major copy, 1,027,406 B |
+| `sleep` | `0xE90000` | 128 KB | `resources/sleep.frame` verbatim, 96,000 B (generate_assets.py checks exact size) |
 
-- `tools/generate_assets.py` pre-build: inflates `resources/Libron.bin` (`[uint32 raw size][zlib]`) on build machine, copies `sleep.mgr`, writes to `$BUILD_DIR`, checks partition size, appends to `FLASH_EXTRA_IMAGES` (one esptool run, 4 images). Rewrites only on byte change.
+- `tools/generate_assets.py` pre-build: inflates `resources/Libron.bin` (`[uint32 raw size][zlib]`) on build machine, copies `sleep.frame`, writes to `$BUILD_DIR`, checks partition size, appends to `FLASH_EXTRA_IMAGES` (one esptool run, 4 images). Rewrites only on byte change.
 - Runtime: `RawPartition::map()` (`font_partition.h`) = `esp_partition_find_first` + `esp_partition_mmap`; no header/CRC/copy/inflate. `FontManager::init()` parses WGFS from mapping; `main.cpp` passes sleep mapping to `DrawBuffer::set_sleep_image()`.
 - Replaced first-boot provisioning (~15 s "Installing fonts...", font stored twice).
 - New asset = edit 3 in step: CSV, `PARTITIONS` in `generate_assets.py`, `map()` call site. Python asserts fit.
-- Font partition holds inflated 574 KB, not compressed. Intentional.
-- Every WGF (Libron bundle, `ui_font_*.h`) carries each glyph twice: row-major + column-major (`col_bitmap_offset`/`col_index_offset`, appended by `tools/wgf_columns.py`, idempotent, derived from existing bitmaps so pixels never change). Portrait glyphs = `blit_cols_` byte copy, no transpose. `make_font.py` calls `add_columns()`; hand-edited font without it still draws (transpose path).
+- Font partition holds inflated 1.03 MB, not compressed. Intentional. Grown 1 → 2 MB 2026-11-19 (partition table changed: sleep moved to `0xE90000`).
+- Every WGF (Libron bundle, `ui_font_*.h`) stores each glyph as two planes (`hi` gray-or-black, `lo` black, set = ink, `lo` ⊆ `hi`) and carries them twice: row-major + column-major (`col_bitmap_offset`/`col_index_offset`, appended by `tools/wgf_columns.py`, idempotent, derived from the rows so pixels never change). Portrait glyphs = column copy (a strip = a range of glyph columns), landscape = rows. The column copy is required (no transpose path); `font_test` checks it.
 
 ## Persistence
 No firmware-made dirs on card. Three hidden root files, one in `.hidden/`, + one per book:
@@ -253,14 +258,24 @@ Host-side, no framework, one `main()` + asserts each, ASan/UBSan. `tools/tests/r
 ```
 nix shell nixpkgs#gcc nixpkgs#cmake nixpkgs#gnumake -c tools/tests/run.sh ~/books
 ```
+Previews of the real screens (simulated panel, PNGs; outputs belong in a scratch dir, not the repo):
+```
+nix shell nixpkgs#gcc nixpkgs#cmake nixpkgs#gnumake -c tools/tests/preview.sh <out dir> book.epub ...
+```
 
 | Test | Covers |
 |---|---|
 | `json_scan_test.cpp` | sync reply scanner, every truncation of a valid reply |
-| `baked_line_test.cpp` | display-list draw pixel-identical to the PageContent draw it replaced: every font/style/valign, long words, rules, both rotations, real reader font |
-| `paginate_book_test.cpp` | final book: every display list reads, fits `kWgbMaxPageBytes`, parses to its end, valid image keys, no blank page, records advance, `find_page` round trip, chapter pages ordered; prints max list size |
+| `baked_line_test.cpp` | baked line ops (list in the tail) render pixel-identical to per-word text ops of the PageContent they replaced: every font/style/valign, long words, rules, both rotations, real reader font; and on the simulated glass |
+| `paginate_book_test.cpp` | final book: every display list reads, fits `kWgbMaxPageBytes`, parses to its end, valid image keys, image data = two-plane rows + cols, no blank page, records advance, `find_page` round trip, chapter pages ordered, every page recorded as the reader does fits a draw list; prints max list and max draw-list use |
 | `book_index_test.cpp` | index parse/save round trip; thumbnail pack built only on add/remove, slots copied, re-added book re-read |
 | `blank_para_test.cpp` | empty paragraphs |
-| `stretch_lut_test.cpp` | cover scaler stretch tables |
-| `blit_test.cpp` | `DrawBuffer::blit_1bit` / `blit_1bit_cols` + glyph ink (column-major in portrait) vs per-pixel reference, both rotations, all clipping |
+| `stretch_lut_test.cpp` | cover contrast-stretch tables |
+| `blit_test.cpp` | strip renderer vs per-pixel reference: fills/rects at every level, text in both inks (column copy vs rows), pixel sources in all layouts with row keeps, diamonds, both rotations, all clipping, fetch splitting |
+| `diff_test.cpp` | `refresh()` on a simulated controller (`sim_panel.h`): glass = list after every update, no pixel driven to the level it showed, unchanged screen = no update, correct if BW is copied to RED after an update; full-refresh level mapping; cursor move sends a window |
+| `drawlist_test.cpp` | text copied at record, tail kept across fill, staged list, parked quick-menu snapshot through redraws, overflow never crashes, draw without fill continues the glass |
+| `lut_test.cpp` | `panel_lut.h`: 105-byte layout, HOLD idle, right alignment, shared gray pulse, temperature bands + hysteresis + clamp, vendor voltages |
+| `dither_test.cpp` | blue-noise quantiser: exact levels exact, mean tone kept, neighbouring levels only, 3 and 4 levels, packers |
+| `frame_test.cpp` | sleep frame: converter packer and the flashed wordmark through `show_frame` = their levels on the simulated glass; wrong size refused |
+| `font_test.cpp` | every glyph of every device font: `lo` ⊆ `hi`, column copy = transpose of rows |
 | `labels_test.cpp` | `books` keep/drop heuristics (`tidy`, matter/junk, `key`, `slug`); labels raw, no chapter-number parsing |

@@ -118,8 +118,9 @@ class WgbWriter {
   // whole EPUB entry has been read.
   uint16_t add_image_ref(uint32_t local_header_offset, uint16_t width, uint16_t height);
 
-  // Store `size` bytes of already-compressed image data (JPEG/PNG exactly as it
-  // appeared in the EPUB) for image `idx`, to be emitted into the blob section.
+  // Image `idx`'s pixels as decoded (8-bit gray, width x height of its ref),
+  // stored as the two-plane rows and cols copies (WgbFormat.h); any other size
+  // leaves the image empty (drawn as blank space).
   void set_image_data(uint16_t idx, std::vector<uint8_t>&& data);
   bool image_has_data(uint16_t idx) const {
     return idx < image_data_.size() && !image_data_[idx].empty();

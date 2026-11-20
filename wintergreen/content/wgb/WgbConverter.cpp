@@ -288,8 +288,9 @@ bool convert_epub_to_wgb_streaming(Book& book, const char* output_path, const st
 
   // --- Rasterise the images --------------------------------------------------
   // Each image is decoded, scaled to fit the panel's portrait page box and
-  // dithered to 1 bit *here*, and only that bitmap goes into the WGB. The device
-  // then draws an image by reading rows and blitting them.
+  // blue-noise dithered to the panel's three levels *here* (WgbWriter::
+  // set_image_data), and only those planes go into the WGB. The device then
+  // streams an image's rows or columns straight to the panel.
   //
   // This is the single biggest thing the format does for the reader. Storing the
   // original JPEG/PNG meant the device carried a JPEG decoder, a PNG decoder, an
