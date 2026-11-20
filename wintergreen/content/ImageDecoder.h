@@ -8,57 +8,28 @@
 
 namespace wintergreen {
 
-// Decoded image: 8-bit grayscale (255 = white), row-major, already scaled.
-// Quantising to the panel's levels is the caller's (quantise_level and the
-// packers below), so every consumer dithers once, at its final size.
+// Decoded image: 1-bit packed bitmap, MSB first, row-major.
 struct DecodedImage {
   uint16_t width = 0;
   uint16_t height = 0;
-  std::vector<uint8_t> data;  // width bytes per row
+  std::vector<uint8_t> data;  // packed 1-bit, stride = (width+7)/8 bytes per row
 
   size_t stride() const {
-    return width;
+    return (width + 7) / 8;
   }
   size_t data_size() const {
     return stride() * height;
   }
 
-  // Gray at (x, y); white for out-of-bounds coords.
-  uint8_t pixel(int x, int y) const {
+  // Get pixel at (x, y): returns white (true) for out-of-bounds coords.
+  bool pixel(int x, int y) const {
     if (x < 0 || y < 0 || x >= width || y >= height)
-      return 255;
-    return data[static_cast<size_t>(y) * stride() + static_cast<size_t>(x)];
+      return true;
+    size_t byte_idx = static_cast<size_t>(y) * stride() + static_cast<size_t>(x) / 8;
+    uint8_t bit = 7 - (x % 8);
+    return (data[byte_idx] >> bit) & 1;
   }
 };
-
-// ---------------------------------------------------------------------------
-// Panel levels
-// ---------------------------------------------------------------------------
-//
-// What the panel's gray and light levels reflect, 0 = black .. 1 = white: the
-// targets the quantiser picks between. Guesses until measured on the device
-// (docs/display.md "Waveform tuning"); tools/make_sleep_image.py uses the same.
-inline constexpr float kGrayLevel = 0.5f;
-inline constexpr float kLightLevel = 0.75f;
-
-// Level (0 white, 1 light, 2 gray, 3 black) for gray `g` at (x, y), blue-noise
-// dithered between the two levels around it. `levels` 3 = white, gray, black
-// (normal updates: images, covers); 4 adds light (full refreshes: the sleep
-// cover). Flat input at a level's own tone stays exact; mean tone is kept.
-int quantise_level(uint8_t g, int x, int y, int levels);
-
-// Pack a w x h gray image as two planes (hi = gray or black, lo = black; set =
-// ink, MSB first), `levels` as above:
-//   rows: row r = ceil(w/8) hi bytes then ceil(w/8) lo bytes
-//   cols: column c = ceil(h/8) hi bytes then ceil(h/8) lo bytes, top MSB
-// `out` must hold 2 * ceil(w/8) * h (rows) or 2 * ceil(h/8) * w (cols) bytes.
-void pack_rows(const uint8_t* gray, int w, int h, int levels, uint8_t* out);
-void pack_cols(const uint8_t* gray, int w, int h, int levels, uint8_t* out);
-
-// The sleep frame (CoverPaths.h, 4 levels) of a kSleepCoverW x kSleepCoverH
-// portrait gray image; `frame` holds kSleepFrameBytes. Same format as
-// tools/make_sleep_image.py writes for the wordmark.
-void pack_sleep_frame(const uint8_t* gray, uint8_t* frame);
 
 enum class ImageFormat {
   Unknown,
@@ -141,9 +112,9 @@ void scaled_size(uint16_t raw_w, uint16_t raw_h, uint16_t max_w, uint16_t max_h,
 // Uses ImageSizeStream internally. Returns true if successful.
 bool get_image_size(const uint8_t* data, size_t size, uint16_t& out_w, uint16_t& out_h);
 
-// Callback invoked for each output row during streaming decode.
+// Callback invoked for each dithered output row during streaming decode.
 // y: 0-based row index within the image.
-// data: 8-bit gray row, width bytes.
+// data: packed 1-bit row, (width+7)/8 bytes, MSB=leftmost pixel.
 // width: image width in pixels.
 struct ImageRowSink {
   void (*emit_row)(void* ctx, uint16_t y, const uint8_t* data, uint16_t width) = nullptr;
@@ -152,15 +123,15 @@ struct ImageRowSink {
 
 // Callback invoked per pixel during Adam7 interlaced PNG decode.
 // Pixels arrive out of row order; the callback must support random writes.
-// x, y: output pixel coordinates. gray: 255 = white.
+// x, y: output pixel coordinates. white: true=white, false=black.
 struct ImagePixelSink {
-  void (*set_pixel)(void* ctx, uint16_t x, uint16_t y, uint8_t gray) = nullptr;
+  void (*set_pixel)(void* ctx, uint16_t x, uint16_t y, bool white) = nullptr;
   void* ctx = nullptr;
 };
 
-// Optional 256-entry tone map applied to each grayscale sample on output.
-// nullptr = identity. Used by the sleep cover to contrast-stretch a
-// low-contrast cover into the panel's range; see build_stretch_lut.
+// Optional 256-entry tone map applied to each grayscale sample before it is
+// dithered. nullptr = identity. Used by the sleep cover to contrast-stretch a
+// low-contrast cover into the panel's 1-bit range; see build_stretch_lut.
 using ToneLut = const uint8_t*;
 
 // Build a contrast-stretch LUT from a grayscale histogram.
@@ -169,7 +140,8 @@ using ToneLut = const uint8_t*;
 // usable range, in which case lut is left untouched and should not be applied.
 bool build_stretch_lut(const uint32_t hist[256], double clip_frac, uint8_t lut[256]);
 
-// Accumulates a grayscale histogram of the samples a decode outputs. Non-null = collect; the decode is otherwise unaffected. This is how
+// Accumulates a grayscale histogram of the samples a decode passes to the
+// ditherer. Non-null = collect; the decode is otherwise unaffected. This is how
 // the sleep cover's probe pass learns the source tone range without a separate
 // grayscale decode path.
 struct ToneHistogram {

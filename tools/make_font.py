@@ -10,26 +10,25 @@ Produces the two shapes the firmware consumes:
   header  UI font: a bare WGF1 blob emitted as a C array, matching
           wintergreen/display/ui_font_*.h.
 
-Needs freetype-py and fontTools, which are not in the PlatformIO interpreter:
+Needs freetype-py, which is not in the PlatformIO interpreter. Run it under:
 
-  nix shell --impure --expr 'with import <nixpkgs> {}; python3.withPackages (ps: [ps.freetype-py ps.fonttools ps.pillow])' -c python3 tools/make_font.py ...
+  nix-shell -p 'python3.withPackages(ps: [ps.freetype-py])' --run '...'
 
-Format notes (WgfFormat.h has the layout):
+Format notes that are not in WgfFormat.h and were recovered from the
+shipped Literata:
 
   * advance_width is in QUARTER-pixels, not pixels.
-  * Every glyph is two 1-bit planes, back to back at bitmap_offset: `hi`
-    (gray or black) then `lo` (black), each ceil(w/8) bytes per row, MSB
-    first, bit SET = ink. lo is a subset of hi. The column-major copy for
-    portrait (tools/wgf_columns.py) is appended last, hi columns then lo.
+  * The BW plane draws where its bit is CLEAR; untouched BW bits must be 1.
+    The column-major copy for portrait (tools/wgf_columns.py) is appended last.
 
 Rendering choices, for quality:
 
-  * FT_LOAD_TARGET_LIGHT: vertical metrics snapped by the autofitter
-    (baseline, x-height), horizontal shapes left smooth, 8-bit coverage. The
-    panel shows three levels in a normal update, so coverage is quantised to
-    white / gray / black at GRAY_THRESHOLD and BLACK_THRESHOLD.
-  * Stem darkening on (autofitter `no-stem-darkening` = false), so the
-    antialiased weight matches the old mono-hinted text instead of thinning.
+  * FT_LOAD_TARGET_MONO, BW plane only. The device draws nothing else, and
+    thresholding an antialiased render left stems straddling pixel boundaries
+    (blurry and uneven), where mono hinting snaps them to the grid. It also drops
+    two thirds of the bitmap data. The cost is integer advances — the hinter
+    rounds them — so the quarter-pixel field carries whole pixels. The old
+    5-level gray path is gone; `--mono` is still accepted and changes nothing.
   * Class kerning is extracted from GPOS (and the legacy kern table) and packed
     losslessly: glyphs with identical kerning rows share a class.
 """
@@ -39,8 +38,6 @@ import os
 import struct
 import sys
 import zlib
-
-import ctypes
 
 import freetype
 
@@ -83,7 +80,7 @@ def codepoints():
 
 
 class Glyph:
-    __slots__ = ("advance_q", "width", "height", "x_off", "y_off", "planes")
+    __slots__ = ("advance_q", "width", "height", "x_off", "y_off", "bw")
 
     def __init__(self):
         self.advance_q = 0
@@ -91,49 +88,12 @@ class Glyph:
         self.height = 0
         self.x_off = 0
         self.y_off = 0
-        self.planes = b""  # hi plane then lo plane, row-major
+        self.bw = b""
 
 
-LOAD_FLAGS = freetype.FT_LOAD_RENDER | freetype.FT_LOAD_TARGET_LIGHT
-
-# Coverage (0-255) at or above which a pixel is gray, and black. Tuned by eye
-# on the simulated panel (tools/check_font.py --png) against the old mono
-# weight; retune on the device if the panel's gray reads differently.
-GRAY_THRESHOLD = 64
-BLACK_THRESHOLD = 168
-
-_darkening_set = False
-
-
-def enable_stem_darkening():
-    """Autofitter stem darkening, process-wide (FreeType property)."""
-    global _darkening_set
-    if _darkening_set:
-        return
-    off = ctypes.c_int(0)
-    err = freetype.raw.FT_Property_Set(freetype.get_handle(), b"autofitter", b"no-stem-darkening",
-                                       ctypes.byref(off))
-    if err:
-        sys.exit(f"FT_Property_Set(no-stem-darkening) failed: {err}")
-    _darkening_set = True
-
-
-def quantise(coverage, w, h, pitch):
-    """8-bit coverage rows -> (hi, lo) planes, packed MSB first, set = ink."""
-    stride = (w + 7) // 8
-    hi = bytearray(stride * h)
-    lo = bytearray(stride * h)
-    for row in range(h):
-        src = row * pitch
-        dst = row * stride
-        for col in range(w):
-            c = coverage[src + col]
-            if c >= GRAY_THRESHOLD:
-                m = 0x80 >> (col & 7)
-                hi[dst + (col >> 3)] |= m
-                if c >= BLACK_THRESHOLD:
-                    lo[dst + (col >> 3)] |= m
-    return bytes(hi), bytes(lo)
+# Always hinted 1-bit: the device draws only the BW plane, and the gray-plane
+# path that once lived here (FT_LOAD_TARGET_LIGHT + 5-level binning) is gone.
+MONO_LOAD_FLAGS = freetype.FT_LOAD_RENDER | freetype.FT_LOAD_TARGET_MONO
 
 
 def glyph_index(face, cp):
@@ -145,11 +105,11 @@ def glyph_index(face, cp):
 
 
 def render_glyph(face, cp):
-    """Rasterize one codepoint into its two planes. Returns None if absent."""
+    """Rasterize one codepoint into the BW plane. Returns None if absent."""
     gi = glyph_index(face, cp)
     if gi == 0:
         return None
-    face.load_glyph(gi, LOAD_FLAGS)
+    face.load_glyph(gi, MONO_LOAD_FLAGS)
     slot = face.glyph
     bmp = slot.bitmap
 
@@ -164,12 +124,17 @@ def render_glyph(face, cp):
         g.width = g.height = 0
         return g
 
-    hi, lo = quantise(bmp.buffer, g.width, g.height, bmp.pitch)
-    if not any(hi):
-        # Coverage too faint for gray: draw nothing, keep the advance.
-        g.width = g.height = 0
-        return g
-    g.planes = hi + lo
+    stride = (g.width + 7) // 8
+
+    # FreeType hands back a bit-packed, MSB-first plane where 1 = ink; the
+    # BW plane wants 0 = ink, and its padding bits white. Inverting does
+    # both, since FreeType leaves the padding clear.
+    bw = bytearray(stride * g.height)
+    for row in range(g.height):
+        src = row * bmp.pitch
+        for i in range(stride):
+            bw[row * stride + i] = ~bmp.buffer[src + i] & 0xFF
+    g.bw = bytes(bw)
     return g
 
 
@@ -364,12 +329,11 @@ def face_metrics(face, line_height_pct=None):
 
 
 def build_wgf(faces, px, name, kern_sources=None, line_height_pct=None):
-    """Compile one WGF blob for a single pixel size.
+    """Compile one WGF1 blob for a single pixel size.
 
     faces: dict of style -> freetype.Face (regular is required).
     kern_sources: dict of style -> (pairs, upem) from extract_kern_pairs.
     """
-    enable_stem_darkening()
     for f in faces.values():
         f.set_pixel_sizes(0, px)
 
@@ -426,7 +390,7 @@ def build_wgf(faces, px, name, kern_sources=None, line_height_pct=None):
         off += STYLE_SECTION_SIZE + table_size + len(kern[style])
 
     # Bitmap pool. Every style appends into the same pool.
-    pool = bytearray()
+    bw_pool = bytearray()
     offsets = {}
     seen = {}  # identical bitmaps (e.g. the same glyph reused) share an offset
     for style in present:
@@ -435,10 +399,10 @@ def build_wgf(faces, px, name, kern_sources=None, line_height_pct=None):
             if g.width == 0 or g.height == 0:
                 offsets[style].append(0)
                 continue
-            if g.planes not in seen:
-                seen[g.planes] = len(pool)
-                pool += g.planes
-            offsets[style].append(seen[g.planes])
+            if g.bw not in seen:
+                seen[g.bw] = len(bw_pool)
+                bw_pool += g.bw
+            offsets[style].append(seen[g.bw])
 
     bitmap_data_offset = off
     # Column bitmaps: filled in by add_columns() below.
@@ -509,7 +473,7 @@ def build_wgf(faces, px, name, kern_sources=None, line_height_pct=None):
         out += kern[style]
 
     assert len(out) == bitmap_data_offset
-    out += pool
+    out += bw_pool
     return add_columns(bytes(out))
 
 
@@ -578,6 +542,11 @@ def main():
             help="line height as a percent of the em (e.g. 145). Default: the font's own "
             "metrics, which vary enough between families to change how the reader's "
             "line-height setting feels.",
+        )
+        p.add_argument(
+            "--mono",
+            action="store_true",
+            help="accepted for compatibility; rendering is always hinted 1-bit.",
         )
 
     b = sub.add_parser("bundle", help="reader font: compressed WGFS bundle")

@@ -58,34 +58,34 @@ item/selection/navigation machinery; every pixel comes from its own `draw_all_`.
 - The selected cover is loaded on demand **from inside `draw_all_`** (hence the `mutable`
   cover members). Loading from `update()` would draw one frame with the previous cover
   and then redraw — two e-ink refreshes per press.
-- **The cover is held nowhere** (2026-11-19). Only its header is read at draw time; the
-  pixels are a blit op whose source is the screen itself (`HomeScreen::read`), streamed
-  from the card a strip at a time while the panel refreshes, and only where the cover is
-  new on the glass: an unchanged cover is matched op-for-op and never read again
-  (docs/display.md "Draw lists and strips"). It shows with the clicker connected and
-  through a sync. There is still exactly **one** cover per screen; neighbour preload is
-  not needed (a cover is a strip-wise read during the refresh that shows it).
-  `cover_slot_` is what stops the header being re-read every frame, including for a book
-  with no cover file: no cover with a valid `cover_slot_` is a real state, not a miss.
+- **The cover lives in the spare framebuffer, not on the heap** (`claim_spare_cache(this)`,
+  trusted while `spare_cache_valid(cover_gen_)`). A heap copy was ~26 KB resident for as
+  long as the home screen was. The cache owner is part of the claim, so the book list's
+  thumbnails and this cover invalidate each other instead of trusting overwritten bytes.
+  The spare is never released (radios included, since 2026-11-11), so the cover shows
+  with the clicker connected and through a sync. There is still exactly **one** cover —
+  a second, preloaded one crashed the device in the layout era; reopened 2026-11-12 and
+  waiting on heap numbers (two covers do not fit the 48,000 B spare; it needs its own
+  fixed 25 KB buffer). See `docs/history.md` "Still open". `cover_slot_` is what stops the card being re-read every frame,
+  including for a book with no cover file: no cover with a valid `cover_slot_` is a real
+  state, not a miss. A cover that was loaded and then lost its spare is reloaded.
 - `on_start()` clears `cover_slot_` because it rebuilds `slots_` from the index — a sync,
   a sync repoints every index without necessarily changing one.
 - The cover is **`cover_home.bin`**, rendered by the converter to fit the box
   (`kHomeCoverW` × `kHomeCoverH` = 424x486 in `content/CoverPaths.h`) with its blank top
-  and bottom rows already trimmed (`Book::write_cover_bin`), 3 levels, two planes,
-  column-major. **There is no scaler on the device** and no fallback
+  and bottom rows already trimmed (`Book::write_cover_bin`), so a load is a header and
+  one `fread` into the spare. **There is no scaler on the device** and no fallback
   file: a missing or oversized cover draws the placeholder frame. `cover_sleep.bin` is
   not a substitute — it is composed for the panel with bars baked in. The two constants
   mirror `draw_all_`'s layout maths; if the layout moves they drift and every cover
   shows the placeholder until the library is re-converted.
-- The header read calls `wait_panel_idle()` first: the card shares SPI2 with the panel.
-- The frame around the cover, the placeholder and the position diamonds are gray /
-  antialiased (`draw_outline(..., Level::Gray)`, `draw_diamond`).
+- The cover read calls `wait_panel_idle()` first: the card shares SPI2 with the panel.
 
 ### QuickmenuScreen
 
 **Closes itself when the clicker connects.** `update()` watches `clicker_state()`; a
 Connecting → Connected change while the menu is up calls `on_back()`, returning to the
-book (the parked snapshot: no card read, no redraw).
+book (snapshot fast path).
 
 A flat list: header block, Font Size, Orientation, Clicker (only when a MAC is
 configured), then the chapter grid. There is no separate Chapters page — selecting a
@@ -95,11 +95,10 @@ pops one screen; `ReaderScreen::resume()` consumes it.
 **Chapter grid.** Two columns of boxed numbers (`1`, `2`, ...), nothing else; the header's
 chapter line reads "Chapter N of M". Each chapter is still one list item, in grid order, so
 the inherited linear navigation is the grid's: down / front Button2 steps right, then wraps
-to the next row's left cell; up reverses. Every cell has a 1 px gray box; the selected one
-is filled black with white digits (gray-antialiased), as is every selection since
-2026-11-19: black fill + white text keeps the text's AA, where a gray fill would swallow
-its gray edges (one update shows only white, gray and black). Settings rows and the
-header block select the same way. Scrolling is item-indexed (base class), but the
+to the next row's left cell; up reverses. Every cell has a 1 px box, the selected one a
+2 px frame (`kCellSelW`, same as the home cover frame, shared `draw_outline()` in
+`ListMenuScreen.h`), never an inverted fill — fewer pixels flip per move, so less ghosting.
+Settings rows keep the inverted selection. Scrolling is item-indexed (base class), but the
 grid always draws and counts whole rows from the row holding `scroll_offset()`
 (`first_grid_row_()`); `centred_offset_` and `draw_all_` must agree on that.
 
@@ -219,7 +218,7 @@ by the clicker's hold (`docs/bluetooth.md`): it means "revert the step the last 
 made, without drawing; an action follows". Here: `undo_selected_` (cursor before the last
 press move) is restored. In `ReaderScreen`: `last_step_` (+1/-1 of the last turn that
 moved, 0 if none, so a press at the book's first page undoes nothing) is reverted with
-`prev_page_()`/`next_page_()` and `pixels_stale_` stops `resume()` restoring the parked
+`prev_page_()`/`next_page_()` and `pixels_stale_` stops `pause()` snapshotting the
 page the glass still shows; a turn still pending in the same batch is just cancelled.
 Screens that do not handle it ignore it.
 
@@ -243,22 +242,20 @@ left using them and are gone, along with the 14 px UI font only they used.
   / `get_item_thumb`) and book rows reserve **two title lines** (`detail_title_lines_`;
   the title wraps at a word, a one-line title leaves the second blank) so the cover gets
   a 76x115 box. The file is `cover_list.bin`, rendered by the converter to fit
-  `kListCoverW`x`kListCoverH`. Indexed books use their slot in the thumbnail pack
-  (`.wintergreen-thumbs`, `BookIndex.h`); hidden books and any slot whose key does not
-  match fall back to the book's own file. **The device has no cover scaler** — a book
-  without the file draws an empty gray frame. **There is no thumbnail cache** (it was 40
-  slots in the spare framebuffer): a row records a blit whose source is `MainMenu` itself
-  (`read()`, pack or own file, opened during the refresh and closed by `release()`), and
-  the refresh streams it only where the row is new on the glass or something over it
-  changed. What is kept per book (40 slots, keyed by path) is the header's answer — pack
-  offset or own file, size, or no cover — so a redraw opens nothing at record time.
-  `thumb_epoch_` (bumped when a sync may have replaced a book) is part of every blit's
-  identity, so an old cover is never taken for a new one. The column is there with the
-  radios up too. Nothing is read ahead (a prefetch of rows that might never be shown was
-  built and removed as wasted card reads and CPU).
-- Selection is a black fill with white, gray-antialiased text; author and percentage are
-  black like the title (gray text could not be antialiased in a normal update). Dividers,
-  hairlines, the scrollbar and empty cover frames are gray.
+  `kListCoverW`x`kListCoverH`, so a load is a header and one `fread` straight into the
+  slot. Indexed books read their slot from the thumbnail pack (`.wintergreen-thumbs`,
+  `BookIndex.h`), opened once per draw and closed by `end_thumbs()`; hidden books and
+  any slot whose key does not match fall back to the book's own file. **The device has no cover scaler** — a book without the file draws an empty
+  frame. Covers load **during the draw that first shows the row**, so a page and its
+  covers arrive in one refresh; nothing is read ahead (a prefetch of rows that might
+  never be shown was built and removed as wasted card reads and CPU). The cache lives
+  in the spare framebuffer (`DrawBuffer::claim_spare_cache`, validity by
+  `spare_cache_gen()`): no allocation, up to 40 slots, keyed by path, surviving list
+  visits until the reader or a radio claims the spare — with a radio up
+  the column is absent. The first version used its own `malloc` gated on 40 KB of
+  contiguous heap and showed nothing on hardware: the heap is too fragmented for that
+  gate. A load re-checks the spare after its last allocation, because the OOM handler
+  releases it from inside any allocation.
 
 **There is one separator, defined once.** `kSeparatorH` (14 px) and `draw_separator_()`
 are the only hairline geometry in the tree, and every list uses them, including

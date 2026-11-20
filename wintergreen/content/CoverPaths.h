@@ -30,9 +30,8 @@ std::string cover_list_bin_path(const char* book_path);
 std::string book_pos_path(const char* book_path);
 
 // The home carousel's cover box, in panel pixels. The converter renders
-// cover_home.bin to fit exactly this, and HomeScreen draws it 1:1, streamed
-// from the card a strip at a time — the device has no scaler and no cover
-// buffer.
+// cover_home.bin to fit exactly this, and HomeScreen reads it 1:1 — the device
+// has no scaler, so a cover is a header and one fread.
 //
 // Derived from HomeScreen::draw_all_'s layout. Note the panel's app-space
 // height is **793**, not 800: DisplayFrame::kPhysicalWidth excludes the 7
@@ -53,7 +52,7 @@ inline constexpr int kHomeCoverW = 424;
 inline constexpr int kHomeCoverH = 486;
 
 // The book list's thumbnail box. The converter renders cover_list.bin to fit
-// inside it, so MainMenu draws it 1:1 from the card (or the thumbnail pack);
+// inside it, so MainMenu reads it straight into its cache with no scaling;
 // a book without the file draws an empty frame. Derived from ListMenuScreen's
 // two-title-line detail row:
 //
@@ -68,44 +67,40 @@ inline constexpr int kListCoverW = 76;
 inline constexpr int kListCoverH = 115;
 
 // The sleep screen, in panel pixels (portrait) — the whole visible panel.
-// The converter composes cover_sleep.bin at exactly this size, artwork trimmed
-// and stretched to the panel, so Application::do_sleep_ streams it 1:1. A file of any other size is ignored and
+// The converter composes cover_sleep.bin at exactly this size, artwork scaled
+// to fit, centred, and the letterbox bars already filled, so
+// Application::do_sleep_ blits it 1:1. A file of any other size is ignored and
 // the wordmark shown instead; that is what an unconverted library looks like.
 // Application.cpp static_asserts these against the panel — the first version of
 // this said 800 and every cover silently failed the size check.
 inline constexpr int kSleepCoverW = 480;
 inline constexpr int kSleepCoverH = 793;
 
-// On-card layouts, all two planes (hi = gray or black, lo = black; bit set =
-// ink), baked for the portrait screens so a strip is one contiguous read and
-// the device copies bytes instead of transposing bits:
+// On-card layouts, both baked for the portrait screens so the device copies
+// bytes instead of transposing bits:
 //
-//   cover_list.bin, cover_home.bin (3 levels): u16 w, u16 h, then w columns,
-//     each ceil(h / 8) hi bytes then ceil(h / 8) lo bytes, top pixel MSB
-//     (PixelLayout::Cols).
-//   cover_sleep.bin (4 levels): the panel's own frame, kSleepFrameBytes, no
-//     header: per physical row, kSleepFrameStride hi bytes then as many lo
-//     bytes; physical row kSleepFrameRows - 1 - x, bit kSleepFrameOffX + y
-//     holds portrait pixel (x, y) (PixelLayout::Frame). The wordmark
-//     (resources/sleep.frame) has the same format.
+//   cover_list.bin, cover_home.bin: u16 w, u16 h, then w columns of
+//     ceil(h / 8) bytes, top pixel MSB, bit set = white
+//     (DrawBuffer::blit_1bit_cols).
+//   cover_sleep.bin: the panel's own frame, kSleepFrameBytes, no header:
+//     physical row kSleepFrameRows - 1 - x, bit kSleepFrameOffX + y holds
+//     portrait pixel (x, y). Read straight into the draw buffer.
 //
 // Frame constants mirror DisplayFrame (Application.cpp static_asserts them);
 // they live here so the host converter needs no display header.
 inline constexpr int kSleepFrameStride = 100;
 inline constexpr int kSleepFrameRows = 480;
 inline constexpr int kSleepFrameOffX = 7;
-inline constexpr size_t kSleepFrameBytes = 2 * static_cast<size_t>(kSleepFrameStride) * kSleepFrameRows;
+inline constexpr size_t kSleepFrameBytes = static_cast<size_t>(kSleepFrameStride) * kSleepFrameRows;
 
 inline constexpr size_t cover_cols_bytes(int w, int h) {
-  return 2 * static_cast<size_t>((h + 7) / 8) * static_cast<size_t>(w);
+  return static_cast<size_t>((h + 7) / 8) * static_cast<size_t>(w);
 }
 
-// Portrait pixel (x, y) of a sleep frame: its level, 0 white .. 3 black.
-inline int sleep_frame_level(const uint8_t* frame, int x, int y) {
+// Portrait pixel (x, y) of a sleep frame: true = white.
+inline bool sleep_frame_white(const uint8_t* frame, int x, int y) {
   const int bit = kSleepFrameOffX + y;
-  const uint8_t* row = frame + static_cast<size_t>(kSleepFrameRows - 1 - x) * 2 * kSleepFrameStride;
-  const int m = 0x80 >> (bit & 7);
-  return ((row[bit >> 3] & m) ? 2 : 0) | ((row[kSleepFrameStride + (bit >> 3)] & m) ? 1 : 0);
+  return (frame[static_cast<size_t>(kSleepFrameRows - 1 - x) * kSleepFrameStride + (bit >> 3)] >> (7 - (bit & 7))) & 1;
 }
 
 }  // namespace wintergreen

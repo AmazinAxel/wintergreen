@@ -1,11 +1,11 @@
 // PngDecoder.cpp
 //
-// Minimal streaming PNG decoder producing 8-bit grayscale (the caller quantises).
+// Minimal streaming PNG decoder producing 1-bit Atkinson-dithered bitmaps.
 // Ported from TrustyReader (Rust) to C++17.
 //
 // Streams row-by-row: reads chunks from ZipEntryInput, feeds IDAT data
 // into a tinfl (miniz) zlib decompressor, reconstructs scanlines one at a
-// time with PNG filter un-apply, then samples to 8-bit output.
+// time with PNG filter un-apply, then dithers to 1-bit output.
 //
 // Supported colour types: greyscale (1/2/4/8/16 bpp), RGB (8/16),
 // palette (1/2/4/8), grey+alpha (8/16), RGBA (8/16).
@@ -293,13 +293,16 @@ static void unfilter_row(uint8_t filter, uint8_t* row, const uint8_t* prev, size
 }
 
 // ---------------------------------------------------------------------------
-// One PNG row → one 8-bit output row (scaled, tone-mapped)
+// Atkinson dithering (one PNG row → 1-bit output)
+// Distributes 6/8 of error to 6 neighbors; intentionally loses 1/4.
+// Requires 3 error rows: cur (this row), nxt (next), nxt2 (row+2).
 // ---------------------------------------------------------------------------
 
-static void sample_row_png(const uint8_t* src_row, const PngHeader& hdr, const uint8_t palette_grey[256],
-                           uint32_t x_step, int out_w, uint8_t* out_row, ToneLut tone_lut = nullptr,
-                           ToneHistogram* tone_hist = nullptr) {
+static void dither_row_png(const uint8_t* src_row, const PngHeader& hdr, const uint8_t palette_grey[256],
+                           uint32_t x_step, int out_w, int16_t* err_cur, int16_t* err_nxt, int16_t* err_nxt2,
+                           uint8_t* out_row, ToneLut tone_lut = nullptr, ToneHistogram* tone_hist = nullptr) {
   uint32_t sx_fp = 0;
+  uint8_t acc = 0, bit = 0x80;
   bool grey8 = (hdr.color_type == kColorGreyscale && hdr.bit_depth == 8);
   bool rgb8 = (hdr.color_type == kColorRGB && hdr.bit_depth == 8);
   bool pal4 = (hdr.color_type == kColorPalette && hdr.bit_depth == 4);
@@ -321,8 +324,34 @@ static void sample_row_png(const uint8_t* src_row, const PngHeader& hdr, const u
       ++tone_hist->bins[static_cast<uint8_t>(g)];
     if (tone_lut)
       g = static_cast<int16_t>(tone_lut[static_cast<uint8_t>(g)]);
-    out_row[ox] = static_cast<uint8_t>(g);
+
+    int16_t val = static_cast<int16_t>(g + err_cur[ox + 1]);
+    if (val < 0)
+      val = 0;
+    if (val > 255)
+      val = 255;
+    bool white = val >= 128;
+    int16_t e = white ? static_cast<int16_t>(val - 255) : val;
+    int16_t q = static_cast<int16_t>(e >> 3);
+
+    if (white)
+      acc |= bit;
+    bit >>= 1;
+    if (!bit) {
+      *out_row++ = acc;
+      acc = 0;
+      bit = 0x80;
+    }
+
+    err_cur[ox + 2] = static_cast<int16_t>(err_cur[ox + 2] + q);
+    err_cur[ox + 3] = static_cast<int16_t>(err_cur[ox + 3] + q);
+    err_nxt[ox] = static_cast<int16_t>(err_nxt[ox] + q);
+    err_nxt[ox + 1] = static_cast<int16_t>(err_nxt[ox + 1] + q);
+    err_nxt[ox + 2] = static_cast<int16_t>(err_nxt[ox + 2] + q);
+    err_nxt2[ox + 1] = static_cast<int16_t>(err_nxt2[ox + 1] + q);
   }
+  if (bit != 0x80)
+    *out_row = acc;
 }
 
 ImageError decode_png_from_entry(IZipFile& file, const ZipEntry& entry, uint16_t max_w, uint16_t max_h,
@@ -485,7 +514,7 @@ ImageError decode_png_from_entry(IZipFile& file, const ZipEntry& entry, uint16_t
   }
   uint32_t x_step = (src_w << 16) / out_w;
   uint32_t y_step = (src_h << 16) / out_h;
-  const uint32_t out_stride = out_w;  // 8-bit gray
+  uint32_t out_stride = (out_w + 7) / 8;
 
   // ---- Adam7 interlaced path ----
   // Decodes all 7 passes in a single IDAT stream pass.  Each decoded pixel is
@@ -501,6 +530,14 @@ ImageError decode_png_from_entry(IZipFile& file, const ZipEntry& entry, uint16_t
     static const uint8_t kA7YS[7] = {0, 0, 4, 0, 2, 0, 1};
     static const uint8_t kA7XD[7] = {8, 8, 4, 4, 2, 2, 1};
     static const uint8_t kA7YD[7] = {8, 8, 8, 4, 4, 2, 2};
+
+    // Bayer 4×4 ordered dithering (pixel-independent, no error rows needed)
+    static const uint8_t kBayer[4][4] = {
+        {0,   128, 32,  160},
+        {192, 64,  224, 96 },
+        {48,  176, 16,  144},
+        {240, 112, 208, 80 }
+    };
 
     // --- fallback: no pixel_sink → allocate full output buffer ---
     std::unique_ptr<uint8_t[]> a7_out;
@@ -631,14 +668,16 @@ ImageError decode_png_from_entry(IZipFile& file, const ZipEntry& entry, uint16_t
               uint32_t ox = src_x * out_w / src_w;
               if (ox < out_w) {
                 uint8_t g = pixel_to_grey(curr_row_a7.get(), pc, hdr, palette_grey);
-                if (tone_hist)
-                  ++tone_hist->bins[g];
-                if (tone_lut)
-                  g = tone_lut[g];
-                if (pixel_sink)
-                  pixel_sink->set_pixel(pixel_sink->ctx, static_cast<uint16_t>(ox), static_cast<uint16_t>(oy), g);
-                else
-                  out_row_ptr[ox] = g;
+                bool white = g >= kBayer[oy & 3][ox & 3];
+                if (pixel_sink) {
+                  pixel_sink->set_pixel(pixel_sink->ctx, static_cast<uint16_t>(ox), static_cast<uint16_t>(oy), white);
+                } else {
+                  uint8_t bit = static_cast<uint8_t>(0x80u >> (ox & 7));
+                  if (white)
+                    out_row_ptr[ox / 8] |= bit;
+                  else
+                    out_row_ptr[ox / 8] &= static_cast<uint8_t>(~bit);
+                }
               }
             }
           }
@@ -705,7 +744,11 @@ ImageError decode_png_from_entry(IZipFile& file, const ZipEntry& entry, uint16_t
   if (!prev_row || !curr_row || !row_buf)
     return ImageError::ReadError;
 
-  std::vector<uint8_t> temp_row(sink ? static_cast<size_t>(out_w) : 0);
+  auto err_cur = std::unique_ptr<int16_t[]>(new (std::nothrow) int16_t[out_w + 4]());
+  auto err_nxt = std::unique_ptr<int16_t[]>(new (std::nothrow) int16_t[out_w + 4]());
+  auto err_nxt2 = std::unique_ptr<int16_t[]>(new (std::nothrow) int16_t[out_w + 4]());
+  if (!err_cur || !err_nxt || !err_nxt2)
+    return ImageError::ReadError;
 
   // Output bitmap
   out.width = static_cast<uint16_t>(out_w);
@@ -812,14 +855,20 @@ ImageError decode_png_from_entry(IZipFile& file, const ZipEntry& entry, uint16_t
             if (src_y != target_src_y)
               break;
             if (sink) {
-              sample_row_png(curr_row.get(), hdr, palette_grey, x_step, static_cast<int>(out_w), temp_row.data(),
-                             tone_lut, tone_hist);
-              sink->emit_row(sink->ctx, static_cast<uint16_t>(out_y), temp_row.data(), static_cast<uint16_t>(out_w));
+              uint8_t temp_row[128];  // byte accumulator writes all bytes
+              dither_row_png(curr_row.get(), hdr, palette_grey, x_step, static_cast<int>(out_w), err_cur.get(),
+                             err_nxt.get(), err_nxt2.get(), temp_row, tone_lut, tone_hist);
+              sink->emit_row(sink->ctx, static_cast<uint16_t>(out_y), temp_row, static_cast<uint16_t>(out_w));
             } else {
-              sample_row_png(curr_row.get(), hdr, palette_grey, x_step, static_cast<int>(out_w),
-                             out.data.data() + out_y * out_stride, tone_lut, tone_hist);
+              uint8_t* out_row = out.data.data() + out_y * out_stride;
+              dither_row_png(curr_row.get(), hdr, palette_grey, x_step, static_cast<int>(out_w), err_cur.get(),
+                             err_nxt.get(), err_nxt2.get(), out_row, tone_lut, tone_hist);
             }
             ++out_y;
+            // Rotate three error rows: cur←nxt, nxt←nxt2, nxt2←fresh
+            std::swap(err_cur, err_nxt);
+            std::swap(err_nxt, err_nxt2);
+            std::fill(err_nxt2.get(), err_nxt2.get() + out_w + 4, int16_t(0));
           }
 
           std::swap(prev_row, curr_row);

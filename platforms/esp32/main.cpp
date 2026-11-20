@@ -1,13 +1,7 @@
 #include <cstdio>
 
-// Define WG_LUT_TEST to boot into the waveform comparison screen
-// (lut_test_screen.h) instead of the app.
-
 #include "driver/gpio.h"
 #include "epd.h"
-#ifdef WG_LUT_TEST
-#include "lut_test_screen.h"
-#endif
 #include "esp_sleep.h"
 #include "esp_system.h"
 #include "esp_timer.h"
@@ -134,8 +128,8 @@ static void verify_battery(const Esp32Runtime& runtime) {
   deep_sleep_now_();
 }
 
-// No out-of-memory rescue. Every long-lived buffer (DrawBuffer's draw lists
-// and strips, the book index) is claimed at boot and kept; a page
+// No out-of-memory rescue. Every long-lived buffer (both framebuffers, the
+// reader's page buffer, the book index) is claimed at boot and kept; a page
 // turn allocates nothing; the radios come and go beside them without anything
 // being handed back. See docs/history.md "OOM rescue".
 extern "C" void app_main(void) {
@@ -157,12 +151,11 @@ extern "C" void app_main(void) {
   // Before anything touches the panel or the card.
   verify_battery(runtime);
 
-  // The wordmark is a raw partition written by esptool, a whole 4-level panel
-  // frame: an mmap and nothing else — no copy, no SD access on the sleep path.
+  // The sleep image is a raw partition written by esptool, so this is an mmap
+  // and nothing else — no copy, no inflate, no SD access on the sleep path.
   static RawPartition sleep_part;
-  // The mapping is the whole 128 KB partition; the frame is its first 96,000 B.
-  if (sleep_part.map("sleep") && sleep_part.size >= wintergreen::DisplayFrame::kFrameBytes)
-    buf.set_sleep_image(sleep_part.data, wintergreen::DisplayFrame::kFrameBytes);
+  if (sleep_part.map("sleep"))
+    buf.set_sleep_image(sleep_part.data, sleep_part.size);
 
   epd.begin();
 
@@ -172,14 +165,8 @@ extern "C" void app_main(void) {
   // The panel is settling from its reset pulse meanwhile; see EInkDisplay::begin.
   const bool sd_ok = sd_init();
   epd.finish_begin();
-#ifdef WG_LUT_TEST
-  wg_lut_test::run(epd);
-  buf.deep_sleep();
-  wait_power_release_();
-  deep_sleep_now_();
-#endif
   if (!sd_ok) {
-    buf.show_sleep_image();
+    buf.show_sleep_image_embedded();
     buf.deep_sleep();
     wait_power_release_();
     deep_sleep_now_();

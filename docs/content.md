@@ -48,22 +48,16 @@ unit) gave an omnibus an 8,513-paragraph chapter whose paragraph table alone was
 Baked pages removed the load unit instead.
 
 **Images are rasterised by the converter, not decoded on the device.** `WgbImageRef` is
-`{data_offset, data_size, width, height}` (12 bytes) addressing two copies of the image inside
-the WGB, both three levels in two planes (hi = gray or black, lo = black, set = ink): **rows**
-for landscape (row r = ceil(w/8) hi bytes then as many lo bytes) followed by **columns** for
-portrait (column c = ceil(h/8) hi bytes then lo, top MSB). `data_size` is exactly
-`wgb_image_bytes` (`WgbWriter::set_image_data` builds both from the decoder's 8-bit gray).
-In either orientation a panel strip of the image is one contiguous read and a byte copy
-(`PixelLayout::Rows` / `Cols`), streamed while the panel refreshes; a portrait strip reads
-whole columns even when the page shows a slice (at most one image height per column).
+`{data_offset, data_size, width, height}` (12 bytes) addressing a raw 1-bit bitmap inside the
+WGB: `(width+7)/8` bytes per row, MSB first, bit clear = ink, followed by a portrait copy in
+8-row bands (`wgb_image_bands_bytes`: band b = `width` bytes, one per column, rows 8b..8b+7,
+top MSB). `data_size` is exactly rows + bands (`WgbWriter::set_image_data` builds both). The
+reader reads rows in landscape and bands in portrait (`blit_1bit_bands`, a byte copy per
+column); a page's slice of an image is one contiguous read either way.
 
-The converter decodes the source JPEG/PNG to 8-bit gray, scales it to fit
-`kWgbImageBoxW × kWgbImageBoxH` (480 × 772 — the portrait panel width and the page height
-less its vertical padding) and quantises it once at that size with the **blue-noise** map
-(`BlueNoise.h`, 64x64 void-and-cluster from `tools/make_blue_noise.py`; `quantise_level`,
-`kGrayLevel`), all on the build machine. Blue noise rather than error diffusion: the
-threshold depends only on the pixel's position, so flat tones stay exact, the pattern is
-fine-grained at every level, and no error rows are carried. Consequences:
+The converter decodes the source JPEG/PNG, scales it to fit `kWgbImageBoxW × kWgbImageBoxH`
+(480 × 772 — the portrait panel width and the page height less its vertical padding) and
+dithers it, all on the build machine. The device seeks and blits rows. Consequences:
 
 - **`width`/`height` in the table are the drawn dimensions**, not the source's, because
   `scale_image()` never enlarges. In portrait the blit is 1:1; a landscape page, whose
@@ -112,14 +106,13 @@ Output is one folder per book:
 <out>/<book name>/book.wgb
 <out>/<book name>/cover_list.bin   # fitted to 76x115, book list rows, column-major
 <out>/<book name>/cover_home.bin   # fitted to 424x486, home carousel, column-major
-<out>/<book name>/cover_sleep.bin  # the panel's own 96,000 B 4-level frame, no header
+<out>/<book name>/cover_sleep.bin  # the panel's own 48,000 B frame, no header
 ```
 
-Layouts in `CoverPaths.h`, all two planes, baked for the portrait screens: list/home are
-`[u16 w][u16 h]` then w columns, each ceil(h/8) hi bytes then ceil(h/8) lo bytes (3 levels,
-`PixelLayout::Cols`); the sleep cover is the physical frame (4 levels, per physical row 100
-hi bytes then 100 lo, `PixelLayout::Frame`). The device holds none of them: a refresh
-streams the strip it needs from the card, and only when the cover is new on the glass.
+Layouts in `CoverPaths.h`. All three are baked for the portrait screens: list/home are
+`[u16 w][u16 h]` then w columns of ceil(h/8) bytes (`DrawBuffer::blit_1bit_cols`, a byte
+copy per column); the sleep cover is the physical frame, read straight into the draw buffer
+(`DrawBuffer::frame()`), no scratch buffer and no blit.
 
 The three cover files are written only when the EPUB has a cover. The `book.wgb` filename is
 not arbitrary — `convert_epub_to_wgb_streaming()` looks for the literal string `book.wgb` in
@@ -141,25 +134,22 @@ failure.
 
 ### The sleep cover
 
-`show_book_cover_sleep_` in `Application.cpp` checks the size and hands the file to
-`DrawBuffer::show_frame`, which streams it to the panel a strip at a time in one full
-refresh. `cover_sleep.bin` is composed by `Book::write_sleep_cover_bin` at exactly
-`kSleepCoverW` × `kSleepCoverH` (480x793) with the artwork already trimmed, scaled and
-quantised to **four levels** (a full refresh shows light as well), laid out as the panel's
-frame (`kSleepFrameBytes`, `pack_sleep_frame`) — no buffer, no blit, no scaling on the
-device. A file of any other size is **ignored**; the wordmark shows instead. The wordmark
-(`resources/sleep.frame`) is the same format, so one streamer serves both.
+`show_book_cover_sleep_` in `Application.cpp` has **nothing left in it but one `fread`**.
+`cover_sleep.bin` is composed by `Book::write_sleep_cover_bin` at exactly `kSleepCoverW` ×
+`kSleepCoverH` (480x793) with the artwork already trimmed, scaled and dithered, then laid
+out as the panel's frame (`kSleepFrameBytes`), so the device reads it into the draw buffer —
+no scratch buffer, no blit, no scaling. A file of any other size is **ignored**; the
+wordmark shows instead.
 
 What the converter does, and why:
 
 - It decodes with `scale_to_fill`, so a small cover is scaled up from the *grayscale* and
-  quantised once at the panel size, never quantised small and pixel-replicated. Pixels at or
-  above `kPaperWhite` (245) count as blank for the trim.
+  dithered once, rather than dithered small and pixel-replicated.
 - It **crops fully blank rows and columns**. Publishers bake white bands into cover artwork,
   and stretching those to the panel only makes them bigger.
 - It then **stretches the artwork to the full panel — aspect ratio is not preserved.**
-  Deliberate. Fitting inside the panel leaves letterbox bars, and there is no good colour for
-  them: white bars under a dark cover look like a bug. The alternative shipped
+  Deliberate. Fitting inside the panel leaves letterbox bars, and on a 1-bit panel there is no
+  good colour for them: white bars under a dark cover look like a bug. The alternative shipped
   briefly — measure the ink coverage of the artwork edges each bar abuts and fill the bars to
   match — and is **gone**, along with `edge_coverage_` and `fill_band_`. Covers sit close
   enough to the panel's 480:786 that filling it outright reads as full-bleed, and there is no
@@ -173,7 +163,7 @@ both — so in portrait `DrawBuffer::height()` is 793 and `width()` is 480. 7 + 
 exactly, so every panel column is reachable by drawing code.
 
 This was 10 + 786 for a long time, which left **4 columns nothing could write**. They kept the
-old framebuffers' `0xFF` init and showed as a white bar along the top in portrait — invisible on
+framebuffers' `0xFF` init and showed as a white bar along the top in portrait — invisible on
 light content, obvious against a dark book cover, and visibly filling in during a full
 refresh. Determined on hardware by dropping the offset to 7 alone: the bar moved *wholesale*
 to the trailing edge rather than splitting in two, which proves the hidden columns are all at
@@ -191,8 +181,7 @@ still depends on font metrics and has to be re-derived by hand if the layout mov
 ## File formats: WGB and WGF
 
 **No file format has a magic or a version** (removed 2026-11-10: WGF `WGF1`, bundle `WGFS`,
-sleep image `MGR2` (since replaced by the headerless sleep frame), index header
-`#wintergreen-index v2`). Fonts and the sleep image are
+sleep image `MGR2`, index header `#wintergreen-index v2`). Fonts and the sleep image are
 built and flashed with the firmware, so a mismatched one cannot exist; a layout change means
 regenerating them in the same commit. The index is binary now (`BookIndex.cpp`); a file whose
 sizes do not add up (an older text index) fails `load()` and the list rescans the card.
@@ -231,26 +220,32 @@ file produced before it must be re-converted:
 size][zlib stream]` wrapper. The three `display/ui_font_*.h` headers are bare `WGF1` blobs
 emitted as C arrays (`kFontData_ui_*_wgf`).
 
-### The sleep wordmark
+### Sleep images (MGR2)
 
-`resources/sleep.frame`: exactly the `cover_sleep.bin` format (96,000 B, no header, four
-levels; `CoverPaths.h`), flashed verbatim into the `sleep` partition and streamed straight
-out of the mapping by `DrawBuffer::show_sleep_image()` (a `PixelSource` over the mmap).
-`generate_assets.py` refuses any other size.
-
-Made from `resources/wintergreen-source.png` (960x1600 RGBA, the hand-drawn tree,
-"Wintergreen" and "Alec♡"): composited over white, scaled exactly 0.5 to 480x800 portrait
-(the 7 rows behind the bezel fall at the top, white there), quantised to four levels with the
-converter's blue-noise map and level tones, so flat black and white stay exact and only the
-antialiased edges get light and gray:
+`resources/sleep.mgr`, flashed verbatim into the `sleep` partition and read straight out of
+the mapping by `DrawBuffer::Mgr2Source_` — there is no file-backed variant, so fetching a row
+is a pointer add.
 
 ```
-nix shell --impure --expr 'with import <nixpkgs> {}; python3.withPackages (ps: [ps.pillow])' \
-  -c python3 tools/make_sleep_image.py resources/wintergreen-source.png resources/sleep.frame --png preview.png
+width    uint16 LE      height   uint16 LE
+pixels   2 bits each, row-major, stride = ceil(width / 4), MSB-first:
+         value = (row[x / 4] >> (6 - (x % 4) * 2)) & 3
+         0 = white, 1 = light, 2 = dark, 3 = black
 ```
 
-The MGR2 format (`[u16 w][u16 h]` + 2 bits per pixel) and its 1-bit threshold decode are
-gone; `tools/tests/frame_test.cpp` shows the flashed frame through the device's streamer.
+Only 4 levels exist because the panel shows it with a one-pass grayscale refresh that takes
+bit 0 of each value into BW RAM and bit 1 into RED RAM. The image is blitted at native size
+into physical panel coordinates with **no scaling and no centring**, so it must be exactly
+800x480 (landscape).
+
+```
+nix-shell -p 'python3.withPackages(ps: [ps.pillow])' --run \
+  'python3 tools/make_sleep_image.py cover.png resources/sleep.mgr'
+```
+
+It fits and letterboxes onto an 800x480 white field by default. `--dither` gives
+Floyd-Steinberg for photographs; plain 4-level quantisation (the default) is better for line
+art, logos and text.
 
 ## Books on the card
 
@@ -302,13 +297,14 @@ Two fonts, both compiled from TTF by `tools/make_font.py`, and **no way to add a
 serial `FONT` partition upload and `SDFN` (`/sdcard/fonts/`) sideload paths were deliberately
 removed.
 
-- **Reader: Libron** (v0.25 release TTFs, github.com/nicoverbruggen/libron), 2 sizes
-  (32/36 px), all four styles. Lives in the `font` flash partition (2 MB; the bundle is
-  1,027,406 B), written by esptool at upload time and mmapped at boot. A font change takes
-  effect on the next upload.
-- **UI: Iosevka Slab Medium** (`SGr-IosevkaSlab` 34.9.0, nixpkgs `iosevka-bin` variant, TTC
-  face 0), one size per header in `display/ui_font_*.h`: 24 (`ui_large`), 32
-  (`ui_header`), and 40 digits-only (`ui_digits`, the quick menu's chapter numbers).
+- **Reader: Libron** (v0.25, github.com/nicoverbruggen/libron), 2 sizes (32/36 px), all four styles, built
+  `--mono`. Lives in the `font` flash partition, written by esptool at upload time and mmapped
+  at boot. A font change takes effect on the next upload.
+- **UI: Iosevka Slab Medium**, built `--mono`, one size per header in `display/ui_font_*.h`
+  (14/24/32 px → small/large/header). There is no medium *size*. It was Bold until the weight
+  was dropped — Bold at 14 px thresholds into near-solid blocks, and the mono hinting is what
+  keeps Medium's thinner stems from breaking up. Dropping the gray planes roughly halved each
+  header (small: 20,332 → 10,099 bytes).
 
 `ReaderSettings::kFontSizeNames` and `kNumFontSizePresets` **must** mirror the `--sizes` list
 passed to `make_font.py`, in order. They had drifted to eight entries reading
@@ -318,41 +314,39 @@ unreachable only because `QuickmenuScreen::on_select` clamps the cycle to
 `font_set()->num_fonts()`; `Application::load_settings_` had no such clamp and now checks
 `kNumFontSizePresets` rather than the array capacity `kMaxFontSizes`.
 
-WGF format is documented in `content/WgfFormat.h`; `make_font.py`'s docstring is the other
-reference:
+WGF1 format is documented in `content/WgfFormat.h`, but three things that matter are **not** in
+that header and were recovered by decoding the old shipped Literata — `make_font.py`'s
+docstring is the real reference:
 
-- `MbfGlyph::advance_width` is in **quarter-pixels**, not pixels. The draw loop snaps the
-  pen to a whole pixel per glyph and `word_width()` measures the same way, so baked pages
-  and the device agree.
-- **Antialiased to the panel's three levels, two planes.** Every glyph is `hi` (gray or
-  black) then `lo` (black), each ceil(w/8) bytes per row, MSB first, **bit set = ink**, `lo`
-  inside `hi`; the column-major copy holds the hi columns then the lo columns. Black ink
-  composites with OR; white ink (text on a selected row's black) clears, so its core goes
-  white and its edge gray.
-- **Rendering: FreeType light hinting** (`FT_LOAD_TARGET_LIGHT`: baseline and x-height
-  snapped by the autofitter, horizontal shapes smooth) **plus stem darkening** (autofitter
-  `no-stem-darkening` = false) so the weight matches the old mono-hinted text, then 8-bit
-  coverage quantised at `GRAY_THRESHOLD` (64) and `BLACK_THRESHOLD` (168). Tune those two
-  against `check_font.py --png` (a simulated-panel render) and the device.
+- `MbfGlyph::advance_width` is in **quarter-pixels**, not pixels.
+- Antialiasing is **5** levels, not 4, encoded across the three planes as `(bw, msb, lsb)`:
+  white `(1,0,0)`, light `(1,0,1)`, mid `(0,1,0)`, dark `(0,1,1)`, black `(0,0,0)`. The BW
+  plane draws where its bit is **clear**; the gray planes draw where theirs is **set**. So
+  `(msb,lsb)` is a lightening modifier, not a magnitude.
 - The reader font asset is `[uint32 uncompressed size][zlib stream]` wrapping a WGFS
   bundle: `[num][pad:3][num × uint32][WGF...]`.
 
-The two header fields `col_bitmap_offset` / `col_index_offset` locate the column-major copy
-of every glyph plus a u32-per-glyph index, appended by `tools/wgf_columns.py` (derived from
-the row planes, so pixels never change; idempotent; `make_font.py` calls it). Portrait text
-uses it (a strip of the panel is a range of glyph columns), landscape the rows; the
-renderer requires it (`tools/tests/font_test.cpp` checks every glyph's copy and that `lo`
-lies inside `hi`).
+The two old gray-plane header fields are now `col_bitmap_offset` / `col_index_offset`: a
+column-major copy of every glyph plus a u32-per-glyph index (`WgfFormat.h`), appended by
+`tools/wgf_columns.py` (from the existing bitmaps, so pixels never change; idempotent;
+`make_font.py` calls it). Portrait text uses it (`blit_cols_`), landscape the row-major
+bitmaps. Every font is built with `--mono`: `FT_LOAD_TARGET_MONO`, no gray planes.
 
-History: the device drew mono-hinted 1-bit glyphs from 2026-10 to 2026-11-19 (`--mono`,
-the 5-level `(bw, msb, lsb)` encoding and its 37.5% threshold all gone); see
-docs/history.md.
+That followed from the reader drawing only the BW plane. The BW plane is not a 50%
+threshold — `LEVEL_BITS` puts level 2 (37.5% coverage) in the ink plane, so BW-only text was
+fattened by a ring of barely-covered edge pixels, and `FT_LOAD_TARGET_LIGHT` left stems
+straddling pixel boundaries, so that ring was uneven from glyph to glyph. Mono hinting snaps
+stems to the grid: same total advance widths, uniform stems, clean curves. It also cut the
+asset from 296 KB to 122 KB compressed.
 
-`tools/check_font.py` parses a bundle (compressed or raw) or a `ui_font_*.h` exactly the way
-`BitmapFont.h` does, checks every glyph's planes, ASCII-art renders a sample string and with
-`--png` writes it in every size and style as the panel shows it (simulated reflectance,
-1:1 and 4x). Run it after regenerating a font — a structurally broken font renders blank on
-device with no error.
+Don't "fix" the AA path to match — the 5-level encoding and its 37.5% threshold are correct
+*for grayscale output*, where the lightening pass pulls those edge pixels back. They only
+misbehave when the gray planes are thrown away.
+
+`tools/check_font.py` parses a bundle (compressed or raw) exactly the way `BitmapFont.h` does and
+ASCII-art renders a sample string. Run it after regenerating a font — a structurally broken
+font renders blank on device with no error. Its header line reports `gray=yes|no`, the quick
+check that `--mono` took effect.
 
 Glyph coverage is per-font and sparse. A font that parses fine can still be missing the glyphs
 for a given string, in which case it renders blank rather than falling back — check
@@ -369,20 +363,17 @@ Glyph lookup itself is a binary search over the WGF1 range table
 UI strings still go through it; reader pages do not (glyph indices are baked into the
 display lists).
 
-Regenerating (needs freetype-py + fontTools, absent from the PlatformIO interpreter). The
-Libron v0.25 TTFs come from the release's `Libron.zip`; Iosevka from
-`nix build --impure --expr 'with import <nixpkgs> {}; iosevka-bin.override { variant = "SGr-IosevkaSlab"; }'`:
+Regenerating (needs freetype-py + fontTools, absent from the PlatformIO interpreter, hence
+nix-shell):
 
 ```
-nix shell --impure --expr 'with import <nixpkgs> {}; python3.withPackages (ps: [ps.freetype-py ps.fonttools ps.pillow])' \
-  -c python3 tools/make_font.py bundle --name Libron \
+nix-shell -p 'python3.withPackages(ps: [ps.freetype-py ps.fonttools])' --run '
+  python3 tools/make_font.py bundle --name Libron --mono \
     --sizes 32,36 --line-height 150 \
     --regular Libron-Regular.ttf --bold Libron-Bold.ttf \
     --italic Libron-Italic.ttf --bold-italic Libron-BoldItalic.ttf \
-    --out resources/Libron.bin
+    --out resources/Libron.bin'
 ```
-
-A font change is a rebake (the pages' glyph indices and advances come from it).
 
 `--line-height` matters: the reader multiplies `y_advance` by the user's setting, so a font's
 native leading decides how that setting feels. Atkinson's own metrics are 1.25× the em where
@@ -392,14 +383,12 @@ and below the text rather than all landing under the baseline.
 A UI font is one command per header, e.g.
 
 ```
-nix shell --impure --expr 'with import <nixpkgs> {}; python3.withPackages (ps: [ps.freetype-py ps.fonttools])' \
-  -c python3 tools/make_font.py header \
+nix-shell -p 'python3.withPackages(ps: [ps.freetype-py ps.fonttools])' --run '
+  python3 tools/make_font.py header --mono \
     --regular …/SGr-IosevkaSlab-Medium.ttc:0 \
     --name ui_large --size 24 --symbol ui_large \
-    --out wintergreen/display/ui_font_large.h
+    --out wintergreen/display/ui_font_large.h'
 ```
-
-(`ui_header` 32, `ui_digits` 40 with `--digits`.)
 
 The TTC face index matters: face **0** is Iosevka Slab, and the rest are the Extended and
 Oblique cuts.
@@ -420,12 +409,11 @@ stack:
 | BLE only | 728,888 | 164,128 |
 | **BLE + Wi-Fi sync** (the configured default) | **1,213,008** | **132,944** |
 
-The RAM figure being *lower* than the BLE-only row is not an error: `DrawBuffer`'s old spare
-framebuffer moved from BSS to the heap in between, taking 48 KB of static RAM with it.
+The RAM figure being *lower* than the BLE-only row is not an error: `DrawBuffer`'s spare
+moved from BSS to the heap in between, taking 48 KB of static RAM with it.
 
-Current sections, default build (2026-11-19, after the grayscale rewrite; image 1,254,832):
-`.flash.text` 977,412, `.flash.rodata` 212,688, `.iram0.text` 53,616, `.dram0.bss`
-28,152, `.dram0.data` 10,368. DrawBuffer's ~26 KB is heap (claimed at boot), not BSS. Roughly 245 KB of `.flash.text` is IDF, picolibc
+Current sections, default build: `.flash.text` 988,598, `.flash.rodata` 143,624,
+`.iram0.text` 69,872, `.dram0.bss` 122,760. Roughly 245 KB of `.flash.text` is IDF, picolibc
 and the C++ runtime; ~51 KB is the five screens; everything else of ours is under 20 KB
 apiece.
 
@@ -435,8 +423,8 @@ FreeRTOS and the heap allocator are all load-bearing. The few genuinely dead pie
 `__d_vfprintf`/`__d_vfscanf` (~5 KB) — are reachable only through IDF code, so removing them
 means patching the framework in place.
 
-rodata is dominated by the three UI fonts (152,000 since they carry two planes, 2026-11-19)
-and the hyphenation trie (26,943). Both could move to a flash partition like the reader font did (mmapped
+rodata is dominated by the three UI fonts (54,138) and the hyphenation trie (26,943) —
+together 87% of it. Both could move to a flash partition like the reader font did (mmapped
 flash and rodata are both XIP, so it would be free at runtime), but the image is not under
 pressure.
 

@@ -178,14 +178,14 @@ std::string edit_line(const std::string& prompt, const std::string& initial) {
 
 // ── cover preview: sixel of the converter's own cover_sleep.bin ─────────────
 
-// `levels`: w x h panel levels (0 white .. 3 black), shown in the simulated
-// panel's tones (tools/check_font.py PANEL).
-void sixel(const std::vector<uint8_t>& levels, int w, int h) {
+void sixel(const std::vector<uint8_t>& bits, int w, int h) {
+  const size_t stride = (static_cast<size_t>(w) + 7) / 8;
+  auto white = [&](int x, int y) { return (bits[static_cast<size_t>(y) * stride + (x >> 3)] >> (7 - (x & 7))) & 1; };
   std::string out = "\x1bP0;1;0q\"1;1;" + std::to_string(w) + ";" + std::to_string(h) +
-                    "#0;2;89;89;89#1;2;70;70;70#2;2;50;50;50#3;2;13;13;13";
+                    "#0;2;100;100;100#1;2;0;0;0";
   for (int y0 = 0; y0 < h; y0 += 6) {
-    for (int color = 0; color < 4; ++color) {
-      out += "#" + std::to_string(color);
+    for (int color = 0; color < 2; ++color) {
+      out += color ? "#1" : "#0";
       char run = 0;
       int n = 0;
       auto flush = [&] {
@@ -198,7 +198,7 @@ void sixel(const std::vector<uint8_t>& levels, int w, int h) {
       for (int x = 0; x < w; ++x) {
         int v = 0;
         for (int k = 0; k < 6 && y0 + k < h; ++k)
-          if (levels[static_cast<size_t>(y0 + k) * w + x] == color)
+          if (white(x, y0 + k) == (color == 0))
             v |= 1 << k;
         const char ch = static_cast<char>(63 + v);
         if (n && ch != run)
@@ -207,7 +207,7 @@ void sixel(const std::vector<uint8_t>& levels, int w, int h) {
         ++n;
       }
       flush();
-      out += color == 3 ? "-" : "$";
+      out += color ? "-" : "$";
     }
   }
   out += "\x1b\\\n";
@@ -237,11 +237,13 @@ void show_cover(const Review& r, const std::string& epub) {
   if (!f)
     return;
   const int w = wintergreen::kSleepCoverW, h = wintergreen::kSleepCoverH;
-  std::vector<uint8_t> levels(static_cast<size_t>(w) * h);
+  const size_t stride = (static_cast<size_t>(w) + 7) / 8;
+  std::vector<uint8_t> bits(stride * static_cast<size_t>(h), 0xFF);
   for (int y = 0; y < h; ++y)
     for (int x = 0; x < w; ++x)
-      levels[static_cast<size_t>(y) * w + x] = static_cast<uint8_t>(wintergreen::sleep_frame_level(frame.data(), x, y));
-  sixel(levels, w, h);
+      if (!wintergreen::sleep_frame_white(frame.data(), x, y))
+        bits[static_cast<size_t>(y) * stride + (x >> 3)] &= static_cast<uint8_t>(~(0x80u >> (x & 7)));
+  sixel(bits, w, h);
 }
 
 // ── one book ─────────────────────────────────────────────────────────────────

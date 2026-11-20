@@ -11,6 +11,35 @@
 
 namespace wintergreen {
 
+// Largest bitmap load_cover_ accepts: it never scales beyond the layout box, so
+// this bounds every cover, and it has to fit the spare it is read into.
+static constexpr size_t kCoverBytesMax = cover_cols_bytes(kHomeCoverW, kHomeCoverH);
+static_assert(kCoverBytesMax <= DrawBuffer::kBufSize, "home cover must fit the spare framebuffer");
+
+// Filled diamond (a square on its corner), one fill_rect per row. Hard edges —
+// the panel is 1-bit, so anything rounded only reads as a ragged circle.
+
+static void draw_diamond(DrawBuffer& buf, int cx, int cy, int r) {
+  for (int dy = -r; dy <= r; ++dy) {
+    const int span = r - std::abs(dy);
+    buf.fill_rect(cx - span, cy + dy, 2 * span + 1, 1, false);
+  }
+}
+
+// Just the border of that diamond, `t` pixels thick along each row.
+static void draw_diamond_outline(DrawBuffer& buf, int cx, int cy, int r, int t) {
+  for (int dy = -r; dy <= r; ++dy) {
+    const int span = r - std::abs(dy);
+    const int w = std::min(t, span + 1);
+    if (2 * span + 1 <= 2 * w) {
+      buf.fill_rect(cx - span, cy + dy, 2 * span + 1, 1, false);
+    } else {
+      buf.fill_rect(cx - span, cy + dy, w, 1, false);
+      buf.fill_rect(cx + span - w + 1, cy + dy, w, 1, false);
+    }
+  }
+}
+
 // Longest prefix of [text, text+len) that fits in max_w, broken at a space when
 // one is available. Returns the byte count to draw; *next is where the following
 // line starts (leading space skipped).
@@ -32,65 +61,42 @@ static void draw_centred(DrawBuffer& buf, int cx, int baseline, const char* text
   char trunc[260];
   const std::string_view t = ellipsize(f, text, len, max_w, trunc);
   const int tw = f.word_width(t.data(), t.size(), FontStyle::Regular);
-  buf.draw_text(cx - tw / 2, baseline, t.data(), t.size(), f);
+  buf.draw_text_proportional(cx - tw / 2, baseline, t.data(), t.size(), f, false);
 }
 
-// cover_home.bin of the cover slot's book, beside the book (CoverPaths.cpp's
-// rule), built on the stack. False when the path does not fit.
-static bool cover_path_(std::string_view book, char (&path)[320]) {
-  const size_t slash = book.rfind('/');
-  static constexpr char kName[] = "/cover_home.bin";
-  if (slash == std::string_view::npos || slash + sizeof(kName) > sizeof(path))
-    return false;
-  std::memcpy(path, book.data(), slash);
-  std::memcpy(path + slash, kName, sizeof(kName));
-  return true;
-}
-
-// The selected book's cover header: its size, and that the file is exactly
-// that size (anything else is not a cover: a truncated download, or an HTML
-// error page saved under the name). The pixels are not read here — the
-// refresh streams them a strip at a time (read()).
-void HomeScreen::load_cover_(int i, int box_w, int box_h) const {
+void HomeScreen::load_cover_(DrawBuffer& buf, int i, int box_w, int box_h) const {
   cover_slot_ = i;
   cover_w_ = cover_h_ = 0;
-  char path[320];
-  if (i < 0 || i >= num_books_ || !cover_path_(slots_[i].path, path))
+  cover_bits_ = nullptr;
+  if (i < 0 || i >= num_books_)
     return;
+  // cover_home.bin beside the book, built on the stack (CoverPaths.cpp's rule).
+  const std::string_view p = slots_[i].path;
+  const size_t slash = p.rfind('/');
+  static constexpr char kName[] = "/cover_home.bin";
+  char path[320];
+  if (slash == std::string_view::npos || slash + sizeof(kName) > sizeof(path))
+    return;
+  std::memcpy(path, p.data(), slash);
+  std::memcpy(path + slash, kName, sizeof(kName));
   FILE* f = std::fopen(path, "rb");
   if (!f)
     return;
   uint16_t hdr[2] = {};
   bool ok = std::fread(hdr, 2, 2, f) == 2 && hdr[0] > 0 && hdr[1] > 0 && hdr[0] <= box_w && hdr[1] <= box_h;
-  ok = ok && std::fseek(f, 0, SEEK_END) == 0 &&
-       std::ftell(f) == static_cast<long>(4 + cover_cols_bytes(hdr[0], hdr[1]));
+  const size_t need = ok ? cover_cols_bytes(hdr[0], hdr[1]) : 0;
+  ok = ok && need <= kCoverBytesMax;
+  uint8_t* dst = ok ? buf.claim_spare_cache(this) : nullptr;
+  // Exactly the declared size: anything else is not a cover (a truncated
+  // download, or an HTML error page saved under the name).
+  ok = dst && std::fread(dst, 1, need, f) == need && std::fgetc(f) == EOF;
   std::fclose(f);
   if (!ok)
     return;
+  cover_bits_ = dst;
+  cover_gen_ = buf.spare_cache_gen();
   cover_w_ = hdr[0];
   cover_h_ = hdr[1];
-}
-
-bool HomeScreen::read(uint32_t item, uint32_t offset, uint8_t* dst, size_t n) {
-  if (static_cast<int>(item) >= num_books_)
-    return false;
-  if (!file_ || file_slot_ != static_cast<int>(item)) {
-    release();
-    char path[320];
-    if (!cover_path_(slots_[item].path, path))
-      return false;
-    file_ = std::fopen(path, "rb");
-    file_slot_ = static_cast<int>(item);
-  }
-  return file_ && std::fseek(file_, static_cast<long>(offset), SEEK_SET) == 0 &&
-         std::fread(dst, 1, n, file_) == n;
-}
-
-void HomeScreen::release() {
-  if (file_)
-    std::fclose(file_);
-  file_ = nullptr;
-  file_slot_ = -1;
 }
 
 void HomeScreen::on_start() {
@@ -116,6 +122,7 @@ void HomeScreen::on_start() {
   // is meaningless even where the number is unchanged — a sync reorders the
   // recents under us.
   cover_slot_ = -1;
+  cover_bits_ = nullptr;
   cover_w_ = cover_h_ = 0;
 
   // Pick the kMaxBooks most recently opened, by selection rather than by
@@ -297,7 +304,7 @@ void HomeScreen::draw_all_(DrawBuffer& buf, std::optional<uint8_t> battery_pct) 
   if (!ui_font_.valid()) return;
   const int W = buf.width();
   const int H = buf.height();
-  buf.fill(Level::White);
+  buf.fill(true);
 
   static constexpr int kPad        = 16;
   static constexpr int kHeroGap    = 24; // header rule → cover box
@@ -346,25 +353,24 @@ void HomeScreen::draw_all_(DrawBuffer& buf, std::optional<uint8_t> battery_pct) 
   const int inset      = kFrameGap + kFrameW;
   const int cover_boxw = std::max(0, box_w - 2 * inset);
   const int cover_boxh = std::max(0, box_h - 2 * inset);
-  // Header on a new selection only; a book with no cover is not retried on
-  // every draw.
-  if (cover_slot_ != sel) {
+  // Reload on a new selection, or when the cover was loaded but something has
+  // since taken the spare. A book with no cover, or no spare at all, is not
+  // retried on every draw.
+  if (cover_slot_ != sel || (cover_bits_ && !have_cover_(buf))) {
     // The card shares SPI2 with the panel; never overlap the read with a refresh.
     buf.wait_panel_idle();
-    load_cover_(sel, cover_boxw, cover_boxh);
+    load_cover_(buf, sel, cover_boxw, cover_boxh);
   }
 
-  if (cover_w_ > 0) {
+  if (have_cover_(buf)) {
     const int cx = kPad + (box_w - cover_w_) / 2;
     const int cy = box_y + (box_h - cover_h_) / 2;
-    // Identity = the book: the same cover on the glass is never read again.
-    buf.blit(const_cast<HomeScreen*>(this), static_cast<uint32_t>(sel), book_path_key(slots_[sel].path), 4,
-             PixelLayout::Cols, cx, cy, cover_w_, cover_h_, 0, 0x7FFF, /*two_level=*/true);
-    buf.draw_outline(cx - inset, cy - inset, cover_w_ + 2 * inset, cover_h_ + 2 * inset, kFrameW, Level::Gray);
+    buf.blit_1bit_cols(cx, cy, cover_bits_, cover_w_, cover_h_);
+    draw_outline(buf, cx - inset, cy - inset, cover_w_ + 2 * inset, cover_h_ + 2 * inset, kFrameW);
   } else {
     // No cover on the card — a placeholder box keeps the layout intact.
     const int ph_w = std::min(box_w, box_h * 2 / 3);
-    buf.draw_outline(kPad + (box_w - ph_w) / 2, box_y, ph_w, box_h, kFrameW, Level::Gray);
+    draw_outline(buf, kPad + (box_w - ph_w) / 2, box_y, ph_w, box_h, kFrameW);
   }
 
   y = box_y + box_h + kTitleGap;
@@ -385,8 +391,9 @@ void HomeScreen::draw_all_(DrawBuffer& buf, std::optional<uint8_t> battery_pct) 
       } else {
         size_t next = 0;
         const size_t n = fit_line(tf, t.data() + off, t.size() - off, W - 2 * kPad, &next);
-        buf.draw_text(W / 2 - tf.word_width(t.data() + off, n, FontStyle::Regular) / 2, baseline, t.data() + off, n,
-                      tf);
+        buf.draw_text_proportional(
+            W / 2 - tf.word_width(t.data() + off, n, FontStyle::Regular) / 2,
+            baseline, t.data() + off, n, tf, false);
         off += next;
       }
       y += tf.y_advance();
@@ -408,10 +415,10 @@ void HomeScreen::draw_all_(DrawBuffer& buf, std::optional<uint8_t> battery_pct) 
   for (int i = 0; i < num_books_; ++i) {
     const int dx = dots_x0 + i * kDotStep;
     if (i == sel) {
-      buf.draw_diamond(dx, dots_cy, kDotR);
-      buf.draw_diamond(dx, dots_cy, kDotRing, kDotRingW);
+      draw_diamond(buf, dx, dots_cy, kDotR);
+      draw_diamond_outline(buf, dx, dots_cy, kDotRing, kDotRingW);
     } else {
-      buf.draw_diamond(dx, dots_cy, kDotRSmall);
+      draw_diamond(buf, dx, dots_cy, kDotRSmall);
     }
   }
 }

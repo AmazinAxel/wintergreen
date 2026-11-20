@@ -210,7 +210,7 @@ class QuickmenuScreen final : public ListMenuScreen {
   static int wrap_(const BitmapFont& f, std::string_view text, int first_w, int rest_w, int max_lines, Line* out);
   // Draw one wrapped line; returns nothing, the caller advances y.
   static void draw_line_(DrawBuffer& buf, int x, int baseline, std::string_view text, const Line& l,
-                         const BitmapFont& f, Ink ink);
+                         const BitmapFont& f, bool invert);
 
   // Pixels from the top of the panel to the rule above the item list.
   int header_h_() const;

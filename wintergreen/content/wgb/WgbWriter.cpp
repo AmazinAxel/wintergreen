@@ -1,7 +1,5 @@
 #include "WgbWriter.h"
 
-#include "../ImageDecoder.h"
-
 #include <cerrno>
 #include <cstring>
 
@@ -479,15 +477,19 @@ void WgbWriter::set_image_data(uint16_t idx, std::vector<uint8_t>&& data) {
   if (idx >= image_data_.size())
     return;
   const uint32_t w = images_[idx].width, h = images_[idx].height;
-  if (data.size() != static_cast<size_t>(w) * h) {
+  const uint32_t rows = wgb_image_rows_bytes(w, h);
+  if (data.size() != rows) {
     image_data_[idx].clear();  // not the size the ref says: draw blank space
     return;
   }
-  // Both copies the device draws from (WgbFormat.h), 3 levels, blue noise.
-  std::vector<uint8_t> planes(wgb_image_bytes(w, h));
-  pack_rows(data.data(), static_cast<int>(w), static_cast<int>(h), 3, planes.data());
-  pack_cols(data.data(), static_cast<int>(w), static_cast<int>(h), 3, planes.data() + wgb_image_rows_bytes(w, h));
-  image_data_[idx] = std::move(planes);
+  const size_t stride = (w + 7) / 8;
+  data.resize(rows + wgb_image_bands_bytes(w, h), 0xFF);
+  uint8_t* bands = data.data() + rows;
+  for (uint32_t y = 0; y < h; ++y)
+    for (uint32_t x = 0; x < w; ++x)
+      if (!((data[y * stride + (x >> 3)] >> (7 - (x & 7))) & 1))
+        bands[(y >> 3) * w + x] &= static_cast<uint8_t>(~(0x80u >> (y & 7)));
+  image_data_[idx] = std::move(data);
 }
 
 void WgbWriter::update_image_size(uint16_t idx, uint16_t width, uint16_t height) {

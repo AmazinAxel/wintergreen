@@ -134,9 +134,7 @@ when it cannot get it — it returns an error, the worker bails, and the row fli
 `Sync` with nothing said. In the layout era that happened with 20 KB free, and the sync
 released DrawBuffer's spare, the OOM reserve and the reader's caches, and deinitialised the
 BT controller, to fit. Pages are now fully baked, the reader holds no layout memory, and
-all of that is gone: DrawBuffer's lists and the book index stay through a sync. Since the
-grayscale rewrite (2026-11-19) DrawBuffer holds ~26 KB instead of 96 KB of framebuffers
-plus the reader's 4 KB page buffer, ~74 KB more heap than the hardware measurement below.
+all of that is gone: the spare (covers, thumbnails) and the book index stay through a sync.
 Not yet confirmed on hardware — `H wifi` / `H http` in the temporary quick-menu rows are
 the largest block at the two points that used to fail (see `docs/bluetooth.md` "RAM now").
 
@@ -213,11 +211,11 @@ would cut the radio with files half written.
 
 The C3 has one core; the Wi-Fi/TCP receive path and SDSPI (interrupt-driven per-sector and
 busy-poll transactions, `sdspi_host.c`) both need it, so overlap only interleaves them.
-The writer task was removed. What stayed: one `kChunk` (16 KB, 32 whole sectors per
-`fwrite`) heap buffer per file, the variant measured at 296 KB/s above. The spare
-framebuffer it was lent instead (`lend_spare()`, 92 sectors per write, never flashed) went
-with the framebuffers in the grayscale rewrite (2026-11-19, owner: no RAM held for it);
-the ~74 KB that freed is why a 16 KB malloc per file is safe. Below this floor would take an
+The writer task was removed. What stayed: the download fills the spare framebuffer, lent by
+`wg_sync::poll()` (UI thread) via `DrawBuffer::lend_spare()`, 92 whole sectors per `fwrite`,
+zero heap. While lent, every other spare claim refuses; the list thumbnails are re-read
+after the sync, and the sync task waits for the spare to come back before setting Done so the
+final repaint has them. Without a spare, `kChunk` from heap. Below this floor would take an
 ESP-IDF SDSPI patch; the SD clock is already at its 20 MHz ceiling (CLAUDE.md).
 
 **Downloads resume with Range** (`http_get_file_`). Measured 2026-11-12: a 36 MB book at
@@ -236,7 +234,7 @@ internal block) read 1800 B. Where that happened is not known.
 In the flake repo (`snowflake`), not here: `hosts/alechomelab/webserver/booksync.js` bolted
 onto the existing bun server (no new service, no new port). **The homelab never converts.**
 `books` (`tools/books` in this repo, packaged by `flake.nix`, installed by snowflake's
-`modules/desktop.nix`; `--usb` also copies the books onto the reader over USB, `--reuse` first fetches every unread backup EPUB to rebake) reviews every EPUB in `~/Downloads/books`, bakes
+`modules/desktop.nix`, no arguments) reviews every EPUB in `~/Downloads/books`, bakes
 locally, and uploads over ssh in one tar stream (written by `books` itself): books into
 `/media/books/.incoming/`, then `mv` into place, so a half-uploaded book is never visible
 to a concurrent sync; reviewed EPUBs straight into `/media/books/.epubs/` as

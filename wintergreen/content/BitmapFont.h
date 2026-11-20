@@ -22,13 +22,13 @@ namespace wintergreen {
 
 // Result of a glyph lookup — points into the WGF data buffer.
 struct GlyphData {
-  const uint8_t* bits;           // hi plane then lo plane, row-major, set = ink (nullptr if no bitmap)
+  const uint8_t* bits;           // pointer to 1-bit BW packed bitmap (nullptr if no bitmap)
   uint8_t bitmap_width;          // bitmap width in pixels
   uint8_t bitmap_height;         // bitmap height in pixels
   uint8_t advance_width;         // horizontal cursor advance
   int8_t x_offset;               // offset from cursor to bitmap left edge
   int8_t y_offset;               // offset from baseline to bitmap top (negative = above)
-  const uint8_t* cols;           // the same two planes column-major (see WgfFormat.h), or nullptr
+  const uint8_t* cols;           // same bitmap column-major (see WgfFormat.h), or nullptr
 };
 
 class BitmapFont : public IFont {
@@ -88,14 +88,6 @@ class BitmapFont : public IFont {
     load_style_(data, size, hdr->italic_offset, styles_[2]);
     load_style_(data, size, hdr->bold_italic_offset, styles_[3]);
 
-    // Leftmost ink relative to the pen, over every glyph of every style: the
-    // renderer skips words that start right of a strip by it.
-    min_x_offset_ = 0;
-    for (const StyleData& sd : styles_)
-      for (uint16_t i = 0; sd.glyphs && i < sd.num_glyphs; ++i)
-        if (sd.glyphs[i].x_offset < min_x_offset_)
-          min_x_offset_ = sd.glyphs[i].x_offset;
-
     // Column bitmaps: one index for all styles, in header order.
     if (hdr->col_bitmap_offset && hdr->col_index_offset && hdr->col_bitmap_offset < size) {
       uint32_t base = 0;
@@ -122,15 +114,6 @@ class BitmapFont : public IFont {
 
   bool valid() const {
     return header_ != nullptr;
-  }
-
-  // The font's bytes: two fonts with the same data draw the same pixels.
-  const uint8_t* data() const {
-    return data_;
-  }
-  // Most negative x_offset of any glyph (0 when none overhangs the pen).
-  int min_x_offset() const {
-    return min_x_offset_;
   }
 
   // ── IFont interface ─────────────────────────────────────────────────────
@@ -251,7 +234,6 @@ class BitmapFont : public IFont {
   const WgfHeader* header_ = nullptr;
   const uint8_t* bitmaps_ = nullptr;
   const uint8_t* cols_ = nullptr;
-  int min_x_offset_ = 0;
   StyleData styles_[4] = {};  // indexed by FontStyle enum value
 
   static int glyph_index_in_(const StyleData& sd, char32_t cp) {
@@ -279,13 +261,13 @@ class BitmapFont : public IFont {
     const uint8_t* cols = nullptr;
     if (g.bitmap_width > 0 && g.bitmap_height > 0) {
       const size_t row_bytes = static_cast<size_t>((g.bitmap_width + 7) / 8);
-      const size_t needed = 2 * row_bytes * static_cast<size_t>(g.bitmap_height);  // hi + lo
+      const size_t needed = row_bytes * static_cast<size_t>(g.bitmap_height);
       if (bitmaps_ && g.bitmap_offset + needed <= size_)
         bits = bitmaps_ + g.bitmap_offset;
       if (sd.col_index) {
         const uint8_t* e = sd.col_index + 4 * static_cast<size_t>(idx);
         const size_t off = e[0] | (e[1] << 8) | (e[2] << 16) | (static_cast<size_t>(e[3]) << 24);
-        const size_t col_bytes = 2 * static_cast<size_t>((g.bitmap_height + 7) / 8) * g.bitmap_width;
+        const size_t col_bytes = static_cast<size_t>((g.bitmap_height + 7) / 8) * g.bitmap_width;
         if (static_cast<size_t>(cols_ - data_) + off + col_bytes <= size_)
           cols = cols_ + off;
       }

@@ -82,10 +82,10 @@ int ListMenuScreen::centred_offset_(int H, int& shift) const {
 void ListMenuScreen::draw_all_(DrawBuffer& buf, std::optional<uint8_t> battery_pct) const {
   const int W = buf.width();
   const int H = buf.height();
-  buf.fill(Level::White);
+  buf.fill(true);
   draw_list_(buf, W, H, header_h_());
   if (scroll_shift_)
-    buf.fill_rect(0, 0, W, header_h_(), Level::White);  // covers the lifted top row
+    buf.fill_rect(0, 0, W, header_h_(), true);  // covers the lifted top row
   // Battery percentage and nothing else: no wordmark, and no rule under it.
   // Same helper the home screen calls, so the two land on the same pixel.
   draw_battery_(buf, W, battery_pct);
@@ -98,7 +98,8 @@ void ListMenuScreen::draw_battery_(DrawBuffer& buf, int W, std::optional<uint8_t
   std::snprintf(pbuf, sizeof(pbuf), "%u%%", static_cast<unsigned>(*battery_pct));
   const size_t len = std::strlen(pbuf);
   const int pw = section_font_.word_width(pbuf, len, FontStyle::Regular);
-  buf.draw_text(W - kBatteryPadX - pw, kBatteryPadY + section_font_.baseline(), pbuf, len, section_font_);
+  buf.draw_text_proportional(W - kBatteryPadX - pw, kBatteryPadY + section_font_.baseline(), pbuf, len, section_font_,
+                             false);
 }
 
 // Measured from the font the battery is actually drawn in (battery_row_h_), not
@@ -147,11 +148,8 @@ void ListMenuScreen::draw_list_(DrawBuffer& buf, int W, int H, int header_h) con
     }
 
     const int slot_h = wintergreen_slot_h_(i);
-    // Selected row: black, its text white with gray antialiasing (one update
-    // can show both; a gray fill would swallow the text's gray edges).
-    const Ink ink = sel ? Ink::White : Ink::Black;
     if (sel)
-      buf.fill_rect(0, y, W, slot_h - 1, Level::Black);
+      buf.fill_rect(0, y, W, slot_h - 1, false);
 
     const std::string_view label = get_item_label(i);
     const std::string_view sub = get_item_subtitle(i);
@@ -178,12 +176,12 @@ void ListMenuScreen::draw_list_(DrawBuffer& buf, int W, int H, int header_h) con
         const int title_y = y + kPadT + line * title_h + ui_font_.baseline();
         const bool last = (line == detail_title_lines_ - 1);
         if (ui_font_.word_width(p, left, FontStyle::Regular) <= max_lw) {
-          buf.draw_text(kLM, title_y, p, left, ui_font_, ink);
+          buf.draw_text_proportional(kLM, title_y, p, left, ui_font_, sel);
           break;
         }
         if (last) {
           const std::string_view t = ellipsize(ui_font_, p, left, max_lw, trunc_buf);
-          buf.draw_text(kLM, title_y, t.data(), t.size(), ui_font_, ink);
+          buf.draw_text_proportional(kLM, title_y, t.data(), t.size(), ui_font_, sel);
           break;
         }
         const size_t fit = fit_prefix(ui_font_, p, left, max_lw);
@@ -194,7 +192,7 @@ void ListMenuScreen::draw_list_(DrawBuffer& buf, int W, int H, int header_h) con
           brk = fit;  // one word wider than the column: cut it
         if (brk == 0)
           break;      // not even a glyph fits
-        buf.draw_text(kLM, title_y, p, brk, ui_font_, ink);
+        buf.draw_text_proportional(kLM, title_y, p, brk, ui_font_, sel);
         p += brk;
         left -= brk;
         while (left > 0 && *p == ' ') {
@@ -209,28 +207,31 @@ void ListMenuScreen::draw_list_(DrawBuffer& buf, int W, int H, int header_h) con
     // Right-aligned percentage, on the author's baseline.
     if (!right_txt.empty()) {
       const int right_x = text_r - right_w_actual;
-      buf.draw_text(right_x, sub_baseline, right_txt.data(), right_txt.size(), sub_font, ink);
+      buf.draw_text_proportional(right_x, sub_baseline, right_txt.data(), right_txt.size(), sub_font, sel);
     }
 
     // Subtitle line (author)
     if (!sub.empty()) {
       const std::string_view s = ellipsize(sub_font, sub.data(), sub.size(), text_r - kLM - right_reserved, trunc_buf);
-      buf.draw_text(kLM, sub_baseline, s.data(), s.size(), sub_font, ink);
+      buf.draw_text_proportional(kLM, sub_baseline, s.data(), s.size(), sub_font, sel);
     }
 
     // Cover thumbnail, centred in its box. The image keeps its own paper
-    // white on a selected row, so it reads as a cover rather than a negative.
-    // A book without one gets an empty gray frame.
+    // white on a selected (inverted) row, so it reads as a cover rather than
+    // a negative. A book without one gets an empty frame in the row's ink.
     if (row_thumb) {
       const int bx = W - kRM - sb_reserved - thumb_w;
       const int by = y + kThumbPad;
       Thumb t;
-      if (get_item_thumb(i, t) && t.src && t.w > 0 && t.h > 0) {
+      if (get_item_thumb(i, t) && t.bits && t.w > 0 && t.h > 0) {
         const int tx = bx + (thumb_w - t.w) / 2;
         const int ty = by + (thumb_box_h - t.h) / 2;
-        buf.blit(t.src, t.item, t.gen, t.base, PixelLayout::Cols, tx, ty, t.w, t.h, 0, 0x7FFF, /*two_level=*/true);
+        buf.blit_1bit_cols(tx, ty, t.bits, t.w, t.h);
       } else {
-        buf.draw_outline(bx, by, thumb_w, thumb_box_h, 1, Level::Gray);
+        buf.fill_rect(bx, by, thumb_w, 1, sel);
+        buf.fill_rect(bx, by + thumb_box_h - 1, thumb_w, 1, sel);
+        buf.fill_rect(bx, by, 1, thumb_box_h, sel);
+        buf.fill_rect(bx + thumb_w - 1, by, 1, thumb_box_h, sel);
       }
     }
 
@@ -238,9 +239,10 @@ void ListMenuScreen::draw_list_(DrawBuffer& buf, int W, int H, int header_h) con
     // divided from, so it gets none — nor does a row followed by a section
     // hairline, which would otherwise draw two rules a few pixels apart.
     if (i != n - 1 && !is_separator(i + 1))
-      buf.fill_rect(0, y + slot_h - 1, W, 1, Level::Gray);
+      buf.fill_rect(0, y + slot_h - 1, W, 1, false);
     y += slot_h;
   }
+  end_thumbs();
 
   // Scrollbar
   if (has_scrollbar) {
@@ -249,7 +251,7 @@ void ListMenuScreen::draw_list_(DrawBuffer& buf, int W, int H, int header_h) con
     const int track = available_h - thumb_h;
     const int max_scroll = n - visible;
     const int thumb_y = header_h + (max_scroll > 0 ? track * scroll_offset_ / max_scroll : 0);
-    buf.fill_rect(sb_x, thumb_y, 3, thumb_h, Level::Gray);
+    buf.fill_rect(sb_x, thumb_y, 3, thumb_h, false);
   }
 }
 

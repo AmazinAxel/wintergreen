@@ -276,9 +276,9 @@ bare `vTaskDelete` and the host is not restartable.
 
 Pages are fully baked (`docs/content.md`), so the reader has no layout engine, no
 paragraph cache and no per-page allocation: a page is one display list of a few hundred
-bytes read into the tail of a DrawBuffer draw list (since 2026-11-19; it was a 4 KB
-`page_buf_`). With that gone every workaround below was deleted: the clicker releases
-nothing of DrawBuffer's (its ~26 KB of lists and strips, claimed at boot), the book index is never
+bytes read into `ReaderScreen::page_buf_` (4 KB, claimed at boot). With that gone every
+workaround below was deleted: the clicker no longer releases DrawBuffer's spare (covers,
+thumbnails and the pre-drawn page all stay with the clicker up), the book index is never
 dropped, there is no cache cap, no `largest_free_block` guard, no OOM reserve and no
 `set_new_handler` rescue, and `IRuntime::clicker_holds_ram()` /
 `largest_free_block_bytes()` are gone. Image 1,199,358 → 1,141,052 B.
@@ -288,10 +288,6 @@ dropped, there is no cache cap, no `largest_free_block` guard, no OOM reserve an
 fell below 38,912 B (lowest at `esp_http_client_init`). Total free internal heap bottomed at
 44,604 B, during the sync. Pass mark was 24 KB. That 44 KB is the whole budget for anything
 kept resident: since nothing is released for radios, every permanent buffer comes out of it.
-Measured before the grayscale rewrite (2026-11-19), which freed ~74 KB (two 48 KB
-framebuffers and the 4 KB page buffer replaced by ~26 KB of draw lists and strips) and
-moved the sync's download buffer from the lent spare to a 16 KB heap chunk; re-measure
-`H min` on the device.
 If the controller reports `esp_bt_controller_init -4` or
 `emi.c 164` again, that is a RAM budget regression: find the allocation, do not start
 releasing buffers again. Next lever if it is short: initialise the controller at boot

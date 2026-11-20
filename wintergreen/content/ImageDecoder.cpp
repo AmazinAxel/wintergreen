@@ -1,8 +1,5 @@
 #include "ImageDecoder.h"
 
-#include "BlueNoise.h"
-#include "CoverPaths.h"
-
 #include <algorithm>
 #include <cctype>
 #include <cmath>
@@ -320,7 +317,7 @@ bool get_image_size(const uint8_t* data, size_t size, uint16_t& out_w, uint16_t&
 // decode_image_from_entry — streaming decode from a ZIP entry (all platforms)
 // ---------------------------------------------------------------------------
 
-// Contrast stretch. Three panel levels in sunlight leave little mid-tone room: an image
+// Contrast stretch. A 1-bit panel in sunlight has no usable mid-tones: an image
 // whose samples all sit between (say) 0.3 and 0.6 dithers to a uniform speckle
 // with no true black or paper white to anchor contrast against, and reads as
 // flat gray. Mapping the source range onto the full 0..255 gives the ditherer
@@ -415,81 +412,6 @@ ImageError decode_image_from_entry(IZipFile& file, const ZipEntry& entry, uint16
                                  pixel_sink, tone_lut, tone_hist);
 
   return ImageError::UnsupportedFormat;
-}
-
-// ---------------------------------------------------------------------------
-// Panel levels
-// ---------------------------------------------------------------------------
-
-int quantise_level(uint8_t g, int x, int y, int levels) {
-  // Levels from dark to light with their reflectance.
-  static constexpr int kLv4[4] = {3, 2, 1, 0};
-  static constexpr float kLum4[4] = {0.f, kGrayLevel, kLightLevel, 1.f};
-  static constexpr int kLv3[3] = {3, 2, 0};
-  static constexpr float kLum3[3] = {0.f, kGrayLevel, 1.f};
-  const int* lv = levels == 4 ? kLv4 : kLv3;
-  const float* lum = levels == 4 ? kLum4 : kLum3;
-  const int n = levels == 4 ? 4 : 3;
-  // Threshold in (0, 1): the cell's blue-noise rank.
-  const float t = (kBlueNoise[(y & (kBlueNoiseSize - 1)) * kBlueNoiseSize + (x & (kBlueNoiseSize - 1))] + 0.5f) / 256.f;
-  // In 8-bit tones, so a level's own (rounded) tone is exactly that level.
-  for (int i = 0; i + 1 < n; ++i) {
-    const int a = static_cast<int>(lum[i] * 255.f + 0.5f), b = static_cast<int>(lum[i + 1] * 255.f + 0.5f);
-    if (g <= b) {
-      const float f = static_cast<float>(g - a) / static_cast<float>(b - a);
-      return f > t ? lv[i + 1] : lv[i];
-    }
-  }
-  return 0;
-}
-
-void pack_rows(const uint8_t* gray, int w, int h, int levels, uint8_t* out) {
-  const size_t rb = (static_cast<size_t>(w) + 7) / 8;
-  std::memset(out, 0, 2 * rb * static_cast<size_t>(h));
-  for (int y = 0; y < h; ++y) {
-    uint8_t* hi = out + 2 * rb * y;
-    uint8_t* lo = hi + rb;
-    for (int x = 0; x < w; ++x) {
-      const int l = quantise_level(gray[static_cast<size_t>(y) * w + x], x, y, levels);
-      const auto m = static_cast<uint8_t>(0x80u >> (x & 7));
-      if (l & 2)
-        hi[x >> 3] |= m;
-      if (l & 1)
-        lo[x >> 3] |= m;
-    }
-  }
-}
-
-void pack_sleep_frame(const uint8_t* gray, uint8_t* frame) {
-  std::memset(frame, 0, kSleepFrameBytes);
-  for (int y = 0; y < kSleepCoverH; ++y)
-    for (int x = 0; x < kSleepCoverW; ++x) {
-      const int l = quantise_level(gray[static_cast<size_t>(y) * kSleepCoverW + x], x, y, 4);
-      const int bit = kSleepFrameOffX + y;
-      uint8_t* row = frame + static_cast<size_t>(kSleepFrameRows - 1 - x) * 2 * kSleepFrameStride;
-      const auto m = static_cast<uint8_t>(0x80u >> (bit & 7));
-      if (l & 2)
-        row[bit >> 3] |= m;
-      if (l & 1)
-        row[kSleepFrameStride + (bit >> 3)] |= m;
-    }
-}
-
-void pack_cols(const uint8_t* gray, int w, int h, int levels, uint8_t* out) {
-  const size_t cb = (static_cast<size_t>(h) + 7) / 8;
-  std::memset(out, 0, 2 * cb * static_cast<size_t>(w));
-  for (int x = 0; x < w; ++x) {
-    uint8_t* hi = out + 2 * cb * x;
-    uint8_t* lo = hi + cb;
-    for (int y = 0; y < h; ++y) {
-      const int l = quantise_level(gray[static_cast<size_t>(y) * w + x], x, y, levels);
-      const auto m = static_cast<uint8_t>(0x80u >> (y & 7));
-      if (l & 2)
-        hi[y >> 3] |= m;
-      if (l & 1)
-        lo[y >> 3] |= m;
-    }
-  }
 }
 
 }  // namespace wintergreen

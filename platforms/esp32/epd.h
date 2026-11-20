@@ -1,7 +1,6 @@
 #pragma once
 
-// EInkDisplay driver for ESP-IDF (SSD1677): custom LUTs (panel_lut.h), strip
-// windows queued over DMA, temperature bands from the C3's own sensor.
+// EInkDisplay driver for ESP-IDF (SSD1677).
 
 #include <algorithm>
 #include <cstdint>
@@ -10,13 +9,11 @@
 
 #include "driver/gpio.h"
 #include "driver/spi_master.h"
-#include "driver/temperature_sensor.h"
 #include "esp_memory_utils.h"
 #include "esp_timer.h"
 #include "freertos/FreeRTOS.h"
 #include "freertos/semphr.h"
 #include "freertos/task.h"
-#include "panel_lut.h"
 #include "wintergreen/display/DrawBuffer.h"
 
 // ---- Pin assignments ----
@@ -44,11 +41,12 @@
 #define CMD_DISPLAY_UPDATE_CTRL2 0x22
 #define CMD_MASTER_ACTIVATION 0x20
 #define CTRL1_NORMAL 0x00
-#define CMD_GATE_VOLTAGE 0x03
-#define CMD_SOURCE_VOLTAGE 0x04
-#define CMD_WRITE_VCOM 0x2C
-#define CMD_WRITE_LUT 0x32
+#define CTRL1_BYPASS_RED 0x40
+#define CMD_WRITE_TEMP 0x1A
 #define CMD_DEEP_SLEEP 0x10
+
+// ---- Refresh modes (internal) ----
+enum EpdRefreshMode { EPD_FULL_REFRESH, EPD_HALF_REFRESH, EPD_FAST_REFRESH };
 
 class EInkDisplay : public wintergreen::IDisplay {
  public:
@@ -83,28 +81,12 @@ class EInkDisplay : public wintergreen::IDisplay {
     waitWhileBusy();
   }
 
-#ifdef WG_LUT_TEST
-  // Waveform comparison screen only (lut_test_screen.h): upload `lut` in place
-  // of whatever begin_update() loaded; the next begin_update() reloads ours.
-  void upload_lut(const uint8_t (&lut)[panel_lut::kLutBytes]) {
-    wakeIfNeeded();
-    waitWhileBusy();
-    sendCommand(CMD_WRITE_LUT);
-    sendData(lut, panel_lut::kLutBytes);
-    sendCommandData(CMD_GATE_VOLTAGE, {panel_lut::kGateVoltage});
-    sendCommandData(CMD_SOURCE_VOLTAGE,
-                    {panel_lut::kSourceVoltage[0], panel_lut::kSourceVoltage[1], panel_lut::kSourceVoltage[2]});
-    sendCommandData(CMD_WRITE_VCOM, {panel_lut::kVcom});
-    loaded_ = Loaded::None;
-  }
-#endif
-
   spi_device_handle_t spi_;
 
   void begin() {
-    // GPIO outputs: DC, RST (CS is the SPI peripheral's, see below)
+    // GPIO outputs: CS, DC, RST
     gpio_config_t out_cfg{};
-    out_cfg.pin_bit_mask = (1ULL << EPD_DC) | (1ULL << EPD_RST);
+    out_cfg.pin_bit_mask = (1ULL << EPD_CS) | (1ULL << EPD_DC) | (1ULL << EPD_RST);
     out_cfg.mode = GPIO_MODE_OUTPUT;
     out_cfg.pull_up_en = GPIO_PULLUP_DISABLE;
     out_cfg.pull_down_en = GPIO_PULLDOWN_DISABLE;
@@ -126,6 +108,7 @@ class EInkDisplay : public wintergreen::IDisplay {
     gpio_install_isr_service(0);
     gpio_isr_handler_add(EPD_BUSY, busy_isr_, this);
 
+    gpio_set_level(EPD_CS, 1);
     gpio_set_level(EPD_DC, 1);
 
     spi_bus_config_t bus{};
@@ -137,22 +120,12 @@ class EInkDisplay : public wintergreen::IDisplay {
     bus.max_transfer_sz = 4096;
     spi_bus_initialize(SPI2_HOST, &bus, SPI_DMA_CH_AUTO);
 
-    // CS by the peripheral and DC from each transaction's pre-callback, so a
-    // whole strip (window commands, both planes) is queued at once and the CPU
-    // renders the next strip while DMA sends this one.
     spi_device_interface_config_t dev{};
     dev.clock_speed_hz = 40 * 1000 * 1000;
     dev.mode = 0;
-    dev.spics_io_num = EPD_CS;
-    dev.queue_size = 2 * kTxPerWindow;
-    dev.pre_cb = dc_pre_cb_;
+    dev.spics_io_num = -1;
+    dev.queue_size = 2;  // one in flight + one queued for the async bulk path
     spi_bus_add_device(SPI2_HOST, &dev, &spi_);
-
-    // The C3's die sensor: chip temperature, a few degrees above ambient.
-    // Installed once; enabled only around each reading.
-    temperature_sensor_config_t tcfg = TEMPERATURE_SENSOR_CONFIG_DEFAULT(-10, 80);
-    if (temperature_sensor_install(&tcfg, &temp_) != ESP_OK)
-      temp_ = nullptr;
 
     // Reset pulse only. The panel needs ~20 ms after RST rises before it takes
     // commands, and main.cpp spends that mounting the SD card (same bus, but
@@ -169,7 +142,8 @@ class EInkDisplay : public wintergreen::IDisplay {
   // Second half of begin(): wait out whatever is left of the post-reset settle,
   // then configure the controller. No RAM clear: the first thing drawn is
   // Application::start()'s full_refresh(), which writes both planes over the
-  // whole panel.
+  // whole panel, so the two auto-write fills (and their busy waits) were paid
+  // for and then overwritten on every boot.
   void finish_begin() {
     const uint32_t since = millis() - reset_released_ms_;
     if (since < kResetSettleMs)
@@ -179,82 +153,52 @@ class EInkDisplay : public wintergreen::IDisplay {
 
   // ---- wintergreen::IDisplay ----
 
-  void begin_update(wintergreen::UpdateKind kind) override {
+  // RED RAM is the *previous* frame, and only EPD_FULL_REFRESH reads it.
+  //
+  // The full-refresh waveform is prior-state dependent: it drives each pixel from
+  // its old level to its new one, and the level it starts from is what RED holds.
+  // This used to write `pixels` to both planes with CTRL1_BYPASS_RED set, which
+  // told the controller to ignore RED altogether — so those 48 KB went out over
+  // SPI and were discarded, and the waveform fell back to the controller's own
+  // notion of the previous frame. After a session of fast partials that notion is
+  // stale, so pixels that should have been given a long white drive got a short
+  // one and stayed grey.
+  //
+  // Visible as a sleep cover that comes up washed out in its light areas, only on
+  // light covers (a dark one is mostly large transitions that get driven anyway)
+  // and only sometimes, since it depends on what was last on the glass.
+  //
+  // Half keeps BYPASS_RED. It is the boot paint — Application::start()'s
+  // full_refresh() defaults to it — and that sequence has already produced a
+  // panel that ran a waveform and then displayed nothing for the rest of time
+  // (see the EPD_HALF_REFRESH case in refreshDisplay). It draws from a cleared
+  // panel on a cold boot, so it has no previous frame to honour and gains
+  // nothing from one. Leave it alone.
+  void full_refresh(const uint8_t* pixels, const uint8_t* prev, wintergreen::RefreshMode mode,
+                    bool turnOffScreen) override {
+
     wakeIfNeeded();
     waitWhileBusy();
-    load_lut_(kind);
-    sendCommandData(CMD_DATA_ENTRY_MODE, {0x01});  // X inc, Y dec
+    const bool full = (mode != wintergreen::RefreshMode::Half);
+    // Without a previous frame there is nothing better to start from than the
+    // new one, which is the old behaviour.
+    const uint8_t* red = (full && prev) ? prev : pixels;
+    // Buffer covers all 800 columns; panel offset is baked into draw-function coordinates.
+    setRamArea(0, 0, DISPLAY_WIDTH, DISPLAY_HEIGHT);
+    writeRamBuffer(CMD_WRITE_RAM_BW, pixels, BUFFER_SIZE);
+    writeRamBuffer(CMD_WRITE_RAM_RED, red, BUFFER_SIZE);
+    refreshDisplay(full ? EPD_FULL_REFRESH : EPD_HALF_REFRESH, turnOffScreen);
   }
 
-  void await_strip_slot() override {
-    while (windows_ > 1)
-      drain_oldest_();
-  }
-
-  // One window of both RAM planes, queued: the range, the counters, BW, the
-  // counters again, RED. Buffer row 0 is the window's first physical row; the
-  // controller's Y runs the other way (data entry Y decrement), as the old
-  // whole-frame write did.
-  void write_window(int row0, int rows, int xb0, int xbytes, const uint8_t* bw, const uint8_t* red) override {
-    await_strip_slot();
-    spi_transaction_t* t = ring_[ring_slot_];
-    int n = 0;
-    const uint16_t x = static_cast<uint16_t>(xb0 * 8);
-    const uint16_t x_end = static_cast<uint16_t>(x + xbytes * 8 - 1);
-    const uint16_t y = static_cast<uint16_t>(DISPLAY_HEIGHT - row0 - rows);
-    const uint16_t y_end = static_cast<uint16_t>(DISPLAY_HEIGHT - row0 - 1);
-    auto cmd = [&](uint8_t c) { small_(t[n++], 0, {c}); };
-    auto counters = [&]() {
-      cmd(CMD_SET_RAM_X_COUNTER);
-      small_(t[n++], 1, {lo8_(x), hi8_(x)});
-      cmd(CMD_SET_RAM_Y_COUNTER);
-      small_(t[n++], 1, {lo8_(y_end), hi8_(y_end)});
-    };
-    cmd(CMD_SET_RAM_X_RANGE);
-    small_(t[n++], 1, {lo8_(x), hi8_(x), lo8_(x_end), hi8_(x_end)});
-    cmd(CMD_SET_RAM_Y_RANGE);
-    small_(t[n++], 1, {lo8_(y_end), hi8_(y_end), lo8_(y), hi8_(y)});
-    counters();
-    cmd(CMD_WRITE_RAM_BW);
-    bulk_(t[n++], bw, static_cast<size_t>(rows) * xbytes);
-    counters();
-    cmd(CMD_WRITE_RAM_RED);
-    bulk_(t[n++], red, static_cast<size_t>(rows) * xbytes);
-    for (int k = 0; k < n; ++k)
-      spi_device_queue_trans(spi_, &t[k], portMAX_DELAY);
-    ring_n_[ring_slot_] = n;
-    ring_slot_ ^= 1;
-    ++windows_;
-  }
-
-  void finish_writes() override {
-    while (windows_ > 0)
-      drain_oldest_();
-  }
-
-  // Run the loaded LUT over the whole panel. CTRL1 0x00: RED is used (it is
-  // half of every pixel's state). CTRL2 0x0C = DISPLAY_START + mode 2 and
-  // **no LUT_LOAD**: LUT_LOAD would replace our table from OTP.
-  //
-  // Turn returns while the panel is still busy: every entry point opens with
-  // wakeIfNeeded(); waitWhileBusy(), so the next one collects it. Full waits —
-  // its callers send more (deep sleep) or power down at its end.
-  void fire(wintergreen::UpdateKind kind, bool turn_off) override {
-    finish_writes();
-    sendCommandData(CMD_DISPLAY_UPDATE_CTRL1, {CTRL1_NORMAL});
-    uint8_t mode = 0x0C;
-    if (!isScreenOn) {
-      isScreenOn = true;
-      mode |= 0xC0;  // CLOCK_ON + ANALOG_ON (power up for the first update)
-    }
-    if (turn_off) {
-      isScreenOn = false;
-      mode |= 0x03;  // ANALOG_OFF_PHASE + CLOCK_OFF at the end of the waveform
-    }
-    sendCommandData(CMD_DISPLAY_UPDATE_CTRL2, {mode});
-    sendCommand(CMD_MASTER_ACTIVATION);
-    if (kind == wintergreen::UpdateKind::Full || turn_off)
-      waitWhileBusy();
+  // Fire and return: the controller now holds the pixels in its own RAM, so both
+  // host buffers are free and the app can lay out and draw the next frame while
+  // the waveform runs. This is the whole page-turn/menu latency win.
+  void partial_refresh(const uint8_t* new_pixels) override {
+    wakeIfNeeded();
+    waitWhileBusy();
+    setRamArea(0, 0, DISPLAY_WIDTH, DISPLAY_HEIGHT);
+    writeRamBuffer(CMD_WRITE_RAM_BW, new_pixels, BUFFER_SIZE);
+    refreshDisplay(EPD_FAST_REFRESH, /*turnOffScreen=*/false, /*wait=*/false);
   }
 
   // ---------------------------------------------------------------------------
@@ -268,17 +212,25 @@ class EInkDisplay : public wintergreen::IDisplay {
   //
   // On hardware the *first* page turn after the rails went down did nothing
   // visible — the old page stayed — and the turn after that drew correctly. So
-  // the waveform runs before the analog rails have actually come up, and one
-  // page turn is silently lost.
+  // the fast waveform runs before the analog rails have actually come up, and
+  // one page turn is silently lost. The user-visible bug is "go forward, screen
+  // does not change; go back and forward again and it does".
   //
-  // The rails are still powered down where it is free: fire()'s turn_off, at
-  // the end of a full refresh, which is what the sleep image uses.
+  // Two reasons not to try again. The 0x03 shutdown-only sequence is unproven:
+  // those two bits are marked "best guess" in refreshDisplay() and are only
+  // documented in combination with a refresh. And the fix — a settling delay or
+  // a power-up activation before the waveform — would land on the *first page
+  // turn after a pause*, which is the common case, paying back the whole saving
+  // as added latency exactly where this firmware is tuned not to have any.
+  //
+  // The rails are still powered down where it is free: refreshDisplay()'s
+  // turnOffScreen path, at the end of a full refresh, which is what the sleep
+  // image uses.
   // ---------------------------------------------------------------------------
 
   void deep_sleep() override {
-    // A turn may have left a waveform running; CMD_DEEP_SLEEP mid-update aborts
-    // it and leaves a half-drawn panel on screen for the whole sleep.
-    finish_writes();
+    // partial_refresh() may have left a waveform running; CMD_DEEP_SLEEP mid-update
+    // aborts it and leaves a half-drawn panel on screen for the whole sleep.
     waitWhileBusy();
     sendCommand(CMD_DEEP_SLEEP);
     sendData(0x03);
@@ -287,88 +239,6 @@ class EInkDisplay : public wintergreen::IDisplay {
   }
 
  private:
-  // ---- Transactions ----
-  //
-  // Every transaction carries its DC level in `user`; the pre-callback sets the
-  // pin just before the peripheral asserts CS.
-  static void dc_pre_cb_(spi_transaction_t* t) {
-    gpio_set_level(EPD_DC, reinterpret_cast<uintptr_t>(t->user) ? 1 : 0);
-  }
-  static uint8_t lo8_(uint16_t v) {
-    return static_cast<uint8_t>(v & 0xFF);
-  }
-  static uint8_t hi8_(uint16_t v) {
-    return static_cast<uint8_t>(v >> 8);
-  }
-  static void small_(spi_transaction_t& t, int dc, std::initializer_list<uint8_t> bytes) {
-    t = spi_transaction_t{};
-    t.length = bytes.size() * 8;
-    t.flags = SPI_TRANS_USE_TXDATA;
-    t.user = reinterpret_cast<void*>(static_cast<uintptr_t>(dc));
-    std::copy(bytes.begin(), bytes.end(), t.tx_data);
-  }
-  static void bulk_(spi_transaction_t& t, const uint8_t* data, size_t n) {
-    t = spi_transaction_t{};
-    t.length = n * 8;
-    t.tx_buffer = data;
-    t.user = reinterpret_cast<void*>(static_cast<uintptr_t>(1));
-  }
-
-  // Two windows of transactions in flight at most (DrawBuffer's two strip
-  // buffers). The descriptors live here until their results are collected.
-  static constexpr int kTxPerWindow = 16;
-  spi_transaction_t ring_[2][kTxPerWindow] = {};
-  int ring_n_[2] = {};
-  int ring_slot_ = 0;
-  int windows_ = 0;  // queued, results not yet collected
-
-  void drain_oldest_() {
-    // Results come back in queue order, so the oldest window's are next.
-    const int slot = ring_slot_ ^ (windows_ == 2 ? 0 : 1);
-    spi_transaction_t* done = nullptr;
-    for (int k = 0; k < ring_n_[slot]; ++k)
-      spi_device_get_trans_result(spi_, &done, portMAX_DELAY);
-    ring_n_[slot] = 0;
-    --windows_;
-  }
-
-  // ---- LUT ----
-
-  enum class Loaded : uint8_t { None, Turn, Full };
-  Loaded loaded_ = Loaded::None;  // reset by every controller init
-  panel_lut::Band band_ = panel_lut::Band::Warm;
-  panel_lut::Band loaded_band_ = panel_lut::Band::Warm;
-  temperature_sensor_handle_t temp_ = nullptr;
-
-  // Pick the band from the die temperature, then upload the table for `kind`
-  // unless it is already loaded for that band. Upload order as the vendor's:
-  // LUT (0x32, 105 B), gate voltage, source voltages, VCOM — after any OTP
-  // load (there is none now) and after every controller init.
-  void load_lut_(wintergreen::UpdateKind kind) {
-    float c = 0;
-    if (temp_ && temperature_sensor_enable(temp_) == ESP_OK) {
-      if (temperature_sensor_get_celsius(temp_, &c) == ESP_OK)
-        band_ = panel_lut::band_for(c, band_);
-      temperature_sensor_disable(temp_);
-    }
-    const Loaded want = kind == wintergreen::UpdateKind::Full ? Loaded::Full : Loaded::Turn;
-    if (loaded_ == want && loaded_band_ == band_)
-      return;
-    alignas(4) uint8_t lut[panel_lut::kLutBytes];
-    if (want == Loaded::Full)
-      panel_lut::build_full(lut, band_);
-    else
-      panel_lut::build_turn(lut, panel_lut::timing(band_));
-    sendCommand(CMD_WRITE_LUT);
-    sendData(lut, sizeof(lut));
-    sendCommandData(CMD_GATE_VOLTAGE, {panel_lut::kGateVoltage});
-    sendCommandData(CMD_SOURCE_VOLTAGE,
-                    {panel_lut::kSourceVoltage[0], panel_lut::kSourceVoltage[1], panel_lut::kSourceVoltage[2]});
-    sendCommandData(CMD_WRITE_VCOM, {panel_lut::kVcom});
-    loaded_ = want;
-    loaded_band_ = band_;
-  }
-
   // Exit deep sleep via hardware reset + controller re-init.
   void wakeIfNeeded() {
     if (!inDeepSleep_)
@@ -391,33 +261,57 @@ class EInkDisplay : public wintergreen::IDisplay {
     vTaskDelay(pdMS_TO_TICKS(ms));
   }
 
-  // Polled transfers, only with nothing queued (begin_update, fire, deep sleep).
   void sendCommand(uint8_t command) {
-    spi_transaction_t t;
-    small_(t, 0, {command});
+    gpio_set_level(EPD_DC, 0);
+    gpio_set_level(EPD_CS, 0);
+    spi_transaction_t t{};
+    t.length = 8;
+    t.flags = SPI_TRANS_USE_TXDATA;
+    t.tx_data[0] = command;
     spi_device_polling_transmit(spi_, &t);
+    gpio_set_level(EPD_CS, 1);
   }
 
   void sendData(uint8_t data) {
-    spi_transaction_t t;
-    small_(t, 1, {data});
+    gpio_set_level(EPD_DC, 1);
+    gpio_set_level(EPD_CS, 0);
+    spi_transaction_t t{};
+    t.length = 8;
+    t.flags = SPI_TRANS_USE_TXDATA;
+    t.tx_data[0] = data;
     spi_device_polling_transmit(spi_, &t);
+    gpio_set_level(EPD_CS, 1);
   }
 
-  // The LUT: 105 bytes from the stack, polled (less than an interrupt round
-  // trip).
+  // Bulk pixel/LUT push.
+  //
+  // Bulk transfers wait on an interrupt rather than polling. A framebuffer plane
+  // is 48,000 bytes — ~10 ms at 40 MHz, and full_refresh writes two — and polling
+  // spun the CPU for all of it. The transfer is DMA either way; only the waiting
+  // changed, so this is a battery optimisation rather than a speed one.
+  //
+  // Small writes always poll: a 105-byte LUT costs less than the interrupt round
+  // trip, and LUT tables live in rodata, which is not DMA-capable — hence the
+  // esp_ptr_dma_capable() guard rather than a plain size test.
   void sendData(const uint8_t* data, uint32_t length) {
-    spi_transaction_t t;
-    bulk_(t, data, length);
-    spi_device_polling_transmit(spi_, &t);
-  }
-
-  // A command and its (at most four) parameter bytes: two transactions.
-  void sendCommandData(uint8_t command, std::initializer_list<uint8_t> data) {
-    sendCommand(command);
-    spi_transaction_t t;
-    small_(t, 1, data);
-    spi_device_polling_transmit(spi_, &t);
+    static constexpr size_t kChunk = 4092;
+    static constexpr size_t kAsyncMin = 1024;
+    const bool async = length >= kAsyncMin && esp_ptr_dma_capable(data);
+    gpio_set_level(EPD_DC, 1);
+    size_t offset = 0;
+    while (offset < length) {
+      const size_t chunk = (length - offset < kChunk) ? (length - offset) : kChunk;
+      gpio_set_level(EPD_CS, 0);
+      spi_transaction_t t{};
+      t.length = chunk * 8;
+      t.tx_buffer = data + offset;
+      if (async)
+        spi_device_transmit(spi_, &t);
+      else
+        spi_device_polling_transmit(spi_, &t);
+      gpio_set_level(EPD_CS, 1);
+      offset += chunk;
+    }
   }
 
   void waitWhileBusy() {
@@ -432,16 +326,135 @@ class EInkDisplay : public wintergreen::IDisplay {
     }
   }
 
-  // The vendor init. CMD_TEMP_SENSOR_CONTROL 0x80 (internal sensor) stays
-  // although nothing loads an OTP waveform any more (no LUT_LOAD, no
-  // TEMP_LOAD): harmless, and a vendor init is not a place to remove things
-  // that "should" be no-ops. Every init forgets the uploaded LUT.
+  // wait=false fires the waveform and returns immediately, leaving the panel busy.
+  // Safe because every public entry point opens with wakeIfNeeded()+waitWhileBusy(),
+  // so the next panel operation collects the outstanding refresh before touching RAM.
+  // Callers that send further SPI commands right afterwards (deep sleep, screen
+  // power-off) must keep wait=true — a command mid-waveform aborts it.
+  void refreshDisplay(EpdRefreshMode mode, bool turnOffScreen = false, bool wait = true) {
+    sendCommand(CMD_DISPLAY_UPDATE_CTRL1);
+    // Only EPD_HALF_REFRESH bypasses RED. Fast has always used it as the previous
+    // frame, and Full now does too — that is what makes a full refresh drive from
+    // the pixel's actual old level rather than from whatever the controller last
+    // tracked. See full_refresh() for what the bypass cost on the sleep cover.
+    sendData(mode == EPD_HALF_REFRESH ? CTRL1_BYPASS_RED : CTRL1_NORMAL);
+
+    // best guess at display mode bits:
+    // bit | hex | name                    | effect
+    // ----+-----+--------------------------+-------------------------------------------
+    // 7   | 80  | CLOCK_ON                | Start internal oscillator
+    // 6   | 40  | ANALOG_ON               | Enable analog power rails (VGH/VGL drivers)
+    // 5   | 20  | TEMP_LOAD               | Load temperature (internal or I2C)
+    // 4   | 10  | LUT_LOAD                | Load waveform LUT
+    // 3   | 08  | MODE_SELECT             | Mode 1/2
+    // 2   | 04  | DISPLAY_START           | Run display
+    // 1   | 02  | ANALOG_OFF_PHASE        | Shutdown step 1 (undocumented)
+    // 0   | 01  | CLOCK_OFF               | Disable internal oscillator
+
+    // TEMP_LOAD (0x20) makes the controller sample the sensor selected by
+    // CMD_TEMP_SENSOR_CONTROL — the internal one, chosen in
+    // initDisplayController() — into the temperature register, and the OTP
+    // waveform is then picked for *that* reading.
+    //
+    // Without it the register only ever holds what the host last wrote, which is
+    // the fixed 0x5A below: every waveform on this device ran as though the panel
+    // were at one unchanging temperature. e-ink waveform timing is genuinely
+    // temperature-dependent, and driving a cold panel with a warm panel's
+    // waveform under-develops the pixels — which reads as ghosting and washed-out
+    // contrast, the exact symptoms the periodic full refresh exists to fix.
+    //
+    // **Only EPD_FULL_REFRESH takes it**, and the other two are excluded for
+    // different reasons. EPD_FAST_REFRESH runs the custom LUT — a fixed table no
+    // temperature can select between — and is the page-turn hot path.
+    // EPD_HALF_REFRESH is the boot paint, which on a device that deep-sleeps
+    // after a minute runs every time it is picked up; a correct, colder, longer
+    // waveform there was simply too visible. See the note in that case.
+    //
+    // What is left is exactly the set of updates that recondition the panel: the
+    // periodic DC-balancing flush and the sleep image, neither of which anybody
+    // is waiting on.
+    //
+    // The temperature cannot be read back: CMD_READ_TEMP needs MISO and the
+    // panel is wired write-only. The controller acts on it; nothing can print it.
+    //
+    // If a future panel revision disagrees, setting this to 0x00 restores the
+    // previous fixed-temperature behaviour exactly — the 0x5A seed write below
+    // is kept for that reason. It is a constant rather than a config option
+    // because it is a property of the controller, not a preference.
+    static constexpr uint8_t kTempLoad = 0x20;
+
+    uint8_t displayMode = 0x00;
+    if (!isScreenOn) {
+      isScreenOn = true;
+      displayMode |= 0xC0;  // CLOCK_ON + ANALOG_ON (power up for first refresh)
+    }
+
+    if (turnOffScreen) {
+      isScreenOn = false;
+      displayMode |= 0x03;  // Set ANALOG_OFF_PHASE and CLOCK_OFF bits
+    }
+
+    switch (mode) {
+      case EPD_FULL_REFRESH:
+        displayMode |= 0x34 | kTempLoad;
+        break;
+      case EPD_HALF_REFRESH:
+        // This temperature-register write is NOT redundant, however much it
+        // looks it. initDisplayController() does select the internal sensor
+        // (CMD_TEMP_SENSOR_CONTROL = 0x80), and on that basis this was removed
+        // once as vestigial — the result was a panel that ran its waveform (a
+        // black flash) and then showed nothing at all. 0xD4 includes LUT_LOAD,
+        // and the OTP waveform this loads is selected by the temperature
+        // register; without the write it does not come up with a usable LUT.
+        // Application::start()'s full_refresh() defaults to Half, so this is the
+        // path that draws the very first screen. Leave it alone.
+        //
+        // **This path deliberately does NOT take TEMP_LOAD**, and the reason is
+        // what the user sees rather than what the panel wants.
+        //
+        // Half is the boot paint — Application::start() ends with
+        // full_refresh(), whose default is Half — and because deep-sleep wake is
+        // a full boot, that is the waveform that runs *every time the device is
+        // picked up*. Letting the controller sample its sensor here made it
+        // visibly longer: 0x5A corresponds to a much warmer panel than a room,
+        // and e-ink waveforms get longer and invert more times as they get
+        // colder. Correct, and far too distracting several times an hour.
+        //
+        // EPD_FULL_REFRESH keeps TEMP_LOAD, and that is where it earns its keep:
+        // the periodic DC-balancing flush and the sleep image are the updates
+        // that actually recondition the panel, and they happen when nobody is
+        // waiting on them. Any under-driving this path leaves behind is cleared
+        // by the next flush.
+        sendCommand(CMD_WRITE_TEMP);
+        sendData(0x5A);
+        displayMode |= 0xD4;
+        break;
+      case EPD_FAST_REFRESH:
+        // LUT_LOAD (bit 4) included: page turns run the panel's OTP fast
+        // waveform, which is selected via the temperature register.
+        displayMode |= 0x1C;
+        break;
+    }
+
+    sendCommand(CMD_DISPLAY_UPDATE_CTRL2);
+    sendData(displayMode);
+
+    sendCommand(CMD_MASTER_ACTIVATION);
+
+    // Powering the screen off happens at the end of the waveform, so those
+    // refreshes can never be left outstanding.
+    if (!wait && !turnOffScreen)
+      return;
+    waitWhileBusy();
+  }
+
   void initDisplayController() {
     sendCommand(CMD_SOFT_RESET);
     waitWhileBusy();
-    loaded_ = Loaded::None;
 
-    sendCommandData(CMD_TEMP_SENSOR_CONTROL, {0x80});
+    sendCommand(CMD_TEMP_SENSOR_CONTROL);
+    sendData(0x80);
+
     sendCommand(CMD_BOOSTER_SOFT_START);
     sendData(0xAE);
     sendData(0xC7);
@@ -449,9 +462,49 @@ class EInkDisplay : public wintergreen::IDisplay {
     sendData(0xC0);
     sendData(0x40);
 
-    sendCommandData(CMD_DRIVER_OUTPUT_CONTROL,
-                    {static_cast<uint8_t>((DISPLAY_HEIGHT - 1) % 256), static_cast<uint8_t>((DISPLAY_HEIGHT - 1) / 256),
-                     0x02});
-    sendCommandData(CMD_BORDER_WAVEFORM, {0x01});
+    sendCommand(CMD_DRIVER_OUTPUT_CONTROL);
+    sendData((DISPLAY_HEIGHT - 1) % 256);
+    sendData((DISPLAY_HEIGHT - 1) / 256);
+    sendData(0x02);
+
+    sendCommand(CMD_BORDER_WAVEFORM);
+    sendData(0x01);
+
   }
+
+  // A command and its (at most four) parameter bytes: one transaction for the
+  // command and one for all of its data, CS held low across the data as the
+  // bulk RAM writes already do. Byte-at-a-time this was 18 data transactions,
+  // each with its own CS edge and polling round trip, ahead of every refresh.
+  void sendCommandData(uint8_t command, std::initializer_list<uint8_t> data) {
+    sendCommand(command);
+    gpio_set_level(EPD_DC, 1);
+    gpio_set_level(EPD_CS, 0);
+    spi_transaction_t t{};
+    t.length = data.size() * 8;
+    t.flags = SPI_TRANS_USE_TXDATA;
+    std::copy(data.begin(), data.end(), t.tx_data);
+    spi_device_polling_transmit(spi_, &t);
+    gpio_set_level(EPD_CS, 1);
+  }
+
+  void setRamArea(uint16_t x, uint16_t y, uint16_t w, uint16_t h) {
+    y = DISPLAY_HEIGHT - y - h;
+    const uint16_t x_end = x + w - 1;
+    const uint16_t y_end = y + h - 1;
+
+    sendCommandData(CMD_DATA_ENTRY_MODE, {0x01});  // X inc, Y dec
+    sendCommandData(CMD_SET_RAM_X_RANGE, {static_cast<uint8_t>(x % 256), static_cast<uint8_t>(x / 256),
+                                          static_cast<uint8_t>(x_end % 256), static_cast<uint8_t>(x_end / 256)});
+    sendCommandData(CMD_SET_RAM_Y_RANGE, {static_cast<uint8_t>(y_end % 256), static_cast<uint8_t>(y_end / 256),
+                                          static_cast<uint8_t>(y % 256), static_cast<uint8_t>(y / 256)});
+    sendCommandData(CMD_SET_RAM_X_COUNTER, {static_cast<uint8_t>(x % 256), static_cast<uint8_t>(x / 256)});
+    sendCommandData(CMD_SET_RAM_Y_COUNTER, {static_cast<uint8_t>(y_end % 256), static_cast<uint8_t>(y_end / 256)});
+  }
+
+  void writeRamBuffer(uint8_t ramBuffer, const uint8_t* data, uint32_t size) {
+    sendCommand(ramBuffer);
+    sendData(data, size);
+  }
+
 };

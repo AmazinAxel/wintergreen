@@ -1,23 +1,21 @@
 #pragma once
 
-// WGF binary font format.
+// WGF (Microreader Bitmap Font) binary format — version 4.
 //
 // Each WGF file contains one font at one pixel size, with up to 4 styles
-// (Regular + optional Bold, Italic, BoldItalic). Every glyph is antialiased to
-// the three levels a normal panel update shows (white, gray, black), stored as
-// two 1-bit planes: hi (gray or black) and lo (black), lo inside hi.
+// (Regular + optional Bold, Italic, BoldItalic) and optional 2-bit grayscale
+// data for antialiased rendering on e-ink displays.
 //
 // Layout (single-style, style_flags=0):
 //   [WgfHeader]                     40 bytes
 //   [WgfRange × num_ranges]         8 bytes each
 //   [WgfGlyph × num_glyphs]        10 bytes each
-//   [Bitmap data]                  variable: per glyph hi plane then lo plane
+//   [BW bitmap data]               variable (1-bit packed, MSB-first)
 //   [Column bitmap data]           variable (absent if col_bitmap_offset=0)
 //   [Column index]                 u32 per glyph, every style (absent if col_index_offset=0)
 //
 // Column bitmaps: every glyph a second time, column-major (each column
-// ceil(bitmap_height/8) bytes, top pixel MSB; all hi columns, then all lo
-// columns), so the portrait
+// ceil(bitmap_height/8) bytes, top pixel MSB, same polarity), so the portrait
 // blit is a byte copy per column instead of a bit transpose. The index holds,
 // for each glyph of Regular, then Bold, Italic, BoldItalic (the styles whose
 // header offset is non-zero, in that order), its offset from col_bitmap_offset.
@@ -33,9 +31,8 @@
 // a BitmapFontSet at runtime.
 //
 // Glyph lookup: binary-search ranges by codepoint → index into glyph table.
-// Bitmap data: each glyph has 2 × ceil(bitmap_width/8) × bitmap_height bytes
-// (hi plane rows, then lo plane rows), MSB first. Bit SET = ink. Quantised by
-// tools/make_font.py (light hinting, stem darkening, two coverage thresholds).
+// Bitmap data: each glyph has ceil(bitmap_width/8) × bitmap_height bytes.
+// Bit polarity: 1 = white, 0 = black (bit CLEAR = draw pixel).
 
 #include <cstddef>
 #include <cstdint>

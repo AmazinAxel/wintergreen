@@ -250,11 +250,33 @@ inline bool http_post_(const std::string& body, std::string& out) {
 
 // ── Download pipe: network fills one buffer while the card writes the other ──
 
+// The spare framebuffer, lent by the UI thread for the length of a sync. It is
+// 48 KB the sync would otherwise take from a heap that bottoms out at ~44 KB
+// free during one, and while a sync runs nothing needs it: input is locked and
+// the book list repaints only at the end (its thumbnails are re-read then).
+// Lending and returning both happen in poll() on the UI thread, which owns the
+// DrawBuffer; this task only asks and waits.
+inline uint8_t* g_spare = nullptr;
+inline volatile bool g_spare_want = false;
+inline volatile bool g_spare_back = false;
+inline SemaphoreHandle_t g_spare_ready = nullptr;
 
-// One download buffer, kChunk from the heap (there is no framebuffer to borrow
-// any more; DrawBuffer keeps ~70 KB less than the old spare did, so the heap
-// has the room). Filled from the network, written in one fwrite (32 whole
-// sectors), so the card sees few, large multi-block writes.
+inline uint8_t* acquire_spare_() {
+  if (g_spare)
+    return g_spare;
+  if (!g_spare_ready)
+    g_spare_ready = xSemaphoreCreateBinary();
+  if (!g_spare_ready)
+    return nullptr;
+  g_spare_want = true;
+  ui_wake();
+  xSemaphoreTake(g_spare_ready, portMAX_DELAY);
+  return g_spare;  // null when there is no spare: DownloadBuf falls back to the heap
+}
+
+// One download buffer: the lent spare in whole sectors (92 × 512 B), or kChunk
+// from the heap without one. Filled from the network, written in one fwrite,
+// so the card sees few, large multi-block writes.
 //
 // **Serial on purpose.** A double buffer with a separate card-writer task was
 // built and measured 2026-11-12 and gained nothing (docs/sync.md "Speed
@@ -264,14 +286,21 @@ inline bool http_post_(const std::string& body, std::string& out) {
 struct DownloadBuf {
   uint8_t* data = nullptr;
   size_t cap = 0;
+  uint8_t* heap = nullptr;
 
   bool open() {
-    data = static_cast<uint8_t*>(std::malloc(kChunk));
+    if (uint8_t* spare = acquire_spare_()) {
+      data = spare;
+      cap = wintergreen::DrawBuffer::kBufSize / 512 * 512;
+      return true;
+    }
+    heap = static_cast<uint8_t*>(std::malloc(kChunk));
+    data = heap;
     cap = kChunk;
-    return data != nullptr;
+    return heap != nullptr;
   }
   ~DownloadBuf() {
-    std::free(data);
+    std::free(heap);
   }
 };
 
@@ -725,6 +754,14 @@ inline void sync_task(void*) {
     esp_pm_lock_delete(cpu_lock);
   }
 
+  // The download buffers go back before the end state is visible: poll() on
+  // the UI thread returns the spare and only then is the state set, so the
+  // repaint that shows "Synced" has its thumbnails again.
+  if (g_spare) {
+    g_spare_back = true;
+    ui_wake();
+    xSemaphoreTake(g_spare_ready, portMAX_DELAY);  // poll() gives it once returned
+  }
   g_state = ok ? SyncState::Done : SyncState::Failed;
   g_keep_awake = false;
   g_busy = false;
@@ -756,8 +793,9 @@ inline void start() {
   // One radio at a time: the clicker's link closes and its controller is
   // disabled, but its stack stays initialised (never deinit — that loses the
   // clicker until reboot), and poll() reconnects it when the sync ends.
-  // Nothing is freed or lent: the book index (whose strings the book list is
-  // showing) and DrawBuffer's lists stay.
+  // Nothing is freed: the book index (whose strings the book list is showing)
+  // and the reader's page buffer stay. The spare framebuffer is only *lent* to
+  // the downloads (acquire_spare_), contents dropped, and comes back at the end.
   g_reconnect_clicker = wg_clicker::begin_sync();
   g_end_pending = true;
 
@@ -776,6 +814,17 @@ inline void start() {
 inline void poll() {
   if (g_keep_awake && g_app)
     g_app->keep_awake();
+  if (g_spare_want && g_buf) {
+    g_spare_want = false;
+    g_spare = g_buf->lend_spare();
+    xSemaphoreGive(g_spare_ready);
+  }
+  if (g_spare_back && g_buf) {
+    g_spare_back = false;
+    g_spare = nullptr;
+    g_buf->return_spare();
+    xSemaphoreGive(g_spare_ready);
+  }
   if (g_end_pending && !g_busy) {
     g_end_pending = false;
     wg_clicker::end_sync(g_reconnect_clicker);

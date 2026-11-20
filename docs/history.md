@@ -6,13 +6,9 @@ Part of the Wintergreen notes; the entry point is `CLAUDE.md`.
 
 Moved here from `PLAN.md` (deleted 2026-11-12). Owner's call unless noted.
 
-- **Grayscale rewrite (2026-11-19), nothing device-tested.** Draw lists + strip renderer,
-  custom LUTs, temperature bands, two-plane fonts/images/covers, sleep frame. Flash it,
-  rebake the library, and walk docs/display.md "Waveform tuning". Re-measure `H min`
-  (docs/bluetooth.md "RAM now"): ~74 KB more heap is expected.
-- **Neighbouring carousel cover preload (reopened 2026-11-12, not built)** — moot since
-  2026-11-19: no cover is held in RAM at all; a changed cover streams from the card
-  during the refresh that shows it.
+- **Neighbouring carousel cover preload (reopened 2026-11-12, not built).** Two covers
+  (2 × 25,387 B) do not fit the 48,000 B spare, so it needs a fixed 25 KB buffer claimed
+  at boot. Waits for the device heap numbers (`H min`) to show the room.
 - **Re-baked books never re-sync.** Sync matches by folder name only; a re-bake under the
   same slug is never offered again. Bug. Any WGB format change (2026-11-12: compact word
   records) needs the card's books replaced by hand until this is fixed.
@@ -23,8 +19,7 @@ Moved here from `PLAN.md` (deleted 2026-11-12). Owner's call unless noted.
 - **Built 2026-11-12, none device-tested yet:** column-major glyphs, covers in panel
   order, glyph ids in display lists, allocation-free quick-menu wrap, thumbnail pack,
   allocation-free home slots, hidden-book title cache, unclipped fast path in
-  `put_row_`, reader images with a portrait copy (bands then; columns since 2026-11-19),
-  binary index file (format only:
+  `put_row_`, reader images with a portrait band copy, binary index file (format only:
   `BookIndex` API, sort, sync and hidden handling unchanged). Not baked: display-order
   records and pre-cut titles (sort and `fit_prefix` are sub-ms; would change the API).
 - B1 light-sleep experiment, B2 `min_freq_mhz = 40`: both contradict CLAUDE.md "never
@@ -36,7 +31,8 @@ Moved here from `PLAN.md` (deleted 2026-11-12). Owner's call unless noted.
 - Never device-tested: sync started while the clicker is still connecting (code review
   2026-11-12 found and fixed a race: `begin_sync()` now aborts and waits for
   `connect_task` to exit); clicker paired elsewhere then back (fixed: stale bond deleted
-  even when the clicker hangs up, then one fresh re-pair); final-file rewrite in `WgbPaginator` (tmp + remove + rename) on the
+  even when the clicker hangs up, then one fresh re-pair); image-page pre-draw after idle; `stage_next_page_` ordering on
+  quick-menu resume; final-file rewrite in `WgbPaginator` (tmp + remove + rename) on the
   owner's machine.
 - Seen once, never again: 20/20 clicker presses dropped (queue full) in one run; first
   big sync leaving a 0-byte `book.wgb.tmp` (`docs/sync.md` "Open").
@@ -59,9 +55,7 @@ waveform, see `docs/display.md`.)
   records instead: sharing needs a second card read on every page not pre-staged
   (backward turn, chapter jump, open), against a one-time sync gain.
 
-- **Shorter page-turn waveform (custom fast LUT)** — (since 2026-11-19 every waveform is a
-  custom LUT; its length D is tuned for solid blacks on device day, not shortened for
-  speed without asking) offered 2026-11-11 as the only lever
+- **Shorter page-turn waveform (custom fast LUT)** — offered 2026-11-11 as the only lever
   left on turn/menu/hold latency (~150-200 ms vs ~300 ms, at a ghosting/contrast cost
   judged by eye). Owner declined; not built. Offered again 2026-11-12 for menu cursor moves
   only (fast clicker taps batch into one ~430 ms frame and look skipped; measured: 26 presses,
@@ -108,11 +102,11 @@ waveform, see `docs/display.md`.)
 - **Sampling buttons every 10 ms instead of 5 ms.** Would halve the 200 Hz timer wakeups, but the
   CPU is *never* asleep between them — there is no light sleep — so it saves a fraction of a
   milliamp out of 15 while adding up to 10 ms to every press.
-- **Compressing the sleep image** (`sleep.mgr` then, `sleep.frame` now, ~96 KB → a few KB
-  with zlib). Moot: the image lives in its own flash partition, so it costs no image bytes,
-  and uncompressed means the sleep path streams straight from the mmap with no inflate.
-- **A faster page-turn waveform** (OTP era). There wasn't one: page turns used
-  `EPD_FAST_REFRESH`, the shortest OTP waveform. Since 2026-11-19 the turn LUT is ours.
+- **Compressing `sleep.mgr`** (96,008 → 4,682 with zlib). Moot: the image left the app image for
+  its own flash partition, so it costs no image bytes, and uncompressed means the sleep path is a
+  straight mmap with no inflate.
+- **A faster page-turn waveform.** There isn't one. Page turns already use `EPD_FAST_REFRESH`,
+  the shortest waveform the controller has.
 - **Pre-draw backwards.** `prev_page_()` already runs `layout_backward()` and caches the result,
   so a backward pre-draw saves only the glyph blit — and saving the layout too would need a
   second, backward-keyed page cache on top of a second spare framebuffer.
@@ -173,20 +167,8 @@ carousel, hidden books a `MainMenu` mode, chapters an inline quick-menu list. **
 means editing `platforms/esp32/CMakeLists.txt` too**; the failure is at CMake generate time with
 a "Cannot find source file" naming the wrong call site.
 
-**Grayscale resurrected (2026-11-19, owner's call, asked and approved).** Not the design
-below: one update per change, the old frame known from a draw list (no framebuffers),
-three levels per normal update with HOLD for unchanged pixels, four in full refreshes,
-right-aligned custom LUTs. See docs/display.md "One update per change". Removed with it:
-the 48 KB spare framebuffer and everything on it (pre-draw `prerender_next_page_` /
-`take_predrawn_` / `predraw_after_idle_`, the snapshot swap, `claim_spare_cache`'s
-thumbnail and home-cover caches, the sync's `lend_spare` loan), the draw framebuffer, the
-reader's `page_buf_`, every OTP waveform path (`EPD_FAST/HALF/FULL_REFRESH`, the 0x5A
-seed, TEMP_LOAD), `--mono` / mono-hinted 1-bit fonts, MGR2 and its threshold decode,
-Atkinson/Bayer dithering (blue noise now), and `IDisplay::full_refresh` /
-`partial_refresh` with `RefreshMode`.
-
-**Antialiased (grayscale) text in the reader** (the first attempt), and the whole multi-pass
-machinery behind it. It was removed because it was **visible as motion**: `kLutGrayscale`'s waveforms put white and black
+**Antialiased (grayscale) text in the reader**, and the whole multi-pass machinery behind it. It
+was removed because it was **visible as motion**: `kLutGrayscale`'s waveforms put white and black
 both on LUT0 = *do nothing*, so gray was only reachable by driving a pixel black and then
 partially pulling it back. Every page turn became three physical updates, the middle one showing
 the font's mid/dark AA levels as solid black — text that appeared to thicken and then visibly

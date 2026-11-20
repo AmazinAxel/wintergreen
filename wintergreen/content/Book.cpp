@@ -10,10 +10,6 @@
 
 namespace wintergreen {
 
-// Gray at or above which a cover pixel counts as paper (blank bands trimmed).
-static constexpr uint8_t kPaperWhite = 245;
-
-
 EpubError Book::open(const char* path, uint8_t* work_buf, uint8_t* xml_buf, bool parse_css_ncx) {
   close();  // release previous resources
   if (!file_.open(path))
@@ -107,7 +103,7 @@ bool Book::write_cover_bin(const char* cover_path, int max_w, int max_h,
     auto row_blank = [&](int row) {
       const uint8_t* r = img.data.data() + static_cast<size_t>(row) * stride;
       for (int x = 0; x < img.width; ++x)
-        if (r[x] < kPaperWhite)
+        if (!((r[x >> 3] >> (7 - (x & 7))) & 1))
           return false;
       return true;
     };
@@ -120,9 +116,14 @@ bool Book::write_cover_bin(const char* cover_path, int max_w, int max_h,
       img.height = static_cast<uint16_t>(bot - top + 1);
     }
   }
-  // Column-major, two planes, 3 levels, for the portrait screens (CoverPaths.h).
-  std::vector<uint8_t> cols(cover_cols_bytes(img.width, img.height));
-  pack_cols(img.data.data(), img.width, img.height, 3, cols.data());
+  // Column-major for the portrait screens (CoverPaths.h).
+  const size_t stride = img.stride();
+  const size_t col_bytes = (static_cast<size_t>(img.height) + 7) / 8;
+  std::vector<uint8_t> cols(cover_cols_bytes(img.width, img.height), 0xFF);
+  for (int y = 0; y < img.height; ++y)
+    for (int x = 0; x < img.width; ++x)
+      if (!((img.data[static_cast<size_t>(y) * stride + (x >> 3)] >> (7 - (x & 7))) & 1))
+        cols[static_cast<size_t>(x) * col_bytes + (y >> 3)] &= static_cast<uint8_t>(~(0x80u >> (y & 7)));
   FILE* f = std::fopen(cover_path, "wb");
   if (!f)
     return false;
@@ -134,25 +135,32 @@ bool Book::write_cover_bin(const char* cover_path, int max_w, int max_h,
 }
 
 // Compose the sleep screen exactly as the panel will show it, so the device
-// only has to stream it: trimmed, stretched to the full panel, dithered to the
-// four levels a full refresh shows. None of
+// only has to blit it: trimmed, stretched to the full panel, dithered. None of
 // it depends on anything known only at runtime — the panel size is fixed — so
 // it happens here and the device gets a 1:1 blit of a W x H bitmap.
 //
 // The stretch is deliberate and is **not** aspect-preserving. Fitting the cover
-// inside the panel leaves letterbox bars, and there is no good
+// inside the panel leaves letterbox bars, and on a 1-bit panel there is no good
 // colour for them: white bars on a dark cover look like a mistake, and the
 // alternative (measuring the artwork's edge ink and filling the bars to match)
 // was tried and is gone with this comment. Covers are close enough to the
 // panel's aspect that filling it outright reads as a full-bleed image, which is
 // what a sleep screen wants — and there is no bar geometry left to get wrong.
 //
-// **Scale in the decoder, dither once at the final size.** Resampling a
-// dithered bitmap picks whole pixels out of its pattern and bands; the decoder
-// scales the grayscale instead. Two decodes: one to measure the trim box, one
-// at dimensions inflated so the trimmed region lands at exactly W x H. The
-// second decode's crop is a pure copy, then one blue-noise quantise. Decoding
-// twice costs converter time only.
+// **Never resample the decoder's output.** It returns a dithered 1-bit bitmap,
+// and scaling that means picking whole pixels out of an error-diffused pattern:
+// the dropped pixels are the ones carrying the diffused error, so the local
+// average stops matching the original tone and the result bands and mottles.
+// This function used to decode at W x H and then nearest-neighbour the trimmed
+// sub-rectangle up to the panel, which is exactly that — and it silently
+// contradicted the "dithered once" comment two lines above it.
+//
+// So the scale is pushed into the decoder, which scales from *grayscale* and
+// dithers in the same pass (see dither_row's x_step). Two decodes: one to
+// measure the trim box, one at dimensions inflated so the trimmed region lands
+// at exactly W x H. The second decode's crop is then a pure copy, no resampling
+// at any point. Decoding twice costs converter time only, and the converter
+// already decodes this cover three times for the three sizes.
 bool Book::write_sleep_cover_bin(const char* cover_path, int W, int H,
                                  uint8_t* work_buf, size_t work_buf_size) {
   const int idx = epub_.cover_zip_idx();
@@ -175,7 +183,7 @@ bool Book::write_sleep_cover_bin(const char* cover_path, int W, int H,
 
   // Contrast-stretch low-contrast covers. A cover whose tones all sit in the
   // middle (a soft watercolour, a faded scan) dithers to a uniform speckle with
-  // no true black or paper white, and on the panel in sunlight that reads as
+  // no true black or paper white, and on a 1-bit panel in sunlight that reads as
   // flat gray. Measured on "alice in wonderland": 46.5% ink with zero rows at
   // either extreme, against ~95% (the hobbit) and ~10% (lord of the flies),
   // both of which look right on the device untouched. build_stretch_lut
@@ -193,7 +201,9 @@ bool Book::write_sleep_cover_bin(const char* cover_path, int W, int H,
   const int cw = probe.width, ch = probe.height;
   const size_t pstride = probe.stride();
   const uint8_t* psrc = probe.data.data();
-  auto pink = [&](int x, int y) { return psrc[static_cast<size_t>(y) * pstride + x] < kPaperWhite; };
+  auto pink = [&](int x, int y) {
+    return ((psrc[static_cast<size_t>(y) * pstride + (x >> 3)] >> (7 - (x & 7))) & 1) == 0;
+  };
 
   // Trim fully blank rows and columns. Publishers bake white bands into cover
   // artwork, and stretching those to the panel just makes them bigger.
@@ -216,13 +226,13 @@ bool Book::write_sleep_cover_bin(const char* cover_path, int W, int H,
   if (keep_w <= 0 || keep_h <= 0)
     return false;
 
-  const size_t out_stride = static_cast<size_t>(W);
+  const size_t out_stride = (static_cast<size_t>(W) + 7) / 8;
   std::vector<uint8_t> out;
 
   if (keep_w == cw && keep_h == ch && !stretch) {
     // Nothing to trim and no tone map: the probe is already the final image at
-    // the right size. With a stretch it holds the raw tones, so fall through
-    // and decode again through the LUT.
+    // the right size. With a stretch the probe is unusable — it was dithered
+    // from the raw tones — so fall through and decode again through the LUT.
     out = std::move(probe.data);
   } else if (keep_w == cw && keep_h == ch) {
     DecodedImage full;
@@ -261,18 +271,30 @@ bool Book::write_sleep_cover_bin(const char* cover_path, int W, int H,
 
     const size_t fstride = full.stride();
     const uint8_t* fsrc = full.data.data();
-    out.resize(out_stride * static_cast<size_t>(H));
-    for (int dy = 0; dy < H; ++dy)
-      std::memcpy(out.data() + static_cast<size_t>(dy) * out_stride, fsrc + static_cast<size_t>(oy + dy) * fstride + ox,
-                  static_cast<size_t>(W));
+    out.assign(out_stride * static_cast<size_t>(H), 0xFF);
+    for (int dy = 0; dy < H; ++dy) {
+      const uint8_t* srow = fsrc + static_cast<size_t>(oy + dy) * fstride;
+      uint8_t* orow = out.data() + static_cast<size_t>(dy) * out_stride;
+      for (int dx = 0; dx < W; ++dx) {
+        const int sx = ox + dx;
+        if (((srow[sx >> 3] >> (7 - (sx & 7))) & 1) == 0)
+          orow[dx >> 3] &= static_cast<uint8_t>(~(0x80u >> (dx & 7)));
+      }
+    }
   }
 
-  // The panel's own frame (CoverPaths.h), four levels: the device streams it
-  // to the panel a strip at a time, no buffer and no blit.
+  // The panel's own frame (CoverPaths.h): the device reads it into the draw
+  // buffer with one fread and no blit.
   if (W != kSleepCoverW || H != kSleepCoverH)
     return false;
-  std::vector<uint8_t> frame(kSleepFrameBytes);
-  pack_sleep_frame(out.data(), frame.data());
+  std::vector<uint8_t> frame(kSleepFrameBytes, 0xFF);
+  for (int y = 0; y < H; ++y)
+    for (int x = 0; x < W; ++x)
+      if (!((out[static_cast<size_t>(y) * out_stride + (x >> 3)] >> (7 - (x & 7))) & 1)) {
+        const int bit = kSleepFrameOffX + y;
+        frame[static_cast<size_t>(kSleepFrameRows - 1 - x) * kSleepFrameStride + (bit >> 3)] &=
+            static_cast<uint8_t>(~(0x80u >> (bit & 7)));
+      }
   FILE* f = std::fopen(cover_path, "wb");
   if (!f)
     return false;
