@@ -83,6 +83,22 @@ class EInkDisplay : public wintergreen::IDisplay {
     waitWhileBusy();
   }
 
+#ifdef WG_LUT_TEST
+  // Waveform comparison screen only (lut_test_screen.h): upload `lut` in place
+  // of whatever begin_update() loaded; the next begin_update() reloads ours.
+  void upload_lut(const uint8_t (&lut)[panel_lut::kLutBytes]) {
+    wakeIfNeeded();
+    waitWhileBusy();
+    sendCommand(CMD_WRITE_LUT);
+    sendData(lut, panel_lut::kLutBytes);
+    sendCommandData(CMD_GATE_VOLTAGE, {panel_lut::kGateVoltage});
+    sendCommandData(CMD_SOURCE_VOLTAGE,
+                    {panel_lut::kSourceVoltage[0], panel_lut::kSourceVoltage[1], panel_lut::kSourceVoltage[2]});
+    sendCommandData(CMD_WRITE_VCOM, {panel_lut::kVcom});
+    loaded_ = Loaded::None;
+  }
+#endif
+
   spi_device_handle_t spi_;
 
   void begin() {
@@ -340,7 +356,7 @@ class EInkDisplay : public wintergreen::IDisplay {
       return;
     alignas(4) uint8_t lut[panel_lut::kLutBytes];
     if (want == Loaded::Full)
-      panel_lut::build_full(lut, panel_lut::timing(band_));
+      panel_lut::build_full(lut, band_);
     else
       panel_lut::build_turn(lut, panel_lut::timing(band_));
     sendCommand(CMD_WRITE_LUT);

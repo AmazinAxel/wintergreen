@@ -197,8 +197,11 @@ class DrawBuffer {
   // [keep_lo, keep_hi) are drawn. Cols needs portrait, Rows landscape.
   // (src, item, gen, base) identify the pixels: equal identity = equal pixels,
   // so bump `gen` whenever the bytes behind an item may have changed.
+  // `two_level`: gray pixels become a 1 px checkerboard of black and white
+  // (covers in menus: a turn's gray dips black before it settles, black and
+  // white don't; owner's call 2026-11-19, gray kept for the sleep cover).
   void blit(PixelSource* src, uint32_t item, uint32_t gen, uint32_t base, PixelLayout layout, int x, int y, int w,
-            int h, int keep_lo = 0, int keep_hi = 0x7FFF);
+            int h, int keep_lo = 0, int keep_hi = 0x7FFF, bool two_level = false);
 
   // -- The tail ---------------------------------------------------------------
   //

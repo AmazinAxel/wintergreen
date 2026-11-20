@@ -171,7 +171,7 @@ tools/
   make_font.py             TTF → WGF / WGFS; light hinting + stem darkening, 3 levels in two planes
   wgf_columns.py           append column-major glyph copy to WGFs (Libron.bin, ui_font_*.h); idempotent
   check_font.py            validate bundle/header, ASCII + --png simulated-panel sample
-  make_sleep_image.py      PNG → sleep frame (4 levels, blue noise)
+  make_sleep_image.py      PNG → sleep frame (4 levels, nearest, no dither)
   make_blue_noise.py       regenerates content/BlueNoise.h (numpy)
   merge-bin.sh             single flash-at-0x0 release image
   books/                   `books` (flake package): review every EPUB in ~/Downloads/books (title/author/cover sixel/chapters), bake, one tar | ssh: WGB → `/media/books/<slug>/`, reviewed EPUB (wg.ncx, dropped = class="wgdrop") → `/media/books/.epubs/<Title> by <Author>.epub`; uploaded EPUBs then deleted locally (failed ones stay). Nothing kept on PC. Own CMakeLists, explicit sources. `--usb`: also copy books to reader over USB (before ssh). `--reuse`: first fetch `.epubs` minus `.sync.json` `finished` into ~/Downloads/books to rebake. Neither by default
@@ -272,7 +272,7 @@ nix shell nixpkgs#gcc nixpkgs#cmake nixpkgs#gnumake -c tools/tests/preview.sh <o
 | `blank_para_test.cpp` | empty paragraphs |
 | `stretch_lut_test.cpp` | cover contrast-stretch tables |
 | `blit_test.cpp` | strip renderer vs per-pixel reference: fills/rects at every level, text in both inks (column copy vs rows), pixel sources in all layouts with row keeps, diamonds, both rotations, all clipping, fetch splitting |
-| `diff_test.cpp` | `refresh()` on a simulated controller (`sim_panel.h`): glass = list after every update, no pixel driven to the level it showed, unchanged screen = no update, correct if BW is copied to RED after an update; full-refresh level mapping; cursor move sends a window |
+| `diff_test.cpp` | `refresh()` on a simulated controller (`sim_panel.h`): glass = list after every update, no pixel driven to the level it showed (black excepted: re-driven), unchanged screen = no update, correct if BW is copied to RED after an update; full-refresh level mapping; cursor move sends a window |
 | `drawlist_test.cpp` | text copied at record, tail kept across fill, staged list, parked quick-menu snapshot through redraws, overflow never crashes, draw without fill continues the glass |
 | `lut_test.cpp` | `panel_lut.h`: 105-byte layout, HOLD idle, right alignment, shared gray pulse, temperature bands + hysteresis + clamp, vendor voltages |
 | `dither_test.cpp` | blue-noise quantiser: exact levels exact, mean tone kept, neighbouring levels only, 3 and 4 levels, packers |

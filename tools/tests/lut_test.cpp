@@ -1,7 +1,7 @@
 // The waveform tables epd.h uploads (platforms/esp32/panel_lut.h): 105 bytes in
-// the controller's layout, HOLD really idle, every target of a table ending on
-// the same frame (nothing settles early and then watches the rest move), the
-// gray pulse shared by both tables so boot paint and page turns show one gray,
+// the controller's layout, HOLD really idle, the turn's targets driving at once
+// as the stock X4 Pro text waveform (no reset pass before the new page), the
+// Full table = the X4 OEM factory table (band-lengthened, same shape),
 // temperature bands that only lengthen, clamp, and do not flap, and the
 // vendor's voltages untouched.
 #include <cassert>
@@ -29,12 +29,11 @@ struct Seq {
 };
 Seq run(const uint8_t* lut, int n) {
   Seq s;
-  for (int g = 0; g < 10; ++g) {
-    assert(lut[kTpOffset + g * 5 + 4] == 0);  // no repeats
-    for (int ph = 0; ph < 4; ++ph)
-      for (int f = 0; f < tp(lut, g, ph); ++f)
-        s.code[s.len++] = vs(lut, n, g, ph);
-  }
+  for (int g = 0; g < 10; ++g)
+    for (int rep = 0; rep <= lut[kTpOffset + g * 5 + 4]; ++rep)  // RP: run RP + 1 times
+      for (int ph = 0; ph < 4; ++ph)
+        for (int f = 0; f < tp(lut, g, ph); ++f)
+          s.code[s.len++] = vs(lut, n, g, ph);
   return s;
 }
 
@@ -62,47 +61,61 @@ int main() {
 
   for (Band b : {Band::Warm, Band::Cool, Band::Cold}) {
     const Timing t = timing(b);
-    assert(t.d >= t.p && t.p >= t.pl && t.pl >= 1 && t.c >= 1 && t.d <= 255 && t.c <= 255);
     uint8_t turn[kLutBytes], full[kLutBytes];
     build_turn(turn, t);
-    build_full(full, t);
+    build_full(full, b);
     for (int i = 0; i < 10; ++i) {
       assert(turn[kVsOffset + 40 + i] == 0);  // VCOM LUT4 idle
       assert(full[kVsOffset + 40 + i] == 0);
     }
     for (int i = 0; i < 5; ++i)
-      assert(turn[kFrOffset + i] == kFrameRate && full[kFrOffset + i] == kFrameRate);
+      assert(turn[kFrOffset + i] == kFrameRate && full[kFrOffset + i] == 0x22);
 
-    // Turn: LUT0 HOLD never drives; the three targets all end on the last frame.
+    // Turn: LUT0 HOLD never drives; the targets are the stock text waveform's
+    // rows, frame for frame, all driving from the start (no reset pass).
     const Seq hold = run(turn, 0), w = run(turn, 1), g = run(turn, 2), k = run(turn, 3);
     assert(count(hold, kVsBlack) == 0 && count(hold, kVsWhite) == 0);
-    assert(idle_tail(w) == 0 && idle_tail(g) == 0 && idle_tail(k) == 0);
-    assert(w.len == g.len && g.len == k.len && w.len == t.d);
-    assert(count(w, kVsWhite) == t.d && count(k, kVsBlack) == t.d);
-    // to-gray: saturate white, then exactly P frames of black at the end.
-    assert(count(g, kVsBlack) == t.p && count(g, kVsBlack, g.len - t.p) == t.p);
-    assert(count(g, kVsWhite) == t.d - t.p);
-
-    // Full: clear is balanced and identical for every level; the set phase is
-    // right-aligned: black D, gray P, light PL, white nothing.
-    const Seq f[4] = {run(full, 0), run(full, 1), run(full, 2), run(full, 3)};
-    for (int n = 0; n < 4; ++n) {
-      assert(f[n].len == 2 * t.c + t.d);
-      assert(count(f[n], kVsWhite) == t.c);
-      for (int i = 0; i < t.c; ++i)
-        assert(f[n].code[i] == kVsBlack && f[n].code[t.c + i] == kVsWhite);
+    assert(w.len == t.turn_len() && g.len == w.len && k.len == w.len);
+    for (int i = 0; i < w.len; ++i) {
+      const bool wi = i >= t.white_start && i < t.white_start + t.white;
+      assert(w.code[i] == (wi ? kVsWhite : kVsHold));
+      assert(k.code[i] == (i < t.black ? kVsBlack : kVsHold));
+      // Gray = to-black's drive (erases what was there), then pulled back.
+      assert(g.code[i] == (i < t.black ? kVsBlack : i < t.black + t.gray_back ? kVsWhite : kVsHold));
     }
-    const int set = 2 * t.c;
-    assert(count(f[0], kVsBlack, set) == 0);
-    assert(count(f[1], kVsBlack, set) == t.pl && idle_tail(f[1]) == 0);
-    assert(count(f[2], kVsBlack, set) == t.p && idle_tail(f[2]) == 0);
-    assert(count(f[3], kVsBlack, set) == t.d && idle_tail(f[3]) == 0);
-    // Same gray: P black frames from white in both tables.
-    assert(count(f[2], kVsBlack, set) == count(g, kVsBlack));
+
+    // Full: the OEM table's VS rows untouched; white ends on white, black on
+    // black; the band only lengthens phases (warm = verbatim, 50 frames).
+    const Seq f[4] = {run(full, 0), run(full, 1), run(full, 2), run(full, 3)};
+    for (int i = 0; i < 50; ++i)
+      assert(full[i] == kFactoryFull[i]);
+    auto last_drive = [](const Seq& s) {
+      for (int i = s.len - 1; i >= 0; --i)
+        if (s.code[i] != kVsHold)
+          return s.code[i];
+      return static_cast<int>(kVsHold);
+    };
+    assert(last_drive(f[0]) == kVsWhite && last_drive(f[3]) == kVsBlack);
+    assert(f[0].len == f[3].len);
+    if (b == Band::Warm) {
+      assert(f[0].len == 50);
+      for (size_t i = 0; i < kLutBytes; ++i)
+        assert(full[i] == kFactoryFull[i]);
+    }
   }
 
+  // The waveform picked on hardware: 25 frames at FR 0x33, gray 4 back.
+  assert(timing(Band::Warm).turn_len() == 25 && kFrameRate == 0x33 && kGrayBack == 4);
+
   // Bands only lengthen, and clamp to a byte.
-  assert(timing(Band::Cool).d > timing(Band::Warm).d && timing(Band::Cold).d > timing(Band::Cool).d);
+  assert(timing(Band::Cool).turn_len() > timing(Band::Warm).turn_len() &&
+         timing(Band::Cold).turn_len() > timing(Band::Cool).turn_len());
+  {
+    uint8_t w[kLutBytes], c[kLutBytes];
+    build_full(w, Band::Warm);
+    build_full(c, Band::Cold);
+    assert(run(c, 3).len > run(w, 3).len);
+  }
   assert(scaled_(250, Band::Cold) == 255);
 
   // Hysteresis: hovering at a boundary does not flip.

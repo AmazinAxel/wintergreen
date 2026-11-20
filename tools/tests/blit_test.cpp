@@ -164,8 +164,9 @@ int main() {
             klo = 0;
             khi = h;
           }
+          const bool two = std::rand() % 3 == 0;
           buf.blit(&src, static_cast<uint32_t>(src.items.size() - 1), 0, 7,
-                   cols ? PixelLayout::Cols : PixelLayout::Rows, x, y, w, h, klo, khi);
+                   cols ? PixelLayout::Cols : PixelLayout::Rows, x, y, w, h, klo, khi, two);
           for (int r = klo; r < khi; ++r)
             for (int c = 0; c < w; ++c) {
               uint8_t* d = ref.at(x + c, y + r);
@@ -175,6 +176,11 @@ int main() {
               const int i = cols ? r : c;
               const int hb = (u[i / 8] >> (7 - (i & 7))) & 1, lb = (u[ub + i / 8] >> (7 - (i & 7))) & 1;
               *d = static_cast<uint8_t>((hb << 1) | lb);
+              if (two && *d == 2) {
+                // Two levels: gray = a checkerboard on the physical grid.
+                const size_t at = static_cast<size_t>(d - ref.px.data());
+                *d = ((at / kBits + at % kBits) & 1) ? 3 : 0;
+              }
             }
           break;
         }

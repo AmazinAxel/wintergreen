@@ -84,7 +84,7 @@ the list holds. `paginate_book_test` and the preview print the real sizes (large
 
 `tools/tests/diff_test.cpp` runs random evolving screens through a simulated controller
 (`sim_panel.h`) and checks after every update that the glass equals the list, that no pixel
-was driven to the level it already showed, and that both hold if the controller copies BW
+was driven to the level it already showed (except black, re-driven on purpose), and that both hold if the controller copies BW
 into RED after an update (unknown for a custom LUT).
 
 ## Refresh latency
@@ -248,37 +248,73 @@ controller init (`loaded_ = None`). CTRL1 0x00 (RED used), CTRL2 0x0C (+0xC0 pow
 
 | Table | Slots | Shape |
 |---|---|---|
-| Turn | HOLD / to-white / to-gray / to-black | one group: D−P frames then P frames. White: white, white. Gray: white, black. Black: black, black. All end on the same frame. |
-| Full | white / light / gray / black | group 0 clears (black C, white C); group 1 sets right-aligned: black D, gray P, light PL |
+| Turn | HOLD / to-white / to-gray / to-black | all at once: to-black VSH1 17 (frames 0–17), to-white VSL 24 (1–25), to-gray VSH1 17 then VSL 4 (0–21); FR 0x33, 25 frames |
+| Full | white / light / gray / black | the X4 OEM factory 4-gray table verbatim (`kFactoryFull`, 50 frames, FR 0x22), phases lengthened in cold bands |
 
-- **Voltages are the vendor's** (gate 0x17, source 0x41 0xA8 0x32, VCOM 0x30: Good
-  Display's 4-gray table, identical in Adafruit's hardware-verified ThinkInk 4.26"
-  grayscale driver). They are the electrical safety envelope; only timings are tuned.
-- **Polarity in one place**: `kVsBlack = 01` (VSH1), `kVsWhite = 10` (VSL), inferred from
-  the vendor table (its black state ends on VSH1). An inverted panel = swap those two.
-- **Right-aligned**: every level finishes on the last frame. The old vendor 4-gray
+- **Voltages are the vendor's** (gate 0x17, source 0x41 0xA8 0x32: Good Display's 4-gray
+  table, identical in Adafruit's hardware-verified ThinkInk 4.26" grayscale driver). They
+  are the electrical safety envelope; only timings are tuned.
+- **VCOM 0x30** (X4 OEM). 0x14, the X4 Pro firmware's pairing for the stock text
+  waveform, was tried 2026-11-19: no visible difference to ghosting or dark covers.
+- **Full = X4 OEM factory table** (2026-11-19). Our own full table (clear, then 4 / 2
+  frames of black from white for gray / light) turned light covers near-black: the OEM
+  grays drive toward black and pull back with 2–4 white frames, so short black pulses
+  from white land far darker than the 0.5 / 0.75 covers are dithered for. Turn gray and
+  full gray are no longer one recipe.
+- **Comparison screen** (`platforms/esp32/lut_test_screen.h`, off; `#define WG_LUT_TEST`
+  at the top of `main.cpp` boots into it): five candidate turn LUTs side by side, 11
+  toggles each over text, black→gray (beside a 1 px checkerboard = 50%), text→gray and
+  gray→white zones, then deep sleep. One flash compares five waveforms; use it instead
+  of a guess per flash.
+- **Slot order** = RED << 1 | BW (SSD1677 datasheet Table 6-5; FreeInk's "RED × 2 + BW").
+- **Polarity in one place**: `kVsBlack = 01` (VSH1), `kVsWhite = 10` (VSL); the stock text
+  waveform's black row is VSH1. An inverted panel = swap those two.
+- **Turn black and white are the stock firmware's** (`kX4ProTextSsd1677`, firmware
+  26110201, from Free-Ink/freeink-sdk PR #185, ~600 ms measured on an X4). Its rows:
+  black, to-white, gray, white-rest (VSL 2 nudge); ours put HOLD where the nudge was.
+- **Turn gray = to-black's drive, then 4 white frames back** (comparison screen,
+  2026-11-19). The stock gray (VSL 6, VSH1 4) let old text show through new gray, and was
+  darker than 50%. Driving to black first erases the old level; of 1–4 frames back, 4
+  matched the checkerboard. Covers and images in normal updates use this gray.
+- **No reset pass** (removed 2026-11-19): a 15-frame white reset with to-black waiting
+  read as "one pass to undo, another to do", slow (35 frames at FR 0x22).
+- **Black re-driven** inside the damage (`DrawBuffer::refresh` slot loop), as the stock
+  waveform does: FreeInk measured held black fading within minutes (27.9 vs 13.1
+  re-driven), so a glyph half held, half re-driven reads uneven weight.
+- **Rejected on hardware (2026-11-19)**: gray erased 24 frames with every slot ending on
+  frame 28, plus gray re-driven in the damage (slower to appear, gray AA flashed on every
+  update, ghosting no better); the OEM full recipes per slot (50 frames) and a
+  black-then-white flash for every driven pixel (58): both too slow to read with.
+- **Gray partial updates are not a vendor feature**: Good Display and Waveshare only
+  offer B/W partial; e-reader controllers clear gray ghosting with GC16 (every pixel in the
+  region driven black and white before the target).
+- **Menu covers are two-level** (owner's call, 2026-11-19): home carousel and book-list
+  thumbnails blit with `two_level`, gray → 1 px black/white checkerboard, so scrolling has
+  no gray dipping black before it settles. Reader images, text AA, frames and the sleep
+  cover keep gray.
+- **Open (2026-11-19)**: real-use check of the picked turn LUT (ghosting over a reading
+  session) and of the OEM full table on sleep covers (were near-black).
+- **Full right-aligned**: every level finishes on the last frame. The old vendor 4-gray
   one-pass LUT staggered its phases and read as "wordmark first, then the screen flashes".
-- **Same gray in both**: "P frames of black from white" in each table, one constant.
 - **Not DC-balanced on turns** (neither was the OTP fast waveform); the owner chose no
   visible motion over in-update counter-pulses. Sleep and boot full refreshes clear.
 - **Temperature bands**: the C3's on-chip sensor (`temperature_sensor`, enabled only
   around the reading in `begin_update`): ≥ 20 °C ×1, 10–20 °C ×1.25, < 10 °C ×1.5 on
-  D, P, PL, C; ±2 °C hysteresis. Custom LUTs lose the controller's OTP temperature
+  every frame count; ±2 °C hysteresis. Custom LUTs lose the controller's OTP temperature
   compensation; this replaces it. Chip temperature reads a few degrees above ambient.
-- `tools/tests/lut_test.cpp` checks layout, HOLD idle, right alignment, shared P, bands,
-  clamping and the voltages.
+- `tools/tests/lut_test.cpp` checks layout, HOLD idle, the turn rows frame for frame,
+  Full right alignment, shared gray, bands, clamping and the voltages.
 
 ### Waveform tuning (device day)
 
-Starting values are derived from the vendor table (FR 0x22, D = 20, P = 5, PL = 2, C = 20)
-and are unverified. Constants in `panel_lut.h`; gray/light reflectance targets in
+Turn timings are the stock waveform's; PL = 2 and C = 24 are ours, unverified. Constants in `panel_lut.h`; gray/light reflectance targets in
 `ImageDecoder.h` (`kGrayLevel` 0.5, `kLightLevel` 0.75) and `tools/make_sleep_image.py`.
 
 1. Panel shows anything? Inverted → swap `kVsBlack` / `kVsWhite`. Nothing at all → suspect
    the custom-LUT path first (CTRL2 value, upload after `waitWhileBusy()`).
-2. Blacks solid, whites clean on a page turn? Adjust `kSaturate` (D).
-3. Gray pleasant, and identical between the boot paint and after a turn? Adjust `kGray`
-   (P), and `kLight` (PL) for the sleep cover's light level. Then set `kGrayLevel` /
+2. Blacks solid, whites clean on a page turn? Adjust `kToBlack` / `kToWhite`.
+3. Gray pleasant, and identical between the boot paint and after a turn? Adjust
+   `kGrayBlack`, and `kLight` (PL) for the sleep cover's light level. Then set `kGrayLevel` /
    `kLightLevel` to what the levels actually reflect, regenerate the wordmark and rebake
    (covers and images are dithered against them).
 4. Turn duration: temporary timing around `refresh()` and BUSY, then remove.

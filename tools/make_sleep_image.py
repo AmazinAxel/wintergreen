@@ -11,9 +11,10 @@ book's cover_sleep.bin (CoverPaths.h), so one streamer shows both:
     bit y. Bits 0..6 (portrait rows 0..6) are behind the bezel.
 
 A full refresh shows all four levels, so the source's antialiased edges come
-out as light and gray; flat black and white stay exact. Quantised with the
-converter's blue-noise map (wintergreen/content/BlueNoise.h, parsed here) at
-the converter's gray and light reflectances.
+out as light and gray; flat black and white stay exact. Each pixel takes the
+nearest level at the converter's gray and light reflectances. No dither: the
+wordmark is line art, and blue noise scattered gray specks through the
+near-black strokes and along every edge.
 
 The source is drawn full screen as is: an RGBA image composited over white and
 scaled to 480 x 800 (the default source, resources/wintergreen-source.png, is
@@ -26,8 +27,6 @@ scaled to 480 x 800 (the default source, resources/wintergreen-source.png, is
 """
 
 import argparse
-import os
-import re
 
 from PIL import Image
 
@@ -39,15 +38,6 @@ STRIDE = 100    # bytes per plane row
 # converter (ImageDecoder.h kGrayLevel / kLightLevel).
 LEVEL_LUM = {0: 1.0, 1: 0.75, 2: 0.5, 3: 0.0}
 PREVIEW = {0: 226, 1: 178, 2: 128, 3: 34}
-
-
-def blue_noise():
-    path = os.path.join(os.path.dirname(__file__), "..", "wintergreen", "content", "BlueNoise.h")
-    text = open(path).read()
-    body = text[text.index("kBlueNoise[64 * 64] = {") :]
-    vals = [int(v) for v in re.findall(r"\d+", body[body.index("{") : body.index("}")])]
-    assert len(vals) == 64 * 64
-    return vals
 
 
 def quantise(g, t):
@@ -74,13 +64,10 @@ def main():
     im = Image.alpha_composite(bg, im).convert("L")
     im = im.resize((PANEL_W, PANEL_H), Image.LANCZOS)
     px = im.load()
-    noise = blue_noise()
-
     levels = [[0] * PANEL_H for _ in range(PANEL_W)]
     for x in range(PANEL_W):
         for y in range(PANEL_H):
-            t = (noise[(y % 64) * 64 + (x % 64)] + 0.5) / 256.0
-            levels[x][y] = quantise(px[x, y], t)
+            levels[x][y] = quantise(px[x, y], 0.5)
 
     out = bytearray(ROWS * 2 * STRIDE)
     for x in range(PANEL_W):

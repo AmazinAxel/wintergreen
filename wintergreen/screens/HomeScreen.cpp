@@ -359,7 +359,7 @@ void HomeScreen::draw_all_(DrawBuffer& buf, std::optional<uint8_t> battery_pct) 
     const int cy = box_y + (box_h - cover_h_) / 2;
     // Identity = the book: the same cover on the glass is never read again.
     buf.blit(const_cast<HomeScreen*>(this), static_cast<uint32_t>(sel), book_path_key(slots_[sel].path), 4,
-             PixelLayout::Cols, cx, cy, cover_w_, cover_h_);
+             PixelLayout::Cols, cx, cy, cover_w_, cover_h_, 0, 0x7FFF, /*two_level=*/true);
     buf.draw_outline(cx - inset, cy - inset, cover_w_ + 2 * inset, cover_h_ + 2 * inset, kFrameW, Level::Gray);
   } else {
     // No cover on the card — a placeholder box keeps the layout intact.

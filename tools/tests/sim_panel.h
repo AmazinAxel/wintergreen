@@ -35,7 +35,8 @@ struct SimPanel : IDisplay {
   // Counters.
   int fires = 0, full_fires = 0, updates = 0;
   size_t bytes = 0;
-  // Pixels the last Turn drove although the glass already showed the target.
+  // Pixels the last Turn drove although the glass already showed the target
+  // (black excepted: DrawBuffer re-drives it).
   long needless = 0;
   // Pixels the last Turn drove at all.
   long driven = 0;
@@ -83,7 +84,7 @@ struct SimPanel : IDisplay {
           continue;
         const uint8_t target = s == 1 ? 0 : s == 2 ? 2 : 3;
         ++driven;
-        if (g == target)
+        if (g == target && target != 3)  // black is re-driven on purpose
           ++needless;
         g = target;
       }

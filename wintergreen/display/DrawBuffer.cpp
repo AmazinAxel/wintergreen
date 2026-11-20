@@ -29,7 +29,7 @@ enum OpKind : uint8_t { kFill, kRect, kText, kLine, kBlit, kDiamond };
 
 struct OpHdr {
   uint8_t kind;
-  uint8_t mode;   // Level (Fill, Rect), Ink (Text), PixelLayout (Blit)
+  uint8_t mode;   // Level (Fill, Rect), Ink (Text), PixelLayout | kTwoLevel (Blit)
   uint16_t size;  // record bytes
   int16_t r0, r1, b0, b1;
   uint32_t hash;
@@ -38,6 +38,7 @@ struct OpHdr {
   uint8_t matched;   // refresh only
 };
 static_assert(sizeof(OpHdr) == 20, "OpHdr layout");
+constexpr uint8_t kTwoLevel = 0x80;  // Blit mode bit; the low bits are the PixelLayout
 constexpr uint16_t kNoPartner = 0xFFFF;
 
 struct TextP {
@@ -215,6 +216,25 @@ inline void put2_(const Clip& c, int R, const uint8_t* s_hi, const uint8_t* s_lo
     return;
   put_row_<OpHi>(c.hi_row(R), s_hi, lo, hi, n, bit0);
   put_row_<OpLo>(c.lo_row(R), s_lo, lo, hi, n, bit0);
+}
+
+// Gray pixels of physical row R, bits [x1, x2) (clipped like put2_), become a
+// 1 px checkerboard of black and white: two levels, the same mean tone.
+inline void two_level_(const Clip& c, int R, int x1, int x2) {
+  x1 = std::max(x1, std::max(c.w0, kOffX));
+  x2 = std::min(x2, c.w1);
+  if (x1 >= x2)
+    return;
+  uint8_t* h = c.hi_row(R);
+  uint8_t* l = c.lo_row(R);
+  const auto pat = static_cast<uint8_t>((R & 1) ? 0xAA : 0x55);
+  for (int j = x1 >> 3; j <= (x2 - 1) >> 3; ++j) {
+    const int a = std::max(x1, 8 * j) - 8 * j, b = std::min(x2, 8 * j + 8) - 8 * j;
+    const auto m = static_cast<uint8_t>((0xFFu >> a) & (0xFFu << (8 - b)));
+    const auto g = static_cast<uint8_t>(h[j] & ~l[j] & m);
+    l[j] = static_cast<uint8_t>(l[j] | (g & pat));
+    h[j] = static_cast<uint8_t>((h[j] & ~g) | (g & pat));
+  }
 }
 
 // Black ink adds (OR both planes); white ink takes away: the glyph's black core
@@ -607,7 +627,7 @@ void DrawBuffer::draw_baked_line(const WgbLine& line, const uint8_t* end, const 
 }
 
 void DrawBuffer::blit(PixelSource* src, uint32_t item, uint32_t gen, uint32_t base, PixelLayout layout, int x, int y,
-                      int w, int h, int keep_lo, int keep_hi) {
+                      int w, int h, int keep_lo, int keep_hi, bool two_level) {
   if (!src || w <= 0 || h <= 0)
     return;
   keep_lo = std::max(keep_lo, 0);
@@ -644,7 +664,8 @@ void DrawBuffer::blit(PixelSource* src, uint32_t item, uint32_t gen, uint32_t ba
                  static_cast<int16_t>(keep_lo),
                  static_cast<int16_t>(keep_hi)};
   std::memcpy(rec + sizeof(OpHdr), &bp, sizeof(bp));
-  finish_hdr_(rec, kBlit, static_cast<uint8_t>(layout), r0, r1, b0, b1, fnv(2166136261u, &bp, sizeof(bp)));
+  const auto mode = static_cast<uint8_t>(static_cast<uint8_t>(layout) | (two_level ? kTwoLevel : 0));
+  finish_hdr_(rec, kBlit, mode, r0, r1, b0, b1, fnv(2166136261u, &bp, sizeof(bp)));
 }
 
 // ---------------------------------------------------------------------------
@@ -930,7 +951,7 @@ bool DrawBuffer::fetch_chunk_(int ra, int rb, Fetch* fetches, int& nf) {
     if (!hit)
       continue;
     const BlitP bp = load<BlitP>(reinterpret_cast<const uint8_t*>(h) + sizeof(OpHdr));
-    const auto layout = static_cast<PixelLayout>(h->mode);
+    const auto layout = static_cast<PixelLayout>(h->mode & ~kTwoLevel);
     int first = 0, count = 0;
     size_t unit = 0;
     if (layout == PixelLayout::Cols) {
@@ -1060,15 +1081,18 @@ void DrawBuffer::render_(const Arena& a, bool old, int ra, int rb, int xa, int x
         if (!fe)
           break;
         const BlitP bp = load<BlitP>(pl);
-        const auto layout = static_cast<PixelLayout>(h->mode);
+        const auto layout = static_cast<PixelLayout>(h->mode & ~kTwoLevel);
+        const bool two = (h->mode & kTwoLevel) != 0;
         if (layout == PixelLayout::Cols) {
           const size_t cb = static_cast<size_t>((bp.h + 7) / 8);
           const int c_lo = std::max(0, kPhysH - bp.x - rb);
           const int c_hi = std::min<int>(bp.w, kPhysH - bp.x - ra);
           for (int col = c_lo; col < c_hi; ++col) {
             const uint8_t* s = fe->data + (col - fe->first) * 2 * cb;
-            put2_<BlitOp::Copy, BlitOp::Copy>(c, kPhysH - 1 - bp.x - col, s, s + cb, bp.keep_lo, bp.keep_hi, bp.h,
-                                              bp.y + kOffX);
+            const int R = kPhysH - 1 - bp.x - col;
+            put2_<BlitOp::Copy, BlitOp::Copy>(c, R, s, s + cb, bp.keep_lo, bp.keep_hi, bp.h, bp.y + kOffX);
+            if (two)
+              two_level_(c, R, bp.y + kOffX + bp.keep_lo, bp.y + kOffX + bp.keep_hi);
           }
         } else if (layout == PixelLayout::Rows) {
           const size_t rbytes = static_cast<size_t>((bp.w + 7) / 8);
@@ -1077,6 +1101,8 @@ void DrawBuffer::render_(const Arena& a, bool old, int ra, int rb, int xa, int x
           for (int r = r_lo; r < r_hi; ++r) {
             const uint8_t* s = fe->data + (r - fe->first) * 2 * rbytes;
             put2_<BlitOp::Copy, BlitOp::Copy>(c, bp.y + r, s, s + rbytes, 0, bp.w, bp.w, bp.x + kOffX);
+            if (two)
+              two_level_(c, bp.y + r, bp.x + kOffX, bp.x + kOffX + bp.w);
           }
         } else {
           for (int r = ra; r < rb; ++r) {
@@ -1227,6 +1253,9 @@ void DrawBuffer::run_(UpdateKind kind, bool turn_off) {
         // Slots, in place over the new planes: hi <- BW, lo <- RED.
         //   HOLD 00 where old == new; else to-white 01, to-gray 10, to-black 11
         //   (RED << 1 | BW), i.e. RED = changed & new_hi, BW = changed & (~new_hi | new_lo).
+        //   Black that stays black inside the damage counts as changed: it is
+        //   re-driven, as the stock X4 Pro waveform does (held black fades within
+        //   minutes, so a glyph half re-driven reads uneven; panel_lut.h).
         for (int r = 0; r < n; ++r) {
           const int R = ra + r;
           uint8_t* ph = nh + (off + r) * kStride;
@@ -1252,7 +1281,7 @@ void DrawBuffer::run_(UpdateKind kind, bool turn_off) {
           }
           for (int x = xa; x < xb; ++x) {
             const uint8_t h = ph[x], l = pl[x];
-            uint8_t ch = static_cast<uint8_t>((h ^ qh[x]) | (l ^ ql[x]));
+            uint8_t ch = static_cast<uint8_t>((h ^ qh[x]) | (l ^ ql[x]) | (l & ql[x]));
             if (x >= ulo && x < uhi)
               ch = 0xFF;
             pl[x] = static_cast<uint8_t>(ch & h);

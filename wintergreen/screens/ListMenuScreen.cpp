@@ -228,7 +228,7 @@ void ListMenuScreen::draw_list_(DrawBuffer& buf, int W, int H, int header_h) con
       if (get_item_thumb(i, t) && t.src && t.w > 0 && t.h > 0) {
         const int tx = bx + (thumb_w - t.w) / 2;
         const int ty = by + (thumb_box_h - t.h) / 2;
-        buf.blit(t.src, t.item, t.gen, t.base, PixelLayout::Cols, tx, ty, t.w, t.h);
+        buf.blit(t.src, t.item, t.gen, t.base, PixelLayout::Cols, tx, ty, t.w, t.h, 0, 0x7FFF, /*two_level=*/true);
       } else {
         buf.draw_outline(bx, by, thumb_w, thumb_box_h, 1, Level::Gray);
       }

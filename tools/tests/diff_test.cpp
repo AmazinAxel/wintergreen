@@ -5,6 +5,7 @@
 //   * the glass shows exactly what the current list renders to;
 //   * no pixel was driven to the level it already showed (a gray-to-gray drive
 //     flashes), unless an image was removed (its old pixels are unknown);
+//     black is the exception, re-driven inside the damage on purpose;
 //   * an unchanged screen costs no update at all;
 //   * all of it still holds when the controller copies BW into RED after an
 //     update (unknown for a custom LUT), because RAM a previous update left

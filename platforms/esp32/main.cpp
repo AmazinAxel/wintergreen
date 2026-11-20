@@ -1,7 +1,13 @@
 #include <cstdio>
 
+// Define WG_LUT_TEST to boot into the waveform comparison screen
+// (lut_test_screen.h) instead of the app.
+
 #include "driver/gpio.h"
 #include "epd.h"
+#ifdef WG_LUT_TEST
+#include "lut_test_screen.h"
+#endif
 #include "esp_sleep.h"
 #include "esp_system.h"
 #include "esp_timer.h"
@@ -154,8 +160,9 @@ extern "C" void app_main(void) {
   // The wordmark is a raw partition written by esptool, a whole 4-level panel
   // frame: an mmap and nothing else — no copy, no SD access on the sleep path.
   static RawPartition sleep_part;
-  if (sleep_part.map("sleep"))
-    buf.set_sleep_image(sleep_part.data, sleep_part.size);
+  // The mapping is the whole 128 KB partition; the frame is its first 96,000 B.
+  if (sleep_part.map("sleep") && sleep_part.size >= wintergreen::DisplayFrame::kFrameBytes)
+    buf.set_sleep_image(sleep_part.data, wintergreen::DisplayFrame::kFrameBytes);
 
   epd.begin();
 
@@ -165,6 +172,12 @@ extern "C" void app_main(void) {
   // The panel is settling from its reset pulse meanwhile; see EInkDisplay::begin.
   const bool sd_ok = sd_init();
   epd.finish_begin();
+#ifdef WG_LUT_TEST
+  wg_lut_test::run(epd);
+  buf.deep_sleep();
+  wait_power_release_();
+  deep_sleep_now_();
+#endif
   if (!sd_ok) {
     buf.show_sleep_image();
     buf.deep_sleep();
