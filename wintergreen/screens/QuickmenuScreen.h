@@ -168,6 +168,7 @@ class QuickmenuScreen final : public ListMenuScreen {
   int idx_font_size_ = -1;
   int idx_reader_rotate_display_ = -1;
   int idx_clicker_ = -1;
+  int idx_long_sleep_ = -1;
   int first_chapter_ = -1;
   // List index of the chapter holding the reading position, or -1. Derived in
   // on_start() from current_chapter_offset_, which populate() sets: the last

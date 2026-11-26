@@ -11,7 +11,7 @@ class FontManager {
     if (num_fonts_ >= kMaxFontSizes)
       return;
     int idx = num_fonts_++;
-    prop_fonts_[idx].init(data, sz);
+    prop_fonts_[idx].init(data, sz, /*planes=*/2);  // the reader bundle is two-plane
     font_set_.add(&prop_fonts_[idx]);
   }
 

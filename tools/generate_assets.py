@@ -27,8 +27,8 @@ BUILD_DIR = env.subst("$BUILD_DIR")
 
 # Must match platforms/esp32/default_16MB.csv.
 PARTITIONS = {
-    "font": (0xC90000, 0x100000),
-    "sleep": (0xD90000, 0x020000),
+    "font": (0xC90000, 0x200000),
+    "sleep": (0xE90000, 0x020000),
 }
 
 

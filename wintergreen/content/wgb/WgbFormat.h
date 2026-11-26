@@ -101,17 +101,31 @@ static constexpr size_t kWgbPageSize = 14;
 //   u16 item_count, then items, each starting with a u8 tag. Coordinates are
 //   logical page pixels in the layout's rotation, padding included.
 //
-//   kWgbItemLine   u16 baseline_y, u8 word_count, then per word:
+//   kWgbItemLine   u16 baseline_y, u8 ink_up, u8 ink_down, u8 word_count:
+//                  the line's ink rows are [baseline_y - ink_up,
+//                  baseline_y + ink_down) (every word, sub/superscript
+//                  shifts included; 0/0 = no ink), so a strip renderer skips
+//                  lines outside its rows without touching a glyph. Then per
+//                  word:
 //                    u8 dx: x minus the previous word's x (0 before the
 //                      line's first word); kWgbAbsX: u16 absolute x follows
 //                    u8 len in bits 0-6 (kWgbLongWord: u16 len follows),
 //                      bit 7 (kWgbFlagsFollow): u8 flags follows
-//                    [u16 len], [u8 flags], len bytes of glyph indices
-//                      into the word's font and style (wgb_read_glyph:
-//                      < 0x80 one byte, else two big-endian with the top
-//                      bit set; kWgbNoGlyph = no glyph, default advance).
+//                    [u16 len], [u8 flags]
+//                    i8 ink_l, u16 ink_r: the word's ink columns are
+//                      [x + ink_l, x + ink_r) (ink_r 0 = none; both may be
+//                      conservative, never too narrow)
+//                    len bytes: the first glyph's index, then per further
+//                      glyph an i8 pen step (pixels from the previous
+//                      glyph's pen) and its index. The pen is where the 1-bit
+//                      draw put it: quarter-pixel cursor, class kerning,
+//                      snapped per glyph; the glyph's bitmap is drawn at
+//                      pen + x_offset. Indices into the word's font and style
+//                      (wgb_read_glyph: < 0x80 one byte, else two big-endian
+//                      with the top bit set; kWgbNoGlyph = no glyph).
 //                      Resolved at bake time, U+FFFD fallback included, so
-//                      the device never decodes UTF-8 or searches ranges.
+//                      the device never decodes UTF-8, searches ranges or
+//                      kerns.
 //                  A word without a flags byte keeps the previous word's
 //                  flags, across lines; a page starts at flags 0.
 //                  flags: bits 0-1 FontStyle, bits 2-4 font index in the
@@ -146,8 +160,9 @@ static constexpr size_t kWgbRuleItemSize = 1 + 8;
 static constexpr size_t kWgbImageItemSize = 1 + 14;
 
 // Largest display list the bake accepts, and the size of the device's one
-// page buffer. paginate_book_test prints the maximum: 879 B over two novels
-// (2026-11-11), so this is ~4x headroom for dense pages.
+// page buffer (and GrayPage's kept copy). paginate_book_test prints the
+// maximum: 879 B over two novels (2026-11-11), before pen steps and ink boxes
+// roughly doubled a list (2026-11-25, not re-measured): ~2x headroom left.
 static constexpr size_t kWgbMaxPageBytes = 4 * 1024;
 
 // Where one reviewed chapter begins, as the converter hands it to the
@@ -189,14 +204,15 @@ static constexpr uint16_t kWgbImageBoxH = 772;
 // from the firmware entirely, made an image page turn as fast as a text one, and
 // stopped the reader writing image caches to the card.
 //
-// Followed directly by a portrait copy in 8-row bands (wgb_image_bands_bytes):
-// band b is `width` bytes, byte c = column c's pixels in rows 8b..8b+7, top
-// MSB (padding rows white). In portrait a column is a panel row, so each band
-// is a byte copy per column instead of a bit transpose, and a page's slice of
-// the image is still one contiguous read. Landscape reads the rows.
+// Followed directly by a column-major portrait copy (wgb_image_cols_bytes):
+// column c is ceil(height/8) bytes of its pixels top to bottom, MSB first,
+// same polarity (padding bits white). The device renders pages a strip of 16
+// physical rows at a time (GrayPage): in landscape a strip is image rows, in
+// portrait image columns, so either way a strip's part of an image is one
+// contiguous read and a shifted byte copy.
 struct WgbImageRef {
   uint32_t data_offset;  // offset of the bitmap within this WGB
-  uint32_t data_size;    // (width+7)/8 * height + wgb_image_bands_bytes
+  uint32_t data_size;    // wgb_image_rows_bytes + wgb_image_cols_bytes
   uint16_t width;
   uint16_t height;
 };
@@ -205,7 +221,7 @@ static_assert(sizeof(WgbImageRef) == 12, "WgbImageRef must be 12 bytes");
 inline uint32_t wgb_image_rows_bytes(uint32_t w, uint32_t h) {
   return (w + 7) / 8 * h;
 }
-inline uint32_t wgb_image_bands_bytes(uint32_t w, uint32_t h) {
+inline uint32_t wgb_image_cols_bytes(uint32_t w, uint32_t h) {
   return (h + 7) / 8 * w;
 }
 

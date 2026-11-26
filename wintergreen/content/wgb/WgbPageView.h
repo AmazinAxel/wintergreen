@@ -17,12 +17,16 @@ struct WgbWord {
   uint8_t style;   // FontStyle
   uint8_t font;    // index into the font bundle
   uint8_t valign;  // VerticalAlign
-  const uint8_t* glyphs;  // glyph indices, wgb_read_glyph encoding
+  int8_t ink_l;    // ink columns [x + ink_l, x + ink_r); ink_r 0 = none
+  uint16_t ink_r;
+  const uint8_t* glyphs;  // first index, then (i8 pen step, index) per glyph
   uint16_t len;           // bytes at glyphs
 };
 
 struct WgbLine {
   uint16_t baseline_y = 0;
+  uint8_t ink_up = 0;    // ink rows [baseline_y - ink_up, baseline_y + ink_down)
+  uint8_t ink_down = 0;
   uint8_t word_count = 0;
   uint8_t flags = 0;               // word flags in force at the first word
   const uint8_t* words = nullptr;  // first word header
@@ -67,6 +71,11 @@ class WgbWordIter {
         return false;
       flags_ = *p_++;
     }
+    if (end_ - p_ < 3)
+      return false;
+    w.ink_l = static_cast<int8_t>(p_[0]);
+    w.ink_r = wgb_read_u16(p_ + 1);
+    p_ += 3;
     w.x = x_;
     w.style = flags_ & 0x03;
     w.font = (flags_ >> 2) & 0x07;
@@ -127,12 +136,14 @@ class WgbPageView {
   }
 
   bool read_line(WgbLine& out) {
-    if (!take_(kWgbItemLine, 1 + 3))
+    if (!take_(kWgbItemLine, 1 + 5))
       return false;
     out.baseline_y = wgb_read_u16(p_ + 1);
-    out.word_count = p_[3];
+    out.ink_up = p_[3];
+    out.ink_down = p_[4];
+    out.word_count = p_[5];
     out.flags = flags_;
-    out.words = p_ + 4;
+    out.words = p_ + 6;
     WgbWordIter it(out, end_);
     WgbWord w;
     for (uint8_t i = 0; i < out.word_count; ++i) {

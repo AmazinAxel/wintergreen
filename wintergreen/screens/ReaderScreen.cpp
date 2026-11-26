@@ -3,6 +3,7 @@
 #include <cstdio>
 #include <cstring>
 #include <string>
+#include <utility>
 
 #include "../Application.h"
 #include "../content/BookIndex.h"
@@ -14,88 +15,36 @@ std::string ReaderScreen::display_title_() const {
   return book_title_fallback(wgb_.metadata().title, path_);
 }
 
-// Draw a stored image, or the slice of it that lands on this page.
+// One strip's part of a stored image, for GrayPage (called inside the update,
+// panel idle and queued windows drained, so the card is free).
 //
 // The WGB holds images as raw 1-bit bitmaps already scaled and dithered to the
-// size they are drawn at, so this is a seek and a row-by-row blit — no decoder,
-// no ditherer, no scaling, and no cache file. It replaced a JPEG/PNG decode that
-// ran on first view and wrote its result back to the SD card so it would not
-// have to run twice.
-//
-// It reads through WgbReader's already-open handle, so a page with three figures
-// does not open the book three times.
-//
-// `offset`/`size` come from the image table; `src_y`/`clip_h` select the rows
-// that belong to this page when an image spans a page break.
-bool ReaderScreen::draw_image_(uint32_t offset, uint32_t size, DrawBuffer& buf, int dest_x, int dest_y, uint16_t width,
-                               uint16_t height, uint16_t src_y, uint16_t clip_h) {
-  if (offset == 0 || size == 0 || width == 0 || height == 0)
-    return false;
-  // Refreshes are fired without waiting, so the previous page's waveform may still
-  // be running. The SD card shares SPI2 with the panel and concurrent traffic
-  // corrupts an update in flight, so drain before touching the card. Text-only
-  // pages never reach here and keep the full overlap.
-  buf.wait_panel_idle();
-
+// size they are drawn at, rows plus a column copy, so this is a seek and one
+// read — no decoder, no ditherer, no scaling, and no cache file. It reads
+// through WgbReader's already-open handle, so a page with three figures does
+// not open the book three times.
+bool ReaderScreen::read_image(const WgbImage& img, Rotation rot, int lo, int hi, uint8_t* dst, size_t cap) {
   FILE* f = wgb_.file();
-  if (!f)
+  if (!f || lo < 0 || hi <= lo)
     return false;
-
-  const uint16_t row_bytes = static_cast<uint16_t>((width + 7) / 8);
-  const uint32_t rows_bytes = wgb_image_rows_bytes(width, height);
-  if (rows_bytes + wgb_image_bands_bytes(width, height) > size)
-    return false;
-  const uint16_t first = src_y;
-  uint16_t last = height;
-  if (clip_h > 0 && static_cast<uint32_t>(first) + clip_h < last)
-    last = static_cast<uint16_t>(first + clip_h);
-  if (first >= last)
-    return false;
-
-  if (buf.rotation() == Rotation::Deg90) {
-    // Portrait: the band copy after the rows (WgbFormat.h). Bands first/8 ..
-    // (last-1)/8 are contiguous, read a few at a time; rows of the edge bands
-    // outside [first, last) are not drawn.
-    if (width > 2 * DisplayFrame::kStride * 8)
+  // Every strip an image crosses asks again: read its table entry once.
+  if (img.key != ref_key_) {
+    if (!wgb_.image_ref(img.key, ref_))
       return false;
-    const uint32_t b0 = first / 8u, b1 = (last - 1u) / 8u;
-    if (std::fseek(f, static_cast<long>(offset + rows_bytes + b0 * width), SEEK_SET) != 0)
-      return false;
-    static constexpr uint32_t kBandBuf = 16 * DisplayFrame::kStride;
-    uint8_t bands[kBandBuf];
-    const uint32_t per = std::max<uint32_t>(1, kBandBuf / width);
-    for (uint32_t b = b0; b <= b1;) {
-      const uint32_t n = std::min(per, b1 - b + 1);
-      const size_t got = std::fread(bands, width, n, f);
-      for (uint32_t k = 0; k < got; ++k) {
-        const int top = static_cast<int>(8 * (b + k));  // image row of the band's first row
-        buf.blit_1bit_bands(dest_x, dest_y + top - first, bands + k * width, width, first - top, last - top);
-      }
-      if (got != n)
-        break;
-      b += n;
-    }
-    return true;
+    ref_key_ = img.key;
   }
-
-  if (row_bytes > DisplayFrame::kStride)
-    return false;  // wider than the panel: not something the converter produces
-  if (std::fseek(f, static_cast<long>(offset) + static_cast<long>(first) * row_bytes, SEEK_SET) != 0)
+  const WgbImageRef& ref = ref_;
+  const uint32_t width = img.w, height = img.full_h;
+  if (ref.data_offset == 0 || width == 0 || height == 0 ||
+      wgb_image_rows_bytes(width, height) + wgb_image_cols_bytes(width, height) > ref.data_size)
     return false;
-  // A band of rows on the stack: no heap, one fread per band, and enough rows
-  // per blit for the portrait path to pack whole bytes.
-  static constexpr uint16_t kBandRows = 16;
-  uint8_t band[kBandRows * DisplayFrame::kStride];
-  for (uint16_t r = first; r < last;) {
-    const uint16_t n = static_cast<uint16_t>(std::min<int>(kBandRows, last - r));
-    const size_t got = std::fread(band, row_bytes, n, f);
-    if (got > 0)
-      buf.blit_1bit(dest_x, dest_y + static_cast<int>(r - first), band, width, static_cast<int>(got), row_bytes);
-    if (got != n)
-      break;
-    r = static_cast<uint16_t>(r + n);
-  }
-  return true;
+  // Landscape: rows [lo, hi) of the row copy; portrait: columns of the column
+  // copy (WgbFormat.h).
+  const uint32_t unit = rot == Rotation::Deg90 ? (height + 7) / 8 : (width + 7) / 8;
+  const uint32_t base = ref.data_offset + (rot == Rotation::Deg90 ? wgb_image_rows_bytes(width, height) : 0);
+  const uint32_t n = static_cast<uint32_t>(hi - lo) * unit;
+  return n <= cap && std::fseek(f, static_cast<long>(base + static_cast<uint32_t>(lo) * unit), SEEK_SET) == 0 &&
+         std::fread(dst, 1, n, f) == n;
 }
 
 // Latching: once the bar is up it stays up until the next boot (deep-sleep
@@ -116,28 +65,29 @@ uint8_t ReaderScreen::wanted_layout_(const DrawBuffer& buf) const {
   return wgb_layout_index(size, buf.rotation() == Rotation::Deg0);
 }
 
-void ReaderScreen::sync_layout_(const DrawBuffer& buf) {
+void ReaderScreen::sync_layout_(DrawBuffer& buf) {
   const uint8_t want = wanted_layout_(buf);
   if (want == layout_)
     return;
+  buf.wait_panel_idle();  // record + binary search: card reads
   WgbPage p;
   page_ = wgb_.page(layout_, page_, p) ? wgb_.find_page(want, p.para_offset, p.text_offset) : 0;
   layout_ = want;
-  predrawn_.valid = false;
 }
 
 void ReaderScreen::start(DrawBuffer& buf, IRuntime& runtime) {
   sample_battery_(runtime);
   buf_ = &buf;
-  snapshot_ok_ = false;  // a fresh book must never resume into a previous one's pixels
-  predrawn_.valid = false;
   pos_written_valid_ = false;
+  ref_key_ = UINT32_MAX;  // a new book: its own image table
+  next_.valid = false;   // and its own pages
   if (app_)
     buf.set_rotation(rotation_from_setting(app_->rotate_reader()));
   pos_path_.clear();
 
   // No reader font, no book: update() pops straight back without drawing.
   open_ok_ = false;
+  buf.wait_panel_idle();  // opening, .pos and the first page are card reads
   if (!page_buf_ || !ext_font_set_ || !ext_font_set_->valid() || !wgb_.open(path_.c_str()))
     return;
   layout_ = wanted_layout_(buf);
@@ -158,24 +108,13 @@ void ReaderScreen::start(DrawBuffer& buf, IRuntime& runtime) {
   if (config::kResumeOnePageBack && page_ > 0)
     --page_;
   render_page_(buf);
-  stage_next_page_(buf);
-  prerender_pending_ = true;
 }
 
-// Snapshot the rendered page so resume() can put it back without re-rendering.
-// Recording the font size and rotation alongside it is what makes the fast path
-// safe: the quick menu is the only screen that pushes over the reader, and those
-// two settings are the only things it can change that alter the pixels.
-void ReaderScreen::pause() {
-  if (!buf_ || !open_ok_)
-    return;
-  buf_->save_snapshot();
-  snapshot_font_size_ = reader_settings_.font_size_idx;
-  snapshot_rotation_ = app_ ? app_->rotate_reader() : 0;
-  snapshot_ok_ = !pixels_stale_;
-  pixels_stale_ = false;
-}
+void ReaderScreen::pause() {}
 
+// The quick menu was on the glass (an OTP frame), so the page goes up again as
+// a gray update from that frame; the caller (Application's pop handler) does the
+// refresh. page_buf_ still holds the page unless the layout changed.
 void ReaderScreen::resume(DrawBuffer& buf, IRuntime& runtime) {
   sample_battery_(runtime);
   buf_ = &buf;
@@ -184,22 +123,9 @@ void ReaderScreen::resume(DrawBuffer& buf, IRuntime& runtime) {
   if (!open_ok_)
     return;
 
-  // Fast path: nothing that affects the pixels changed while the quick menu was
-  // up, so put the snapshot back instead of laying the page out and drawing
-  // every glyph again. The caller (Application's pop handler) does the refresh.
-  const bool jumping = app_ && app_->quickmenu()->has_pending();
-  if (!jumping && snapshot_ok_ && reader_settings_.font_size_idx == snapshot_font_size_ &&
-      (app_ ? app_->rotate_reader() : 0) == snapshot_rotation_ && buf.has_snapshot() &&
-      buf.restore_snapshot()) {
-    snapshot_ok_ = false;
-    stage_next_page_(buf);
-    prerender_pending_ = true;  // the snapshot claimed the spare the pre-drawn page was in
-    return;
-  }
-  snapshot_ok_ = false;
-
   // A chapter jump chosen from the quick menu: its page, in the layout the
   // menu was opened in (render_page_ maps it if the layout changed too).
+  const bool jumping = app_ && app_->quickmenu()->has_pending();
   if (jumping) {
     page_ = app_->quickmenu()->pending_page();
     app_->quickmenu()->clear_pending();
@@ -208,14 +134,12 @@ void ReaderScreen::resume(DrawBuffer& buf, IRuntime& runtime) {
   }
 
   render_page_(buf);
-  stage_next_page_(buf);
-  prerender_pending_ = true;
 }
 
 void ReaderScreen::stop() {
   if (open_ok_) {
-    // .pos is an SD write and the panel may still be mid-refresh — see the note in
-    // draw_image_. This is the only reader path that writes the card.
+    // .pos is an SD write and the panel may still be mid-refresh, and the card
+    // shares SPI2 with it. This is the only reader path that writes the card.
     if (buf_)
       buf_->wait_panel_idle();
     save_position_();
@@ -224,10 +148,8 @@ void ReaderScreen::stop() {
     if (app_)
       app_->record_book_progress(path_, progress_pct());
   }
-  loaded_.valid = false;
+  loaded_.valid = next_.valid = false;
   wgb_.close();
-  predrawn_.valid = false;
-  predraw_after_idle_ = false;
   pos_path_.clear();
   pos_path_.shrink_to_fit();
   open_ok_ = false;
@@ -282,10 +204,6 @@ void ReaderScreen::update(const ButtonState& buttons, DrawBuffer& buf, IRuntime&
             prev_page_();
           else if (last_step_ < 0)
             next_page_();
-          if (last_step_ != 0) {
-            predrawn_.valid = false;
-            pixels_stale_ = true;
-          }
           last_step_ = 0;
           break;
         case Button::Button0:
@@ -293,6 +211,7 @@ void ReaderScreen::update(const ButtonState& buttons, DrawBuffer& buf, IRuntime&
           return;
         case Button::Button1: {
           std::vector<uint32_t> chapters;
+          buf.wait_panel_idle();  // the chapter table is on the card
           wgb_.chapter_pages(layout_, chapters);
           const int chapter_pct = chapter_progress_pct_(chapters);
           app_->quickmenu()->set_settings(&reader_settings_);
@@ -328,161 +247,68 @@ void ReaderScreen::update(const ButtonState& buttons, DrawBuffer& buf, IRuntime&
     last_step_ = changed ? static_cast<int8_t>(page_delta > 0 ? 1 : -1) : 0;
 
   if (changed) {
-    pixels_stale_ = false;
-    // One ADC read per page turn, not per frame. A pre-drawn page carries the
-    // sample taken when it was drawn, so the bar can lag one turn.
+    // One ADC read per page turn, not per frame.
     sample_battery_(runtime);
-    // A forward turn may already have the page drawn and waiting.
-    if (page_delta <= 0 || !take_predrawn_(buf))
-      render_page_(buf);
-    stage_next_page_(buf);
+    render_page_(buf);
     buf.refresh();
-    // The panel is now busy for a few hundred ms and the reader is
-    // overwhelmingly likely to go forward next — after a backward turn too,
-    // where "forward" is the page just left. The CPU would only be waiting out
-    // the waveform otherwise.
-    prerender_next_page_(buf);
-    prerender_pending_ = false;
-  } else if (prerender_pending_) {
-    prerender_pending_ = false;
-    prerender_next_page_(buf);
-  } else if (predraw_after_idle_ && !buf.display().is_busy()) {
-    prerender_next_page_(buf);
+  } else if (open_ok_ && !buf.display().is_busy()) {
+    // First frame after the waveform (the loop runs frame cadence while the
+    // panel is busy): read the next page's list now, so a forward turn reads
+    // nothing from the card on the press path.
+    prefetch_next_();
   }
 }
 
+// Read page_ + 1's record and list into next_buf_. Only with the panel idle:
+// the card shares SPI2 with it.
+void ReaderScreen::prefetch_next_() {
+  const uint32_t want = page_ + 1;
+  if (!next_buf_ || want >= wgb_.page_count(layout_) ||
+      (next_.valid && next_.layout == layout_ && next_.index == want))
+    return;
+  next_.valid = false;
+  WgbPage rec;
+  if (!wgb_.page(layout_, want, rec) || !wgb_.read_page(rec, next_buf_, kWgbMaxPageBytes))
+    return;
+  next_len_ = rec.dl_size;
+  next_ = Loaded{true, layout_, want};
+}
+
 // The card shares SPI2 with the panel, so every read here waits the waveform
-// out first (docs/display.md). A page already in page_buf_ costs nothing.
+// out first (docs/display.md). A page already in page_buf_ costs nothing; one
+// prefetched into next_buf_ is a pointer swap.
 bool ReaderScreen::load_page_(DrawBuffer& buf, uint8_t layout, uint32_t index) {
   if (loaded_.valid && loaded_.layout == layout && loaded_.index == index)
     return true;
+  if (next_.valid && next_.layout == layout && next_.index == index) {
+    std::swap(page_buf_, next_buf_);
+    std::swap(page_len_, next_len_);
+    std::swap(loaded_, next_);  // next_ now names the page that was in page_buf_
+    return true;
+  }
   loaded_.valid = false;
   WgbPage rec;
-  if (!page_buf_ || !wgb_.page(layout, index, rec))
+  if (!page_buf_)
     return false;
-  buf.wait_panel_idle();
-  if (!wgb_.read_page(rec, page_buf_, kWgbMaxPageBytes))
+  buf.wait_panel_idle();  // the record read below is a card read too
+  if (!wgb_.page(layout, index, rec) || !wgb_.read_page(rec, page_buf_, kWgbMaxPageBytes))
     return false;
   page_len_ = rec.dl_size;
   loaded_ = Loaded{true, layout, index};
   return true;
 }
 
-// Read the next page's display list while the panel is idle, right before the
-// refresh that puts page_ up, so prerender_next_page_ can draw it during the
-// waveform without touching the card. One small read, a few ms.
-void ReaderScreen::stage_next_page_(DrawBuffer& buf) {
-  if (open_ok_ && page_ + 1 < wgb_.page_count(layout_))
-    load_page_(buf, layout_, page_ + 1);
-}
-
-bool ReaderScreen::page_has_image_() const {
-  WgbPageView v(page_buf_, page_len_);
-  uint8_t tag;
-  while (v.peek(tag)) {
-    if (tag == kWgbItemImage)
-      return true;
-    v.skip();
-  }
-  return false;
-}
-
-// Draw the page after the current one into the offscreen buffer, while the
-// panel is still running this page's waveform.
-//
-// The next forward turn then costs a memcpy and an SPI write: no glyph
-// blitting. It is free in power terms because the CPU would otherwise be idle
-// waiting for the waveform. See "Page-turn latency" in docs/display.md.
-void ReaderScreen::prerender_next_page_(DrawBuffer& buf) {
-  predrawn_.valid = false;
-  predraw_after_idle_ = false;
-  if (!open_ok_ || page_ + 1 >= wgb_.page_count(layout_))
-    return;
-  // Only what stage_next_page_ already read: reading now would put card
-  // traffic under the running waveform.
-  if (!loaded_.valid || loaded_.layout != layout_ || loaded_.index != page_ + 1)
-    return;
-  // An image page needs the card to draw, and the card shares SPI2 with the
-  // panel: draw it on the first frame after the waveform instead (update()).
-  // The loop runs frames while the panel is busy, so that frame comes ~25 ms
-  // after the refresh ends — long before the reader turns again.
-  if (page_has_image_() && buf.display().is_busy()) {
-    predraw_after_idle_ = true;
-    return;
-  }
-  if (!buf.begin_offscreen())
-    return;
-  draw_page_(buf);
-  buf.end_offscreen();
-  predrawn_ = PreDrawn{true, layout_, page_ + 1};
-}
-
-// Put the pre-drawn page on screen instead of rendering it. Returns false for any
-// mismatch, in which case the caller renders normally — this is only ever an
-// optimisation, never the source of truth.
-bool ReaderScreen::take_predrawn_(DrawBuffer& buf) {
-  if (!predrawn_.valid || !buf.has_offscreen())
-    return false;
-  if (predrawn_.layout != wanted_layout_(buf) || predrawn_.layout != layout_ || predrawn_.index != page_)
-    return false;
-  if (!buf.commit_offscreen())
-    return false;
-  predrawn_.valid = false;
-  return true;
-}
-
+// Hand page_ to the gray path (GrayPage): the next refresh puts it up on the
+// Turn LUT. The draw buffer is not touched, so it still holds the last 1-bit
+// frame on the glass. An image that fails to read stays white (a black slab
+// per figure is far worse than white space); the low-battery bar runs along the
+// bottom edge in both orientations.
 void ReaderScreen::render_page_(DrawBuffer& buf) {
   sync_layout_(buf);
   // A record that does not read draws as a blank page (no error text, by rule).
   if (!load_page_(buf, layout_, page_))
     page_len_ = 0;
-  draw_page_(buf);
-}
-
-void ReaderScreen::draw_page_(DrawBuffer& buf) {
-  const int W = buf.width();
-  const int H = buf.height();
-  buf.fill(true);
-
-  // Items are stored in draw order (lines, rules, images); a malformed list
-  // just stops drawing where it goes wrong.
-  WgbPageView v(page_buf_, page_len_);
-  uint8_t tag;
-  while (v.peek(tag)) {
-    if (tag == kWgbItemLine) {
-      WgbLine line;
-      if (!v.read_line(line))
-        break;
-      buf.draw_baked_line(line, v.end(), *ext_font_set_, false);
-    } else if (tag == kWgbItemRule) {
-      WgbRule r;
-      if (!v.read_rule(r))
-        break;
-      buf.fill_rect(r.x, r.y + r.h / 2 - 1, r.w, 2, false);
-    } else if (tag == kWgbItemImage) {
-      WgbImage img;
-      if (!v.read_image(img))
-        break;
-      // The image table is on the card: wait the waveform out before reading it.
-      buf.wait_panel_idle();
-      WgbImageRef ref;
-      if (!wgb_.image_ref(img.key, ref) ||
-          !draw_image_(ref.data_offset, ref.data_size, buf, img.x, img.y, img.w, img.full_h, img.src_y, img.clip_h)) {
-        // Leave the space blank rather than filling it black — a book whose image
-        // failed to rasterise at conversion time has a zero-size entry here, and a
-        // black slab per figure is far worse than white space.
-        buf.fill_rect(img.x, img.y, img.w, img.full_h, true);
-      }
-    } else {
-      break;
-    }
-  }
-
-  // Charge reminder. Drawn last so an image reaching the bottom margin cannot
-  // paint over it, and in logical coordinates so it sits along the bottom edge
-  // in both orientations.
-  if (low_battery_)
-    buf.fill_rect(0, H - kLowBatteryBarH, W, kLowBatteryBarH, false);
+  buf.gray().set(page_buf_, page_len_, ext_font_set_, buf.rotation(), low_battery_ ? kLowBatteryBarH : 0, this);
 }
 
 bool ReaderScreen::next_page_() {

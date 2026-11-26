@@ -119,7 +119,8 @@ ending the attempt at once (hardware-checked).
    `ble_gattc_disc_all_dscs` over a service range reports the range start as every
    descriptor's `chr_val_handle`, so CCCD → report cannot be mapped (70 notifications on
    handle 43 matched none). Any `NOTIFY_RX` inside an HID service range goes to
-   `handle_report`, which scans for Left/Right Arrow (0x50/0x4F; Page Up/Down not matched).
+   `handle_report`, which scans for Left/Right Arrow (0x50/0x4F) and Up/Down Arrow (0x52/0x51, folded onto
+   Left/Right: up = previous, down = next; Page Up/Down not matched).
 6. **Never find the connection by address.** After bonding the stack resolves the RPA to
    the identity address, so `ble_gap_conn_find_by_addr(scanned)` returned `ENOTCONN` on a
    live link. `g_conn` comes from the `CONNECT` event and is cleared on `DISCONNECT`.
@@ -278,10 +279,32 @@ Pages are fully baked (`docs/content.md`), so the reader has no layout engine, n
 paragraph cache and no per-page allocation: a page is one display list of a few hundred
 bytes read into `ReaderScreen::page_buf_` (4 KB, claimed at boot). With that gone every
 workaround below was deleted: the clicker no longer releases DrawBuffer's spare (covers,
-thumbnails and the pre-drawn page all stay with the clicker up), the book index is never
-dropped, there is no cache cap, no `largest_free_block` guard, no OOM reserve and no
-`set_new_handler` rescue, and `IRuntime::clicker_holds_ram()` /
-`largest_free_block_bytes()` are gone. Image 1,199,358 → 1,141,052 B.
+thumbnails and a gray page's planes all stay with the clicker up), the book index is never
+dropped, there is no cache cap, no largest-free-block guard, no OOM reserve and no
+new-handler rescue, and the `IRuntime` hooks for them are gone. Image 1,199,358 →
+1,141,052 B.
+
+**Everything big is claimed once at boot, on the heap, and never released**: both
+framebuffers (heap, not BSS: Static RAM went 164,184 → 116,168 with that change, and the
+48 KB sits in the pool the reader and radio draw from), the reader's two page buffers (2 × 4 KB),
+`GrayPage`'s ~17 KB (kept list, strip buffers, item index, docs/display.md "Gray reader pages"), the
+book index. Sync downloads borrow the spare (docs/sync.md). The heap used to fail by
+**fragmenting, not filling** (aborts on 256 B – 1.4 KB requests with plenty free): any
+future guard checks the largest free block, never the total.
+
+BLE's allocations all come from `MALLOC_CAP_INTERNAL`
+(`CONFIG_BT_NIMBLE_MEM_ALLOC_MODE_INTERNAL`), on a build already holding ~160 KB statically
+out of 320 KB. Not a stack-size problem, and raising stacks makes it worse. Every `BT_*`
+buffer key in `sdkconfig.defaults` is sized down from IDF's defaults, which assume a
+multi-peripheral hub rather than one clicker sending 8-byte reports — each commented in
+place. `BT_CTRL_BLE_MAX_ACT` (6 → 2) is the largest single saving.
+
+**Any early bail-out from `bringup_stack()` reaches `radio_off()`**, via `connect_task`'s
+`if (!ok)`. That is why `radio_off()` guards `ble_gap_disc_cancel()` behind `g_host_up`:
+calling it before `esp_nimble_init()` dereferences a null `ble_hs_ctx` inside
+`ble_hs_is_enabled()` and takes a **load fault, not an error return** (the old heap floor
+introduced exactly this: the device rebooted the instant the row was selected). Any new
+pre-NimBLE failure stage inherits the same hazard.
 
 **Measured on hardware 2026-11-12, passed.** With the clicker connected, a 3-book sync
 (36 MB), the automatic reconnect after it, and page turns, the largest internal block never
@@ -471,101 +494,10 @@ Three properties that matter:
 
 **Anything new that reserves internal RAM up front inherits this.**
 
-### The heap fails by fragmenting, not by filling
+### The bring-up heap floor (removed)
 
-Every abort in this reader has been a small allocation failing with plenty of total free
-heap: 256 bytes, 1,212 bytes, 1,416 bytes. Two things follow, both got wrong first.
-
-**Guard on `largest_free_block_bytes()`, never `free_memory_bytes()`.**
-`heap_caps_get_free_size` sums every free byte across a fragmented heap, and IDF's own
-header warns that a single block of that size probably cannot be allocated. A 24 KB
-*total-free* guard passed and the layout behind it aborted on a 1,416-byte request, on an
-ordinary forward page turn. `heap_caps_get_largest_free_block` answers the question the
-guard is actually asking. The number to clear is the largest *single* allocation one layout
-makes — measured at **5,808 B** worst case — hence `kLayoutMinBlockBytes` = 12 KB and
-`kPrerenderMinBlockBytes` = 20 KB.
-
-**Allocation churn is worse than allocation size.** `shrink_to_fit()` on each laid-out line
-and on the line vector reclaimed ~5 KB of slack per page and was removed again: it
-reallocates (allocate exact, copy, free old), adding ~80 allocate/free pairs per page and
-taking the page from **114 allocations to 197**. Many short-lived blocks of varying size is
-the definition of heap churn, and churn produces the fragmentation above. 5 KB of headroom
-is not worth 40% more traffic on a heap that fails this way. Peak went 13.2 KB → 18.6 KB,
-both inside budget. Same reasoning is why `split_words` fills a caller-owned buffer reused
-across every run of a paragraph instead of returning a fresh vector per run.
-
-**A runtime guard backs this up.** `ReaderScreen::render_page_` checks
-`largest_free_block_bytes()` against `kLayoutMinBlockBytes` immediately before laying out
-and, if short, drops the page cache, the pre-drawn page and the paragraph cache and caps
-the cache at one slot. Exceptions are off, so an allocation failure inside layout is an
-`abort()` with nothing to catch — the check has to happen before allocating. The cost is a
-slower page turn; the page still renders. It deliberately does **not** release
-`DrawBuffer`'s spare: `render_page_` can be reached from inside an offscreen draw, and
-freeing the buffer being drawn into is worse than the abort it would prevent.
-
-**Every path that lays out needs the guard.** There are three, and missing one is not
-theoretical — `prev_page_` was left unguarded and scrolling backwards with the clicker
-connected aborted on a 1,212-byte allocation inside `split_words`:
-
-| Path | Guard |
-|---|---|
-| `render_page_` | two stages — `kLayoutShedBlockBytes` (20 KB) drops the page cache and pre-drawn page; `kLayoutMinBlockBytes` (12 KB) also drops the paragraph cache |
-| `prerender_next_page_` | `kPrerenderMinBlockBytes` (20 KB) — higher, because the *real* page after it still has to fit |
-| `prev_page_` | `kLayoutMinBlockBytes`, and it also skips the forward-resync block entirely |
-
-`prev_page_` is the hungriest: one `layout_backward`, then the resync does another plus up
-to three `layout_end` calls and a final `layout()`. When the heap is tight it drops caches
-*and* takes `layout_backward`'s answer unrefined, costing the occasional one-line offset
-rather than a reboot.
-
-**A forward turn holds two pages at once**, and that is the number to budget against.
-`prerender_next_page_` lays out page N+1 while page N is still resident: measured worst case
-**25 KB** across four books against ~13 KB for a single page. Two consequences, both bugs:
-
-- Its guard at the top tests the heap *before* the speculative layout exists, so it says
-  nothing about whether the subsequent *draw* will fit. It now re-checks after the layout
-  and bails, leaving the layout cached — the next turn is a normal render.
-- The draw calls `render_page_`, which runs its own guard. Left alone that guard would drop
-  the very page cache the prerender just filled, forcing an immediate re-layout with *less*
-  room than the check was made against. `in_prerender_draw_` suppresses it for the nested
-  call only.
-
-**`DrawBuffer`'s spare is on the heap, not in BSS.** Static RAM went 164,184 → 116,168 with
-that one change. It is still allocated at construction and kept for the session — the point
-is that the 48 KB sits in the pool the reader and radio draw from.
-
-**It is deliberately never released, and neither are the reader's page caches.** Both were
-wired to free on connect and that was wrong: they are what makes a page turn a memcpy
-instead of a layout, and a clicker exists to turn pages. Only the book index is handed
-back, because being without it while a book is open costs nothing.
-
-**The index is handed back before the radio starts.** `Failed 8011` — the host task could
-not be created with 11 KB free — showed the two do not fit alongside a resident index.
-`QuickmenuScreen::on_select` calls `Application::release_ram_for_radio()` **synchronously,
-immediately before** `toggle_clicker()`, freeing ~30 KB. It must be synchronous: bringup
-allocates the moment the worker spawns, so a next-frame release is too late.
-
-`BookIndex::release_memory()` swaps the vector rather than clearing it (a cleared vector
-keeps its capacity) and refuses when `dirty_`, since a reload cannot recover unsaved
-mutations. An empty index is the "never loaded" state everywhere, so nothing truncates the
-file.
-
-BLE's allocations all come from `MALLOC_CAP_INTERNAL`
-(`CONFIG_BT_NIMBLE_MEM_ALLOC_MODE_INTERNAL`), on a build already holding ~160 KB statically
-out of 320 KB. Not a stack-size problem, and raising stacks makes it worse. Every `BT_*`
-buffer key in `sdkconfig.defaults` is sized down from IDF's defaults, which assume a
-multi-peripheral hub rather than one clicker sending 8-byte reports — each commented in
-place. `BT_CTRL_BLE_MAX_ACT` (6 → 2) is the largest single saving.
-
-`bringup_stack()` **refuses to start below `kMinHeapKb` (24)**, turning the worst failure
+`bringup_stack()` **refused to start below `kMinHeapKb` (24)**, turning the worst failure
 mode — half initialise, time out at sync, leave a session that cannot retry — into a clean
 refusal. It is a floor for the hopeless case, not an estimate of what BLE needs: it shipped
 at 64, above what the device actually had free, and refused every attempt on hardware that
-had been connecting fine.
-
-**Any early bail-out from `bringup_stack()` reaches `radio_off()`**, via `connect_task`'s
-`if (!ok)`. That is why `radio_off()` guards `ble_gap_disc_cancel()` behind `g_host_up`:
-calling it before `esp_nimble_init()` dereferences a null `ble_hs_ctx` inside
-`ble_hs_is_enabled()` and takes a **load fault, not an error return**. The heap check
-introduced exactly this — the device rebooted the instant the row was selected, before
-"Connecting" was drawn. Any new pre-NimBLE failure stage inherits the same hazard.
+had been connecting fine. Gone with the other layout-era guards.

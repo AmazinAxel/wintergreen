@@ -519,8 +519,8 @@ MainMenu::ThumbSlot* MainMenu::find_thumb_(uint32_t key) const {
 }
 
 bool MainMenu::get_item_thumb(int index, Thumb& out) const {
-  // spare_cache_valid() and not just thumb_bits_: another claim (reader,
-  // snapshot, a sync's loan) may have taken the spare since.
+  // spare_cache_valid() and not just thumb_bits_: another claim (a gray page,
+  // a sync's loan) may have taken the spare since.
   if (!thumb_bits_ || thumb_slots_n_ == 0 || !buf_ || !buf_->spare_cache_valid(thumb_gen_) ||
       is_separator(index) || is_action_row_(index))
     return false;

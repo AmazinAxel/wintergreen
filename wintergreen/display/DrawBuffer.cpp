@@ -1,7 +1,5 @@
 #include "DrawBuffer.h"
 
-#include <climits>
-
 namespace wintergreen {
 
 namespace {
@@ -91,16 +89,12 @@ void blit_deg0_(uint8_t* buf, int x, int y, const uint8_t* src, int w, int h, si
 // physical row kPhysH - 1 - x - c and its pixels run along that row, so each
 // column is one put_row_: the same byte copy as landscape, no transpose. Fonts
 // and the home/list covers are baked in this order for the portrait screens.
-//
-// Rows outside [keep_lo, keep_hi) are not drawn either (a reader image band
-// that straddles the page's slice of the image).
 template <BlitOp Op>
-void blit_cols_(uint8_t* buf, int x, int y, const uint8_t* cols, int w, int h, size_t cstride, int keep_lo = 0,
-                int keep_hi = INT_MAX) {
+void blit_cols_(uint8_t* buf, int x, int y, const uint8_t* cols, int w, int h, size_t cstride) {
   const int c_lo = std::max(0, -x);
   const int c_hi = std::min(w, kPhysH - x);
-  const int r_lo = std::max({0, -y, keep_lo});
-  const int r_hi = std::min({h, kPhysW - y, keep_hi});
+  const int r_lo = std::max(0, -y);
+  const int r_hi = std::min(h, kPhysW - y);
   if (c_lo >= c_hi || r_lo >= r_hi)
     return;
   for (int c = c_lo; c < c_hi; ++c)
@@ -205,19 +199,7 @@ int draw_text_impl_(uint8_t* buf, Rotation rot, int x, int baseline_y, const cha
 void DrawBuffer::blit_1bit(int lx, int ly, const uint8_t* data, int w, int h, size_t stride) {
   if (!data || w <= 0 || h <= 0)
     return;
-  blit_<BlitOp::Copy>(draw_(), rotation_, lx, ly, data, w, h, stride);
-}
-
-void DrawBuffer::blit_1bit_bands(int lx, int ly, const uint8_t* band, int w, int keep_lo, int keep_hi) {
-  if (!band || w <= 0)
-    return;
-  if (rotation_ == Rotation::Deg90) {
-    blit_cols_<BlitOp::Copy>(draw_(), lx, ly, band, w, 8, 1, keep_lo, keep_hi);
-    return;
-  }
-  for (int c = 0; c < w; ++c)
-    for (int r = std::max(0, keep_lo); r < std::min(8, keep_hi); ++r)
-      fill_rect(lx + c, ly + r, 1, 1, (band[c] >> (7 - r)) & 1);
+  blit_<BlitOp::Copy>(buf_, rotation_, lx, ly, data, w, h, stride);
 }
 
 void DrawBuffer::blit_1bit_cols(int lx, int ly, const uint8_t* cols, int w, int h) {
@@ -225,7 +207,7 @@ void DrawBuffer::blit_1bit_cols(int lx, int ly, const uint8_t* cols, int w, int 
     return;
   const size_t cstride = static_cast<size_t>((h + 7) / 8);
   if (rotation_ == Rotation::Deg90) {
-    blit_cols_<BlitOp::Copy>(draw_(), lx, ly, cols, w, h, cstride);
+    blit_cols_<BlitOp::Copy>(buf_, lx, ly, cols, w, h, cstride);
     return;
   }
   // Landscape never shows a cover; kept correct anyway, a pixel at a time.
@@ -238,29 +220,7 @@ void DrawBuffer::blit_1bit_cols(int lx, int ly, const uint8_t* cols, int w, int 
 
 int DrawBuffer::draw_text_proportional(int x, int baseline_y, const char* text, size_t len, const BitmapFont& font,
                                        bool white, FontStyle style) {
-  return draw_text_impl_(draw_(), rotation_, x, baseline_y, text, len, font, white, style);
-}
-
-void DrawBuffer::draw_baked_line(const WgbLine& line, const uint8_t* end, const BitmapFontSet& fonts, bool white) {
-  uint8_t* buf = draw_();
-  WgbWordIter it(line, end);
-  WgbWord w;
-  while (it.next(w)) {
-    const BitmapFont* f = fonts.get_font(w.font);
-    if (!f || !f->valid())
-      continue;
-    int word_baseline = line.baseline_y;
-    if (w.valign == static_cast<uint8_t>(VerticalAlign::Super))
-      word_baseline -= static_cast<int>(f->y_advance(100)) * 20 / 100;
-    else if (w.valign == static_cast<uint8_t>(VerticalAlign::Sub))
-      word_baseline += static_cast<int>(f->y_advance(100)) * 20 / 100;
-    // Baked glyph indices (WgbFormat.h): no UTF-8 decode, no range search.
-    const uint8_t* p = w.glyphs;
-    const uint8_t* e = w.glyphs + w.len;
-    draw_glyphs_(
-        buf, rotation_, w.x, word_baseline, f->styled(static_cast<FontStyle>(w.style)), white,
-        [&] { return p < e; }, [&] { return wgb_read_glyph(p, e); });
-  }
+  return draw_text_impl_(buf_, rotation_, x, baseline_y, text, len, font, white, style);
 }
 
 // Decode MGR2 into the draw buffer and paint it with RefreshMode::Half.
@@ -319,7 +279,9 @@ bool DrawBuffer::show_sleep_image_embedded() {
     }
   }
 
+  gray_.drop_pending();
   display_.full_refresh(buf_, nullptr, RefreshMode::Half, /*turnOffScreen=*/true);
+  gray_.set_glass(GrayPage::Glass::Frame);
   return true;
 }
 

@@ -7,8 +7,8 @@ Mostly negative knowledge: hardware-tested failures. "Don't" = cost a debug sess
 ## Notes index (read matching `docs/` file before touching area)
 | File | Covers | Never break |
 |---|---|---|
-| `docs/power-and-input.md` | idle power, DFS, input sampling, holds, power button | no tickless idle / light sleep (kills ADC buttons on battery); `min_freq_mhz` stays 80; never measure hold in frames; first down frame of a hold adds no dt (idle loop: dt = wait before press); async state change → `ui_wake()` or it shows at next deadline (≤1 s); `pdMS_TO_TICKS(1)` = 0 ticks; wait GPIO3 HIGH before deep sleep; no pin holds in deep sleep (`release_sleep_holds_()` at boot only clears old ones) |
-| `docs/display.md` | refresh latency, paging, spare framebuffer, panel health | every `EInkDisplay` entry starts `wakeIfNeeded(); waitWhileBusy();` (BUSY falling-edge ISR, not tick poll); SD shares SPI2 → `wait_panel_idle()` before card access; keep half-refresh `0x5A` temp write; no idle rail power-down; device never lays out: page = one baked display list read into `ReaderScreen::page_buf_` (`stage_next_page_` reads next one before refresh, never under a waveform) |
+| `docs/power-and-input.md` | idle power, DFS, input sampling, holds, power button | no tickless idle / light sleep (kills ADC buttons on battery); `min_freq_mhz` stays 80; never measure hold in frames; first down frame of a hold adds no dt (idle loop: dt = wait before press); async state change → `ui_wake()` or it shows at next deadline (≤1 s); the loop keeps a 25 ms cadence only while a key is down, power is armed or a transition is queued (busy panel = BUSY edge wakes it; radios/USB wake it; `keep_awake()` is a latch); `pdMS_TO_TICKS(1)` = 0 ticks; wait GPIO3 HIGH before deep sleep; no pin holds in deep sleep (`release_sleep_holds_()` at boot only clears old ones) |
+| `docs/display.md` | refresh latency, paging, spare framebuffer, gray reader pages, panel health | every `EInkDisplay` entry starts `wakeIfNeeded(); waitWhileBusy();` (BUSY falling-edge ISR, not tick poll); SD shares SPI2 → `wait_panel_idle()` before card access; keep half-refresh `0x5A` temp write; no idle rail power-down; device never lays out: page = one baked display list read into `ReaderScreen::page_buf_`, the next read ahead into `next_buf_` on the first idle frame (never under a waveform; every card read waits the panel); custom Turn LUT for reader pages only (`GrayPage`), every other screen OTP 1-bit (custom LUT elsewhere ghosted, reverted `a83a0f3`); `gray_fire` never LUT_LOAD; leaving a gray page → `GrayPage::handoff` rewrites RED before the OTP update; OTP update / controller init → `turn_loaded_ = false`; panel transactions queued (HW CS): `finish_writes()` before any polled send, card access, fire; gray send pairs alternate per window sent, not per strip |
 | `docs/architecture.md` | screens, stack, home/list/quick menu, sorting | `ScreenManager::pop()` keeps last screen; screens pushed from press inherit held button; no `std::sort` (34 KB) |
 | `docs/bluetooth.md` | BLE clicker host, heap | raw NimBLE, no esp_hidh (removed): encrypt, then own CCCD writes, keys = notifications in `conn_cb`; `L2CAP_UPDATE_REQ` has null `self_params` (edit `peer_params`); waits on events only (event group); NimBLE never torn down; never `esp_bt_controller_deinit` (clicker gone till reboot); nothing freed for radios (index, page buffer stay; spare only lent to sync downloads, see docs/sync.md) |
 | `docs/sync.md` | NAS sync over HTTP | radio teardown scope-bound (`WifiGuard`); never call saving `BookIndex` mutators per book; downloads → `.tmp`, must match Content-Length, resume via Range; all buttons dead while syncing; download serial (writer task measured no faster, single core); clicker dropped via `begin_sync()`, reconnected by `wg_sync::poll()` |
@@ -22,7 +22,7 @@ pio run -t upload
 pio device monitor      # 115200
 ```
 - `/dev/ttyACM0`, `303A:1001` (native USB JTAG/serial). `upload_port` unset on purpose (autodetect).
-- No desktop build. Only host build = `tools/books`. It and `platforms/esp32/CMakeLists.txt` list core sources explicitly: add/delete core `.cpp` → edit both, else CMake fails at generate naming `idf_component_register`. Exception: `display/DrawBuffer.cpp` is firmware-only (converter includes `DrawBuffer.h` for constants, never draws).
+- No desktop build. Only host build = `tools/books`. It and `platforms/esp32/CMakeLists.txt` list core sources explicitly: add/delete core `.cpp` → edit both, else CMake fails at generate naming `idf_component_register`. Exception: `display/DrawBuffer.cpp` and `display/GrayPage.cpp` are firmware-only (converter includes `DrawBuffer.h` for constants, never draws); host tests compile them.
 - `ESP_PLATFORM` (IDF macro) = firmware/host-converter seam. Stays.
 - Flash DIO @ 80 MHz (`sdkconfig.defaults`). QIO bricks boot (bootloader quad self-upgrade never finishes). DIO@80 = QIO@40 = 20 MB/s. `board_build.flash_mode` inert under espidf.
 - SD clock (`platforms/esp32/sdcard.h`) divides 80 MHz APB: 80/40/26.7/20 only. 40 fails (12.5 ns half-period < 14 ns card output delay; panel fine at 40, write-only). 26.67 fails (empty book list). 20 = ceiling. Card `input_delay` unreachable via `sdspi_device_config_t` (would need IDF patch).
@@ -39,7 +39,7 @@ Gotchas:
 - Below: save state, wordmark, deep sleep; `verify_battery()` in `main.cpp` refuses boot until charged. Depends on `Esp32Runtime::battery_millivolts()`; on-screen % wrong → suspect it first.
 
 Guards. First two: absence bricked device (boot, one frame, sleep screen, loop; USB Serial/JTAG off between, esptool can't connect).
-1. No USB bypass (removed 2026-11-11, owner's call; no `usb_serial_jtag` read anywhere). Old bypass read GPIO20, always "no host" on native USB. Plugged-in flat cell refuses boot until charger lifts it past cutoff.
+1. No USB bypass (removed 2026-11-11, owner's call; nothing USB decides power: `usb_books.h` only receives books). Old bypass read GPIO20, always "no host" on native USB. Plugged-in flat cell refuses boot until charger lifts it past cutoff.
 2. Low reading must persist wall-clock `kLowBatteryHoldMs` (4 s), not frames (5 frames ≈ 125 ms < one refresh = biggest spike).
 3. Never sample while panel busy (`display().is_busy()`).
 4. 0 = can't measure (no battery / uncalibrated ADC), also anything < `kImplausibleMv` (2500). `battery_millivolts()` returns 0, not raw count, without calibration.
@@ -75,9 +75,8 @@ A session can write nothing: same book, read, sleep → `mark_opened` / `set_pro
 | `WG_WIFI_SYNC` | defined | `#define`. Undefined drops Wi-Fi, lwIP, `esp_http_client` and the book list's Sync row. |
 | `kWifiName` / `kWifiPassword` / `syncServer` | `""` | Read by `platforms/esp32/wifi_sync.h`. `syncServer`: literal IP, router-DNS name, or `.local` (lwIP one-shot mDNS query, `CONFIG_LWIP_DNS_SUPPORT_MDNS_QUERIES`; no `esp_mdns`). Resolved IP cached in NVS per name; failed sync re-resolves once. |
 | `kSyncToken` | `""` | `Authorization: Bearer` on every sync request (homelab `BOOKSYNC_TOKEN`); `""` sends none. `wifi_sync.h` `sync_once_()`. |
-| `kSunlightFadingFix` | `false` | Panel off after every full refresh (restores sunlight contrast). No periodic full refreshes → affects sleep image + boot paint only. `Application::start`. |
-| `kAutoSleepMinutes` | `1` | `Application::update`. |
-| `kResumeOnePageBack` | `false` | Fresh open steps back one page (re-shows last page read). `ReaderScreen::resume_one_page_back_`. |
+| `kAutoSleepMinutes` | `1` | `Application::update`. Quick-menu "Longer autosleep" → 5 min until next sleep (`long_sleep_`, never saved; row hidden while on). |
+| `kResumeOnePageBack` | `false` | Fresh open steps back one page (re-shows last page read). `ReaderScreen::start`. |
 | `kHoldDelayMs` | `250` | Hold before nav auto-repeat; also power hold before sleep. < ~250 ms tap reads as two. |
 | `kBluetoothHoldDelayMs` | `100` | Clicker hold → Undo + Back/Confirm (page already turned on press). Tap held longer reads as hold. `bluetooth_clicker.h`. |
 | `kHoldRepeatMs` | `100` | Repeat gap. |
@@ -95,7 +94,7 @@ Everything else hardcoded at call site. Removed `Application` `static constexpr`
 - Book list title-only, most-recently-opened first, hairline before never-opened.
 - No placeholder/empty-state/error text anywhere ("No items", "No books", "Failed to open book" all gone). Empty = blank; failed book open pops silently.
 - Two rotations only: `Rotation::Deg0` (reader landscape) / `Deg90`. Reversed ones and their draw branches gone.
-- Fixed geometry: `ReaderSettings::h_padding()`/`v_padding()`; alignment, spacing, sizes from book CSS.
+- Fixed geometry: `kReaderHPadding`/`kReaderVPadding` (`PageGeometry.h`, baked); alignment, spacing, sizes from book CSS.
 
 Runtime state: `ReaderSettings::font_size_idx`, `Application::rotate_reader_`, reading position. Hyphenation always on at bake time (English; unknown tag → none); device has none.
 
@@ -111,12 +110,14 @@ resources/                 Libron.bin (reader font), sleep.mgr (wordmark)
 
 platforms/esp32/           entry + all drivers, header-only
   main.cpp                 app_main: boot gate, init order, while() loop
-  epd.h                    EInkDisplay: SPI2 panel, LUTs, refresh modes
+  epd.h                    EInkDisplay: SPI2 panel (HW CS, DC pre-callback), OTP refresh modes, Turn LUT upload + queued gray strip windows (temp band)
+  panel_lut.h              Turn/Full waveform tables from named frame counts (from 5942a93, only Turn used; host-tested)
   input.h                  Esp32InputSource: 5 ms ADC-ladder sampler, press ring
   runtime.h                Esp32Runtime: frame pacing, battery %
   sdcard.h                 sd_init(): SDSPI on SPI2, 20 MHz
   bluetooth_clicker.h      BLE HID host page-turner; compiled out by default
   wifi_sync.h              NAS sync; #ifdef WG_WIFI_SYNC
+  usb_books.h              USB book receiver (`books --usb`), own task
   font_manager.h           ESP32 FontManager: mmaps font partition
   font_partition.h         RawPartition: find + esp_partition_mmap
   default_16MB.csv         partition table
@@ -132,15 +133,16 @@ wintergreen/               portable core
     ListMenuScreen.{h,cpp} base list: header, rows, scroll, hold-repeat, fit_prefix
     HomeScreen.{h,cpp}     recents carousel; overrides draw_all_
     MainMenu.{h,cpp}       book list + Sync row + hidden-books mode
-    ReaderScreen.{h,cpp}   page index, draws baked display lists, images, .pos, pre-draw
+    ReaderScreen.{h,cpp}   page index, hands baked display lists to GrayPage, image slices, .pos
     QuickmenuScreen.{h,cpp} in-book menu + numbered chapter grid
   display/
     DrawBuffer.h           IDisplay + draw buffer + fills/spare (host-safe constants)
-    DrawBuffer.cpp         text + 1-bit blit (byte-packed, both rotations; column-major/band paths for portrait); firmware CMake only
+    DrawBuffer.cpp         text + 1-bit blit (byte-packed, both rotations; column-major path for portrait); firmware CMake only
+    GrayPage.{h,cpp}       gray reader pages: glass as hi/lo planes in buf_/spare_, new list per strip, Turn slots, dirty strips, OTP handoff
     ui_font_{large,header}.h   Iosevka Slab Medium 24/32 px
     ui_font_digits.h       Iosevka Slab Medium 40 px, 0-9 only (`make_font.py header --digits`): quick-menu chapter numbers
   content/
-    BitmapFont{,Format}.h  WGF1 reader / format doc
+    BitmapFont.h, WgfFormat.h  WGF reader (one- or two-plane) / format doc
     ContentModel.h         Paragraph/Run/TextStyle; kMaxFontSizes = 8
     TextLayout.{h,cpp}     host-only: line breaking, page fitting, next_page_start
     PageGeometry.h         host-only: reader page options the paginator bakes with
@@ -164,12 +166,12 @@ docs/                      deep-dive notes (index above)
 
 tools/
   generate_assets.py       pre-build: font/sleep flash images
-  make_font.py             TTF → WGF1 / WGFS; always hinted 1-bit (--mono accepted, no-op)
-  wgf_columns.py           append column-major glyph copy to WGFs (Libron.bin, ui_font_*.h); idempotent
+  make_font.py             TTF → WGF / WGFS; header = hinted 1-bit, bundle = two planes (light hinting + stem darkening)
+  wgf_columns.py           append column-major glyph copy to WGFs (Libron.bin two planes, ui_font_*.h one); idempotent
   check_font.py            validate bundle, ASCII-render sample
   make_sleep_image.py      PNG → MGR2
   merge-bin.sh             single flash-at-0x0 release image
-  books/                   `books` (flake package): review every EPUB in ~/Downloads/books (title/author/cover sixel/chapters), bake, one tar | ssh: WGB → `/media/books/<slug>/`, reviewed EPUB (wg.ncx, dropped = class="wgdrop") → `/media/books/.epubs/<Title> by <Author>.epub`; uploaded EPUBs then deleted locally (failed ones stay). Nothing kept on PC. Own CMakeLists, explicit sources; no arguments, no flags
+  books/                   `books` (flake package): review every EPUB in ~/Downloads/books (title/author/cover sixel/chapters), bake, one tar | ssh: WGB → `/media/books/<slug>/`, reviewed EPUB (wg.ncx, dropped = class="wgdrop") → `/media/books/.epubs/<Title> by <Author>.epub`; uploaded EPUBs then deleted locally (failed ones stay). Nothing kept on PC. Own CMakeLists, explicit sources. `--usb`: also copy books to the reader over USB (before ssh). `--reuse`: first fetch `.epubs` minus `.sync.json` `finished` into ~/Downloads/books to rebake. Neither by default
   tests/                   host checks; run.sh
 ```
 
@@ -178,14 +180,14 @@ tools/
 |---|---|
 | Boot order, deep-sleep entry, main loop | `platforms/esp32/main.cpp` |
 | Power button, auto-sleep, transitions, settings file | `Application::update` / `save_settings_` |
-| List look + scroll | `ListMenuScreen::draw_list_` + `get_visible_count_` |
+| List look + scroll | `ListMenuScreen::draw_list_` + `wintergreen_visible_from_` |
 | Page turn latency | `EInkDisplay::partial_refresh` + `ReaderScreen::render_page_` |
 | Button behavior | `input.h` thresholds → `Application::update` → screen `update()` |
 | Cover look | `HomeScreen::load_cover_`, `Application::show_book_cover_sleep_` |
 
-## USB = flashing only
-- No serial protocol, no USB driver install, no console. `serial_communication.h` (upload/delete/rename/open/inject commands, `g_index_op` handoff) removed 2026-11-10; don't re-add. Books arrive only by Wi-Fi sync.
-- No USB detection at all (removed 2026-11-11): auto-sleep and low-battery cutoff run while plugged. Flash within `kAutoSleepMinutes` of waking, or start upload and hold power. `keep_awake()` = sync only.
+## USB = flashing + book upload
+- Only protocol: `platforms/esp32/usb_books.h` (owner's call, 2026-11-19), upload-only (`books --usb`): magic `WGBK`, book folders → card via `.tmp`+rename, one 4 KB chunk in flight (driver ISR drops what exceeds its RX ring), index saved once, buttons dead + `keep_awake()` during a session. Receiver task blocks with no timeout; in-session reads bounded 5 s (only exit from a dead host). Its card writes run on its own task: `wait_panel_idle()` there waits the waveform only (never touches the UI task's SPI queue). No console, no commands, nothing read back; old `serial_communication.h` (delete/rename/open/inject, `g_index_op`) stays gone.
+- No USB detection at all (removed 2026-11-11): auto-sleep and low-battery cutoff run while plugged. Flash within `kAutoSleepMinutes` of waking, or start upload and hold power. `keep_awake()` = sync + USB upload only.
 
 ## No logging
 - No log statements anywhere (`ESP_LOGx`, `MR_LOGI`, `HEAP_LOG`; `wintergreen/HeapLog.h` deleted). Temporary ones must be removed.
@@ -197,15 +199,16 @@ Raw partitions in `platforms/esp32/default_16MB.csv`:
 
 | Partition | Offset | Size | Holds |
 |---|---|---|---|
-| `font` | `0xC90000` | 1 MB | inflated WGFS (Libron) incl. column-major copy, 573,486 B |
-| `sleep` | `0xD90000` | 128 KB | `resources/sleep.mgr` verbatim, 96,004 B |
+| `font` | `0xC90000` | 2 MB | inflated WGFS (Libron) two planes incl. column-major copy, 1,027,406 B |
+| `sleep` | `0xE90000` | 128 KB | `resources/sleep.mgr` verbatim, 96,004 B |
 
 - `tools/generate_assets.py` pre-build: inflates `resources/Libron.bin` (`[uint32 raw size][zlib]`) on build machine, copies `sleep.mgr`, writes to `$BUILD_DIR`, checks partition size, appends to `FLASH_EXTRA_IMAGES` (one esptool run, 4 images). Rewrites only on byte change.
 - Runtime: `RawPartition::map()` (`font_partition.h`) = `esp_partition_find_first` + `esp_partition_mmap`; no header/CRC/copy/inflate. `FontManager::init()` parses WGFS from mapping; `main.cpp` passes sleep mapping to `DrawBuffer::set_sleep_image()`.
 - Replaced first-boot provisioning (~15 s "Installing fonts...", font stored twice).
 - New asset = edit 3 in step: CSV, `PARTITIONS` in `generate_assets.py`, `map()` call site. Python asserts fit.
-- Font partition holds inflated 574 KB, not compressed. Intentional.
-- Every WGF (Libron bundle, `ui_font_*.h`) carries each glyph twice: row-major + column-major (`col_bitmap_offset`/`col_index_offset`, appended by `tools/wgf_columns.py`, idempotent, derived from existing bitmaps so pixels never change). Portrait glyphs = `blit_cols_` byte copy, no transpose. `make_font.py` calls `add_columns()`; hand-edited font without it still draws (transpose path).
+- Font partition holds inflated 1.03 MB, not compressed. Intentional. Grown 1 → 2 MB 2026-11-25 (two-plane Libron; sleep moved to `0xE90000`).
+- Libron = two planes per glyph (`hi` gray-or-black, `lo` black, set = ink, `lo` ⊆ `hi`), drawn only by `GrayPage`; `ui_font_*.h` stay one 1-bit plane (clear = ink). Nothing in a WGF says which: `BitmapFont::init(..., planes)`, `FontManager` passes 2.
+- Every WGF (Libron bundle, `ui_font_*.h`) carries each glyph twice: row-major + column-major (`col_bitmap_offset`/`col_index_offset`, appended by `tools/wgf_columns.py`, idempotent, derived from existing bitmaps so pixels never change). Portrait glyphs = `blit_cols_` byte copy (UI) / column copy (`GrayPage`, required: no transpose path). `make_font.py` calls `add_columns()`.
 
 ## Persistence
 No firmware-made dirs on card. Three hidden root files, one in `.hidden/`, + one per book:
@@ -257,7 +260,10 @@ nix shell nixpkgs#gcc nixpkgs#cmake nixpkgs#gnumake -c tools/tests/run.sh ~/book
 | Test | Covers |
 |---|---|
 | `json_scan_test.cpp` | sync reply scanner, every truncation of a valid reply |
-| `baked_line_test.cpp` | display-list draw pixel-identical to the PageContent draw it replaced: every font/style/valign, long words, rules, both rotations, real reader font |
+| `baked_line_test.cpp` | `GrayPage` page = independent 3-level per-pixel render of the PageContent: every font/style/valign, long words, rules, images, bar, both rotations, real reader font + kept planes = glass |
+| `gray_page_test.cpp` | `DrawBuffer` + `GrayPage` on a simulated controller (`gray_sim.h`, OTP + Turn semantics, queued windows applied late): random turns / OTP screens / repeats from a garbage glass; glass = intent after every update (handoff), no white/gray re-driven, unchanged page sends nothing (dirty strips) |
+| `lut_test.cpp` | `panel_lut.h`: 105-byte layout, HOLD idle, temperature bands + hysteresis + clamp, vendor voltages |
+| `font_test.cpp` | Libron: `lo` ⊆ `hi`, column copy = transpose of rows |
 | `paginate_book_test.cpp` | final book: every display list reads, fits `kWgbMaxPageBytes`, parses to its end, valid image keys, no blank page, records advance, `find_page` round trip, chapter pages ordered; prints max list size |
 | `book_index_test.cpp` | index parse/save round trip; thumbnail pack built only on add/remove, slots copied, re-added book re-read |
 | `blank_para_test.cpp` | empty paragraphs |

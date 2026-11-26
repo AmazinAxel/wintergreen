@@ -1,5 +1,6 @@
 #include "Application.h"
 
+#include <algorithm>
 #include <cstdio>
 #include <cstring>
 
@@ -33,8 +34,6 @@ void Application::start(DrawBuffer& buf, IRuntime& runtime) {
 
   load_settings_();
 
-  // Compile-time constant; pushed once here rather than on every frame.
-  buf.set_sunlight_fading_fix(config::kSunlightFadingFix);
   buf.set_rotation(Rotation::Deg90);
 
   // Pick the root screen. With no books at all the carousel has nothing to show
@@ -181,8 +180,9 @@ void Application::update(const ButtonState& buttons, uint32_t dt_ms, DrawBuffer&
   // let it idle at 80 MHz otherwise. Page layout and drawing take no PM lock of
   // their own — no driver is involved — so without this a page turn would run at
   // the idle clock. The hold is raised on any button activity or pending screen
-  // transition and dropped after kPerfHoldMs of quiet. All the CPU work of a turn
-  // — layout, draw, SPI, and the next page's pre-draw — happens within a frame
+  // transition and dropped once the frame's update is out (end of update()), or
+  // after kPerfHoldMs of quiet. All the CPU work of a turn
+  // — reading the display list, the strip render and the SPI windows — happens within a frame
   // or two of the press; what follows is the waveform, which the CPU only waits
   // out, so holding 160 MHz through it was ~7 mA spent on nothing. 750 ms became
   // 300, still a dozen frames past the last of that work.
@@ -240,12 +240,13 @@ void Application::update(const ButtonState& buttons, uint32_t dt_ms, DrawBuffer&
   }
 
   // Inactivity / auto-sleep tracking
-  if (buttons.current != 0 || buttons.pressed_latch != 0) {
+  if (buttons.current != 0 || buttons.pressed_latch != 0 || awake_held_) {
     inactivity_ms_ = 0;
+    awake_held_ = false;
   } else {
     inactivity_ms_ += dt_ms;
     if (config::kAutoSleepMinutes > 0) {
-      const uint32_t timeout_ms = static_cast<uint32_t>(config::kAutoSleepMinutes) * 60u * 1000u;
+      const uint32_t timeout_ms = static_cast<uint32_t>(long_sleep_ ? 5 : config::kAutoSleepMinutes) * 60u * 1000u;
       if (inactivity_ms_ >= timeout_ms) {
         do_sleep_(buf);
         return;
@@ -334,17 +335,39 @@ void Application::update(const ButtonState& buttons, uint32_t dt_ms, DrawBuffer&
   if (persist_pending_ && persist_quiet_ms_ >= kPersistQuietMs && !buf.display().is_busy() &&
       !has_pending_transition())
     flush_persist();
+
+  // This frame's update has gone out and the panel is running its waveform:
+  // nothing is left for 160 MHz to speed up, so drop the hold now rather than
+  // kPerfHoldMs later (the CPU would only wait the waveform out at full clock).
+  // A key still down (auto-repeat) or a queued transition keeps it.
+  if (perf_idle_ms_ < kPerfHoldMs && buttons.current == 0 && !has_pending_transition() &&
+      buf.display().is_busy()) {
+    perf_idle_ms_ = kPerfHoldMs;
+    runtime.set_performance_hold(false);
+  }
 }
 
 uint32_t Application::idle_wait_ms(DrawBuffer& buf) const {
-  if (!started_ || !running_ || buttons_down_ || power_armed_ || perf_idle_ms_ < kPerfHoldMs || persist_pending_ ||
-      has_pending_transition() || buf.display().is_busy())
+  // A key down (hold-repeat timing, the power hold) and a queued transition
+  // keep the frame cadence; nothing else does.
+  if (!started_ || !running_ || buttons_down_ || power_armed_ || has_pending_transition())
     return 0;
+  // A running waveform does not keep the frame cadence either: the end of it
+  // (BUSY falling) wakes the loop itself (epd.h busy_isr_ → ui_wake), so work
+  // that waits for an idle panel — the reader's read-ahead, a battery sample,
+  // the deferred card writes — runs on that edge instead of on 25 ms frames
+  // spent checking. Timers below are deadlines, not frames.
+  const bool busy = buf.display().is_busy();
+  auto due = [](uint32_t elapsed, uint32_t period) { return elapsed < period ? period - elapsed : 1; };
   uint32_t wait = UINT32_MAX;
-  if (kLowBatteryCutoffMv > 0)
-    wait = battery_poll_ms_ < kBatteryPollMs ? kBatteryPollMs - battery_poll_ms_ : 1;
+  if (perf_idle_ms_ < kPerfHoldMs)
+    wait = due(perf_idle_ms_, kPerfHoldMs);  // releases the 160 MHz hold
+  if (persist_pending_ && !busy)
+    wait = std::min(wait, due(persist_quiet_ms_, kPersistQuietMs));
+  if (kLowBatteryCutoffMv > 0 && !busy)
+    wait = std::min(wait, due(battery_poll_ms_, kBatteryPollMs));
   if (config::kAutoSleepMinutes > 0) {
-    const uint32_t timeout_ms = static_cast<uint32_t>(config::kAutoSleepMinutes) * 60u * 1000u;
+    const uint32_t timeout_ms = static_cast<uint32_t>(long_sleep_ ? 5 : config::kAutoSleepMinutes) * 60u * 1000u;
     const uint32_t left = inactivity_ms_ < timeout_ms ? timeout_ms - inactivity_ms_ : 1;
     if (left < wait)
       wait = left;

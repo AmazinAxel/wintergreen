@@ -22,7 +22,7 @@ namespace wintergreen {
 
 // Result of a glyph lookup — points into the WGF data buffer.
 struct GlyphData {
-  const uint8_t* bits;           // pointer to 1-bit BW packed bitmap (nullptr if no bitmap)
+  const uint8_t* bits;           // 1-bit bitmap, clear = ink; two-plane fonts: hi plane then lo plane, set = ink (nullptr if no bitmap)
   uint8_t bitmap_width;          // bitmap width in pixels
   uint8_t bitmap_height;         // bitmap height in pixels
   uint8_t advance_width;         // horizontal cursor advance
@@ -35,11 +35,15 @@ class BitmapFont : public IFont {
  public:
   BitmapFont() = default;
 
-  BitmapFont(const uint8_t* data, size_t size) {
-    init(data, size);
+  BitmapFont(const uint8_t* data, size_t size, int planes = 1) {
+    init(data, size, planes);
   }
 
-  void init(const uint8_t* data, size_t size) {
+  // `planes`: 1 = the UI fonts (one 1-bit bitmap per glyph, clear = ink); 2 = the
+  // reader bundle (hi = gray or black, lo = black, set = ink, lo inside hi), drawn
+  // only by GrayPage. Nothing in the file says which: the caller knows.
+  void init(const uint8_t* data, size_t size, int planes = 1) {
+    planes_ = planes == 2 ? 2 : 1;
     data_ = nullptr;
     size_ = 0;
     header_ = nullptr;
@@ -210,6 +214,10 @@ class BitmapFont : public IFont {
     return header_ ? header_->glyph_height : 0;
   }
 
+  int planes() const {
+    return static_cast<int>(planes_);
+  }
+
   uint16_t num_glyphs() const {
     return header_ ? header_->num_glyphs : 0;
   }
@@ -234,6 +242,7 @@ class BitmapFont : public IFont {
   const WgfHeader* header_ = nullptr;
   const uint8_t* bitmaps_ = nullptr;
   const uint8_t* cols_ = nullptr;
+  size_t planes_ = 1;
   StyleData styles_[4] = {};  // indexed by FontStyle enum value
 
   static int glyph_index_in_(const StyleData& sd, char32_t cp) {
@@ -261,13 +270,13 @@ class BitmapFont : public IFont {
     const uint8_t* cols = nullptr;
     if (g.bitmap_width > 0 && g.bitmap_height > 0) {
       const size_t row_bytes = static_cast<size_t>((g.bitmap_width + 7) / 8);
-      const size_t needed = row_bytes * static_cast<size_t>(g.bitmap_height);
+      const size_t needed = planes_ * row_bytes * static_cast<size_t>(g.bitmap_height);
       if (bitmaps_ && g.bitmap_offset + needed <= size_)
         bits = bitmaps_ + g.bitmap_offset;
       if (sd.col_index) {
         const uint8_t* e = sd.col_index + 4 * static_cast<size_t>(idx);
         const size_t off = e[0] | (e[1] << 8) | (e[2] << 16) | (static_cast<size_t>(e[3]) << 24);
-        const size_t col_bytes = static_cast<size_t>((g.bitmap_height + 7) / 8) * g.bitmap_width;
+        const size_t col_bytes = planes_ * static_cast<size_t>((g.bitmap_height + 7) / 8) * g.bitmap_width;
         if (static_cast<size_t>(cols_ - data_) + off + col_bytes <= size_)
           cols = cols_ + off;
       }

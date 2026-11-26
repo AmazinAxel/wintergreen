@@ -1,6 +1,10 @@
 #include "WgbPaginator.h"
 
+#include <algorithm>
+#include <climits>
 #include <cstdio>
+#include <string>
+#include <thread>
 
 #include "../PageGeometry.h"
 #include "../hyphenation/Hyphenation.h"
@@ -59,7 +63,11 @@ bool serialize_page(const PageContent& pc, const BitmapFontSet& fset, uint16_t i
     }
     out.push_back(kWgbItemLine);
     put_u16(out, static_cast<uint16_t>(baseline));
+    const size_t ink_at = out.size();  // ink_up, ink_down: known once the words are
+    out.push_back(0);
+    out.push_back(0);
     out.push_back(static_cast<uint8_t>(nwords));
+    int ink_up = 0, ink_down = 0;
     int prev_x = 0;
     for (const LayoutWord& w : ti->line.words) {
       if (w.len == 0)
@@ -84,14 +92,39 @@ bool serialize_page(const PageContent& pc, const BitmapFontSet& fset, uint16_t i
       const uint8_t flags = static_cast<uint8_t>((static_cast<uint8_t>(w.style) & 0x03) | (font << 2) |
                                                  ((static_cast<uint8_t>(w.vertical_align) & 0x03) << 5));
       // Glyph indices exactly as the device's UTF-8 draw resolved them: same
-      // font object, same style fallback, U+FFFD included.
+      // font object, same style fallback, U+FFFD included. Pens as the 1-bit
+      // draw placed them (quarter-pixel cursor, class kerning, snapped per
+      // glyph), stored as steps; the ink box as their bitmaps cover it.
+      int base = baseline;
+      if (w.vertical_align == VerticalAlign::Super)
+        base -= static_cast<int>(f->y_advance(100)) * 20 / 100;
+      else if (w.vertical_align == VerticalAlign::Sub)
+        base += static_cast<int>(f->y_advance(100)) * 20 / 100;
       glyphs.clear();
       const BitmapFont::Styled sf = f->styled(w.style);
+      int cursor_q = x * 4, prev_idx = -1, prev_pen = x;
+      int ink_l = INT_MAX, ink_r = INT_MIN;
       for (const char *p = w.text, *e = w.text + w.len; p < e;) {
         const int idx = sf.glyph_index(BitmapFont::decode_utf8(p, e));
         if (idx >= kWgbNoGlyph) {
           err = "glyph index does not fit its display-list record";
           return false;
+        }
+        cursor_q += sf.kerning_q(prev_idx, idx);
+        const int pen = (cursor_q + 2) / 4;
+        if (!glyphs.empty()) {
+          if (pen - prev_pen < -128 || pen - prev_pen > 127) {
+            err = "glyph step does not fit its display-list record";
+            return false;
+          }
+          glyphs.push_back(static_cast<uint8_t>(static_cast<int8_t>(pen - prev_pen)));
+        }
+        const GlyphData g = sf.glyph_data_at(idx);
+        if (g.bits) {
+          ink_l = std::min(ink_l, pen + g.x_offset - x);
+          ink_r = std::max(ink_r, pen + g.x_offset + g.bitmap_width - x);
+          ink_up = std::max(ink_up, baseline - (base + g.y_offset));
+          ink_down = std::max(ink_down, base + g.y_offset + g.bitmap_height - baseline);
         }
         const int v = idx < 0 ? kWgbNoGlyph : idx;
         if (v < 0x80) {
@@ -100,7 +133,19 @@ bool serialize_page(const PageContent& pc, const BitmapFontSet& fset, uint16_t i
           glyphs.push_back(static_cast<uint8_t>(0x80 | (v >> 8)));
           glyphs.push_back(static_cast<uint8_t>(v));
         }
+        cursor_q += g.advance_width;
+        cursor_q = ((cursor_q + 2) / 4) * 4;
+        prev_idx = idx;
+        prev_pen = pen;
       }
+      if (ink_r == INT_MIN)
+        ink_l = ink_r = 0;  // no ink at all
+      if (ink_r > 0xFFFF) {
+        err = "word does not fit its display-list record";
+        return false;
+      }
+      // Conservative clamp: a box only ever grows.
+      ink_l = std::max(-128, std::min(ink_l, 127));
       if (glyphs.size() > 0xFFFF) {
         err = "word does not fit its display-list record";
         return false;
@@ -116,8 +161,16 @@ bool serialize_page(const PageContent& pc, const BitmapFontSet& fset, uint16_t i
         out.push_back(flags);
         cur_flags = flags;
       }
+      out.push_back(static_cast<uint8_t>(static_cast<int8_t>(ink_l)));
+      put_u16(out, static_cast<uint16_t>(std::max(ink_r, 0)));
       out.insert(out.end(), glyphs.begin(), glyphs.end());
     }
+    if (ink_up > 0xFF || ink_down > 0xFF) {
+      err = "line does not fit its display-list record";
+      return false;
+    }
+    out[ink_at] = static_cast<uint8_t>(std::max(ink_up, 0));
+    out[ink_at + 1] = static_cast<uint8_t>(std::max(ink_down, 0));
     ++items;
   }
 
@@ -206,16 +259,26 @@ bool paginate_wgb(const char* path, const std::vector<std::vector<uint32_t>>& un
     err = "unpaginated book does not open";
     return false;
   }
-  WgbParagraphs paras(reader);
-  const ImageSizeQuery size_fn = make_image_size_query(paras);
   const HyphenationLang lang = detect_language(reader.metadata().language);
 
   std::vector<WgbPage> pages[kWgbLayouts];
   std::vector<uint8_t> lists[kWgbLayouts];  // every page's display list, back to back
   std::vector<uint32_t> chapter_pages[kWgbLayouts];
-  std::vector<uint8_t> dl;
+  std::string errs[kWgbLayouts];
 
-  for (uint8_t l = 0; l < kWgbLayouts; ++l) {
+  // The layouts are independent: one thread each. Each opens its own reader,
+  // since WgbParagraphs caches paragraphs (mutable, not shareable); fonts and
+  // hyphenation tables are read-only. Output is the same as one at a time.
+  auto bake = [&](uint8_t l) -> bool {
+    std::string& err = errs[l];
+    WgbReader reader;
+    if (!reader.open(path)) {
+      err = "unpaginated book does not open";
+      return false;
+    }
+    WgbParagraphs paras(reader);
+    const ImageSizeQuery size_fn = make_image_size_query(paras);
+    std::vector<uint8_t> dl;
     BitmapFontSet fset = fonts;
     fset.set_base_size_index(l / 2);
     TextLayout engine;
@@ -281,7 +344,20 @@ bool paginate_wgb(const char* path, const std::vector<std::vector<uint32_t>>& un
         idx = i;
       chapter_pages[l].push_back(idx);
     }
-  }
+    return true;
+  };
+  bool baked[kWgbLayouts] = {};
+  std::thread workers[kWgbLayouts - 1];
+  for (uint8_t l = 1; l < kWgbLayouts; ++l)
+    workers[l - 1] = std::thread([&, l] { baked[l] = bake(l); });
+  baked[0] = bake(0);
+  for (std::thread& t : workers)
+    t.join();
+  for (uint8_t l = 0; l < kWgbLayouts; ++l)
+    if (!baked[l]) {
+      err = errs[l];
+      return false;
+    }
 
   // --- Write the final file: no paragraph stream ------------------------------
   // The image bitmaps sit contiguously right after the paragraphs, so dropping

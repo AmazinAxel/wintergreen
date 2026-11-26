@@ -31,13 +31,15 @@ stream: header, image bitmaps, image refs, metadata, page tables, display lists.
 device has no layout engine, hyphenation or paragraph parser. A spine file still always
 ends a page. See docs/display.md "Pages are fully baked".
 
-Size: text is stored once per layout, so a book is ~4× its text plus ~2 B per word per
-layout (x as a 1-byte delta, flags only when they change; was 4 B). Word text is glyph
-indices resolved at bake time (`wgb_read_glyph`, ASCII 1 B, never longer than UTF-8): the
-device does no UTF-8 decode and no range search per glyph. Project Hail Mary:
-4.8 MB (was 6.0), Dune omnibus 28.8 MB (was 36.1). Card and sync cost only; RAM per page
-is one ≤ 4 KB buffer, largest list 705 B. Sharing the text across layouts was rejected
-(`docs/history.md`).
+Size: text is stored once per layout. Per word per layout: x as a 1-byte delta, a length
+byte, flags only when they change, and 3 bytes of ink columns; per glyph its index
+(`wgb_read_glyph`, ASCII 1 B, never longer than UTF-8) plus, after the first, a 1-byte pen
+step; per line 2 bytes of ink rows. The device does no UTF-8 decode, no range search and
+no kerning per glyph. The pen steps and ink boxes (2026-11-25) roughly double a list
+against the 2026-11-12 measurements (Project Hail Mary 4.8 MB, Dune omnibus 28.8 MB,
+largest list 705 B); not re-measured yet (`paginate_book_test` prints the largest list).
+Card and sync cost only; RAM per page is one ≤ 4 KB buffer. Sharing the text across layouts
+was rejected (`docs/history.md`).
 
 **Rebake rule: font bundle, `TextLayout`, `PageGeometry.h` or hyphenation change =
 rebake the library, same commit.** Unchecked (no version); a stale book draws what it
@@ -49,15 +51,20 @@ Baked pages removed the load unit instead.
 
 **Images are rasterised by the converter, not decoded on the device.** `WgbImageRef` is
 `{data_offset, data_size, width, height}` (12 bytes) addressing a raw 1-bit bitmap inside the
-WGB: `(width+7)/8` bytes per row, MSB first, bit clear = ink, followed by a portrait copy in
-8-row bands (`wgb_image_bands_bytes`: band b = `width` bytes, one per column, rows 8b..8b+7,
-top MSB). `data_size` is exactly rows + bands (`WgbWriter::set_image_data` builds both). The
-reader reads rows in landscape and bands in portrait (`blit_1bit_bands`, a byte copy per
-column); a page's slice of an image is one contiguous read either way.
+WGB: `(width+7)/8` bytes per row, MSB first, bit clear = ink, followed by a column-major
+portrait copy (`wgb_image_cols_bytes`: column c = `ceil(height/8)` bytes, top MSB; was 8-row
+bands until 2026-11-25). `data_size` is exactly rows + columns (`WgbWriter::set_image_data`
+builds both). `GrayPage` renders a page per 16-row strip, which is image rows in landscape
+and image columns in portrait, so a strip's part of an image is one contiguous read either
+way (`ReaderScreen::read_image`).
+
+**Lines are baked for the strip renderer** (2026-11-25, WgbFormat.h): ink rows per line,
+ink columns per word, an i8 pen step per glyph after the first (the quarter-pixel cursor,
+class kerning and per-glyph snap resolved at bake time). The device never kerns.
 
 The converter decodes the source JPEG/PNG, scales it to fit `kWgbImageBoxW × kWgbImageBoxH`
 (480 × 772 — the portrait panel width and the page height less its vertical padding) and
-dithers it, all on the build machine. The device seeks and blits rows. Consequences:
+dithers it, all on the build machine. The device seeks and copies bits. Consequences:
 
 - **`width`/`height` in the table are the drawn dimensions**, not the source's, because
   `scale_image()` never enlarges. In portrait the blit is 1:1; a landscape page, whose
@@ -66,7 +73,7 @@ dithers it, all on the build machine. The device seeks and blits rows. Consequen
 - **The image table beats the EPUB's declared width/height.** `resolve_inline_image()` asks
   `make_image_size_query()` first and falls back to `attr_width`/`attr_height` only when
   there is no raster.
-- **`ReaderScreen::draw_image_` reads through `WgbReader::file()`**, the handle the book is
+- **`ReaderScreen::read_image` reads through `WgbReader::file()`**, the handle the book is
   already open on, so a page with three figures does not open the book three times. Every
   `WgbReader` read seeks first, so borrowing the handle cannot disturb its position.
 - There is **no image cache on the card**.
@@ -85,19 +92,11 @@ existed only to resolve hyperlinks. Dropping them also removed the anchor `.tmp`
 `WgbWriter` streamed during every conversion, and the header's `anchor_offset` with it (28 →
 24 bytes).
 
-Two things about the converter that matter on a slow machine (it is meant to run on a
-Raspberry Pi):
-
-- **It converts books in parallel**, one per hardware thread. Each conversion owns its `Book`,
-  its two 48 KB scratch buffers and its own output directory, and the pipeline holds no
-  mutable global state, so only the reporting needs a mutex. Output is byte-identical to the
-  single-threaded result.
-- **The script only rebuilds when the binary is stale.** Converting three books takes 0.15 s;
-  a cold compile of the converter is ~18 s here and minutes on a Pi, so the build, not the
-  conversion, was what you waited for. `needs_build()` compares the binary's mtime against
-  every source it is built from.
-
-The converter links only the content pipeline. `WgbConverter` includes `DrawBuffer.h` purely
+`books` converts one book at a time, between reviews; within a book the paginator bakes
+the four layouts on four threads (`paginate_wgb`, one reader each: `WgbParagraphs` caches;
+TSan-clean and byte-identical across runs, 2026-11-25). The review is interactive; the
+conversion is a fraction of a second against it. The converter links only the content
+pipeline. `WgbConverter` includes `DrawBuffer.h` purely
 for the `kWidth`/`kHeight` constants.
 
 Output is one folder per book:
@@ -249,27 +248,19 @@ art, logos and text.
 
 ## Books on the card
 
-Two shapes are recognised, both found by `BookIndex`'s recursive scan (which skips
+One shape is recognised, found by `BookIndex`'s recursive scan (which skips
 dot-directories, so the state files and any `.hidden/` folder are never picked up as books):
+`<book name>/book.wgb`, opened **in place**. Metadata comes from the WGB itself. Three
+covers sit beside it (`CoverPaths.cpp`: siblings of the WGB, never derived from its stem,
+since every book is literally `book.wgb`). **All** must be written by `books` — the device
+cannot generate any of them, because there is no EPUB on the card. Each is optional at read
+time: every consumer falls back to a smaller one, and a missing cover is silent everywhere.
+`book.pos` is written beside them when the reader closes. A `.epub` on the card is ignored.
 
-- `<book name>/book.wgb` — a converted book, opened **in place**. Metadata comes from the WGB
-  itself. Three covers sit beside it. **All** must be written by the converter — the device
-  cannot generate any of them, because there is no EPUB on the card to extract from. Each is
-  optional at read time: every consumer falls back to a smaller one. `book.pos` is written
-  beside them when the reader closes.
-- `<name>.epub` — a source, converted on demand into `.wintergreen/cache/<stem>/`.
-
-Two traps, both hit during the switch to converted books. `cover_bin_path()` derives from the
-file *stem*, and every converted book is literally named `book.wgb`, so all of them mapped to
-`cache/book/cover.bin` and collided — it now returns the WGB's sibling instead. And
-`ensure_cover_bin()` must return early for a WGB: there is no EPUB to extract from.
-
-A third, from the MRB → WGB rename: **that "is this a converted book" test is a literal
-extension comparison**, and `CoverPaths.cpp`'s copy was still matching `.mrb`. Every book
-therefore took the EPUB-cache branch and every cover path resolved to one nonexistent shared
-path. No cover appeared anywhere, and nothing logged a thing: a missing cover file is a
-supported state everywhere it is read. **If covers vanish library-wide, check `is_wgb_`
-first.**
+**The book test is a literal extension comparison** (`BookIndex::is_wgb_path`, `.wgb`). A
+stale copy of it (still matching `.mrb` after the rename) once made every cover path resolve
+to one nonexistent file with nothing logged: **if covers vanish library-wide, check that
+test first.**
 
 `BookIndex` is a singleton holding the scanned book list plus reading stats, backed by a
 `StringPool`. `MainMenu` rescans whenever the loaded index is **empty**, not just when it
@@ -297,56 +288,50 @@ Two fonts, both compiled from TTF by `tools/make_font.py`, and **no way to add a
 serial `FONT` partition upload and `SDFN` (`/sdcard/fonts/`) sideload paths were deliberately
 removed.
 
-- **Reader: Libron** (v0.25, github.com/nicoverbruggen/libron), 2 sizes (32/36 px), all four styles, built
-  `--mono`. Lives in the `font` flash partition, written by esptool at upload time and mmapped
-  at boot. A font change takes effect on the next upload.
-- **UI: Iosevka Slab Medium**, built `--mono`, one size per header in `display/ui_font_*.h`
-  (14/24/32 px → small/large/header). There is no medium *size*. It was Bold until the weight
-  was dropped — Bold at 14 px thresholds into near-solid blocks, and the mono hinting is what
-  keeps Medium's thinner stems from breaking up. Dropping the gray planes roughly halved each
-  header (small: 20,332 → 10,099 bytes).
+- **Reader: Libron** (v0.25, github.com/nicoverbruggen/libron), 2 sizes (32/36 px), all four styles,
+  **two planes per glyph** (2026-11-25, from `5942a93`): `hi` = gray or black, `lo` = black, bit set
+  = ink, `lo` ⊆ `hi`; `FT_LOAD_TARGET_LIGHT` + stem darkening, coverage quantised at
+  `GRAY_THRESHOLD` 64 / `BLACK_THRESHOLD` 168. Drawn only by `GrayPage` (docs/display.md "Gray
+  reader pages"). Nothing in the file says it is two-plane: `FontManager` inits the bundle with
+  `planes = 2`, on the device and in `books`. Lives in the `font` flash partition (2 MB; the
+  inflated bundle is 1,027,406 B), written by esptool at upload time and mmapped at boot. A font
+  change takes effect on the next upload, and needs a rebake (metrics changed with the hinting).
+- **UI: Iosevka Slab Medium**, hinted 1-bit, one size per header in `display/ui_font_*.h`:
+  24 px `large`, 32 px `header`, 40 px `digits` (0-9 only, the quick menu's chapter numbers).
+  It was Bold until the weight was dropped — Bold thresholds into near-solid blocks, and the
+  mono hinting is what keeps Medium's thinner stems from breaking up.
 
-`ReaderSettings::kFontSizeNames` and `kNumFontSizePresets` **must** mirror the `--sizes` list
-passed to `make_font.py`, in order. They had drifted to eight entries reading
-20/24/26/28/30/32/34/36 against a five-size bundle, so the quick menu labelled the third
-preset "26" while rendering 28 — every size above the second was mislabelled. Indices 5–7 were
-unreachable only because `QuickmenuScreen::on_select` clamps the cycle to
-`font_set()->num_fonts()`; `Application::load_settings_` had no such clamp and now checks
-`kNumFontSizePresets` rather than the array capacity `kMaxFontSizes`.
+`ReaderSettings::kNumFontSizePresets` (= `kWgbFontSizes`, 2) **must** match the `--sizes`
+list passed to `make_font.py`: every book carries one baked page table per size and
+orientation. The quick menu labels them Small / Large (32 / 36 px).
 
-WGF1 format is documented in `content/WgfFormat.h`, but three things that matter are **not** in
-that header and were recovered by decoding the old shipped Literata — `make_font.py`'s
-docstring is the real reference:
+WGF format is documented in `content/WgfFormat.h`; `make_font.py`'s docstring is the
+reference for what the header does not say:
 
-- `MbfGlyph::advance_width` is in **quarter-pixels**, not pixels.
-- Antialiasing is **5** levels, not 4, encoded across the three planes as `(bw, msb, lsb)`:
-  white `(1,0,0)`, light `(1,0,1)`, mid `(0,1,0)`, dark `(0,1,1)`, black `(0,0,0)`. The BW
-  plane draws where its bit is **clear**; the gray planes draw where theirs is **set**. So
-  `(msb,lsb)` is a lightening modifier, not a magnitude.
+- `advance_width` is in **quarter-pixels**, not pixels.
+- UI fonts: one plane, bit **clear** = ink. Reader bundle: two planes per glyph (`hi` then
+  `lo`), bit **set** = ink, `lo` ⊆ `hi`. Nothing in the file says which (no magic):
+  `BitmapFont::init(..., planes)`.
 - The reader font asset is `[uint32 uncompressed size][zlib stream]` wrapping a WGFS
   bundle: `[num][pad:3][num × uint32][WGF...]`.
 
-The two old gray-plane header fields are now `col_bitmap_offset` / `col_index_offset`: a
-column-major copy of every glyph plus a u32-per-glyph index (`WgfFormat.h`), appended by
+`col_bitmap_offset` / `col_index_offset` (once the old gray-plane fields) address a
+column-major copy of every glyph plus a u32-per-glyph index, appended by
 `tools/wgf_columns.py` (from the existing bitmaps, so pixels never change; idempotent;
-`make_font.py` calls it). Portrait text uses it (`blit_cols_`), landscape the row-major
-bitmaps. Every font is built with `--mono`: `FT_LOAD_TARGET_MONO`, no gray planes.
+`make_font.py` calls it; two-plane glyphs = all hi columns, then all lo columns). Portrait
+text uses it (`blit_cols_` for the UI, `GrayPage` for the reader, required there),
+landscape the rows.
 
-That followed from the reader drawing only the BW plane. The BW plane is not a 50%
-threshold — `LEVEL_BITS` puts level 2 (37.5% coverage) in the ink plane, so BW-only text was
-fattened by a ring of barely-covered edge pixels, and `FT_LOAD_TARGET_LIGHT` left stems
-straddling pixel boundaries, so that ring was uneven from glyph to glyph. Mono hinting snaps
-stems to the grid: same total advance widths, uniform stems, clean curves. It also cut the
-asset from 296 KB to 122 KB compressed.
-
-Don't "fix" the AA path to match — the 5-level encoding and its 37.5% threshold are correct
-*for grayscale output*, where the lightening pass pulls those edge pixels back. They only
-misbehave when the gray planes are thrown away.
+**Why the UI stayed mono.** UI screens are 1-bit on the OTP waveforms, so a UI glyph is one
+threshold. Thresholding an antialiased render (`FT_LOAD_TARGET_LIGHT`) leaves stems
+straddling pixel boundaries, uneven from glyph to glyph; mono hinting snaps them to the
+grid: same advances, uniform stems, clean curves. The reader shows real gray, so it takes
+the light render with stem darkening instead.
 
 `tools/check_font.py` parses a bundle (compressed or raw) exactly the way `BitmapFont.h` does and
 ASCII-art renders a sample string. Run it after regenerating a font — a structurally broken
-font renders blank on device with no error. Its header line reports `gray=yes|no`, the quick
-check that `--mono` took effect.
+font renders blank on device with no error. Its header line reports `cols=yes|no` (the
+column copy the portrait path needs).
 
 Glyph coverage is per-font and sparse. A font that parses fine can still be missing the glyphs
 for a given string, in which case it renders blank rather than falling back — check
@@ -358,36 +343,36 @@ near-equivalents (U+2010 hyphen → ASCII `-`, and so on); the rest are blank. E
 rather than accepting a blank glyph. There is **no wintergreen logotype font** — the wordmark
 is drawn in the regular UI font.
 
-Glyph lookup itself is a binary search over the WGF1 range table
+Glyph lookup itself is a binary search over the WGF range table
 (`BitmapFont::find_glyph_index_in`), so `char_width` is O(log ranges) and needs no cache.
 UI strings still go through it; reader pages do not (glyph indices are baked into the
 display lists).
 
-Regenerating (needs freetype-py + fontTools, absent from the PlatformIO interpreter, hence
-nix-shell):
+Regenerating (needs freetype-py + fontTools, absent from the PlatformIO interpreter):
 
 ```
-nix-shell -p 'python3.withPackages(ps: [ps.freetype-py ps.fonttools])' --run '
-  python3 tools/make_font.py bundle --name Libron --mono \
+nix shell --impure --expr 'with import <nixpkgs> {}; python3.withPackages (ps: [ps.freetype-py ps.fonttools])' -c \
+  python3 tools/make_font.py bundle --name Libron \
     --sizes 32,36 --line-height 150 \
     --regular Libron-Regular.ttf --bold Libron-Bold.ttf \
     --italic Libron-Italic.ttf --bold-italic Libron-BoldItalic.ttf \
-    --out resources/Libron.bin'
+    --out resources/Libron.bin
 ```
 
-`--line-height` matters: the reader multiplies `y_advance` by the user's setting, so a font's
-native leading decides how that setting feels. Atkinson's own metrics are 1.25× the em where
-Literata's were 1.55×, which reads cramped; 150% restores it. The extra leading is split above
-and below the text rather than all landing under the baseline.
+`--line-height` matters: the paginator spaces lines from `y_advance` (scaled by the book's
+CSS line height), so a font's native leading decides how every book reads. Some families'
+own metrics are 1.25× the em where Literata's were 1.55×, which reads cramped; 150%
+restores it. The extra leading is split above and below the text rather than all landing
+under the baseline.
 
 A UI font is one command per header, e.g.
 
 ```
-nix-shell -p 'python3.withPackages(ps: [ps.freetype-py ps.fonttools])' --run '
-  python3 tools/make_font.py header --mono \
+nix shell --impure --expr 'with import <nixpkgs> {}; python3.withPackages (ps: [ps.freetype-py ps.fonttools])' -c \
+  python3 tools/make_font.py header \
     --regular …/SGr-IosevkaSlab-Medium.ttc:0 \
     --name ui_large --size 24 --symbol ui_large \
-    --out wintergreen/display/ui_font_large.h'
+    --out wintergreen/display/ui_font_large.h
 ```
 
 The TTC face index matters: face **0** is Iosevka Slab, and the rest are the Extended and

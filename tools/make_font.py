@@ -10,30 +10,37 @@ Produces the two shapes the firmware consumes:
   header  UI font: a bare WGF1 blob emitted as a C array, matching
           wintergreen/display/ui_font_*.h.
 
-Needs freetype-py, which is not in the PlatformIO interpreter. Run it under:
+Needs freetype-py and fontTools, which are not in the PlatformIO interpreter:
 
-  nix-shell -p 'python3.withPackages(ps: [ps.freetype-py])' --run '...'
+  nix shell --impure --expr 'with import <nixpkgs> {}; python3.withPackages (ps: [ps.freetype-py ps.fonttools])' -c python3 tools/make_font.py ...
 
-Format notes that are not in WgfFormat.h and were recovered from the
-shipped Literata:
+Format notes (WgfFormat.h has the layout):
 
   * advance_width is in QUARTER-pixels, not pixels.
-  * The BW plane draws where its bit is CLEAR; untouched BW bits must be 1.
-    The column-major copy for portrait (tools/wgf_columns.py) is appended last.
+  * UI fonts (header): one BW plane that draws where its bit is CLEAR;
+    untouched BW bits must be 1.
+  * Reader font (bundle): two 1-bit planes per glyph, back to back at
+    bitmap_offset: `hi` (gray or black) then `lo` (black), each ceil(w/8)
+    bytes per row, MSB first, bit SET = ink; lo is a subset of hi. Drawn only
+    by GrayPage on the Turn LUT (white / gray / black).
+  * The column-major copy for portrait (tools/wgf_columns.py) is appended last.
 
 Rendering choices, for quality:
 
-  * FT_LOAD_TARGET_MONO, BW plane only. The device draws nothing else, and
-    thresholding an antialiased render left stems straddling pixel boundaries
-    (blurry and uneven), where mono hinting snaps them to the grid. It also drops
-    two thirds of the bitmap data. The cost is integer advances — the hinter
-    rounds them — so the quarter-pixel field carries whole pixels. The old
-    5-level gray path is gone; `--mono` is still accepted and changes nothing.
+  * UI fonts: FT_LOAD_TARGET_MONO. Thresholding an antialiased render left
+    stems straddling pixel boundaries (blurry and uneven), where mono hinting
+    snaps them to the grid. The cost is integer advances — the hinter rounds
+    them — so the quarter-pixel field carries whole pixels.
+  * Reader font: FT_LOAD_TARGET_LIGHT (vertical metrics snapped by the
+    autofitter, horizontal shapes smooth, 8-bit coverage) quantised to white /
+    gray / black at GRAY_THRESHOLD and BLACK_THRESHOLD, with stem darkening on
+    so the antialiased weight matches the mono-hinted text.
   * Class kerning is extracted from GPOS (and the legacy kern table) and packed
     losslessly: glyphs with identical kerning rows share a class.
 """
 
 import argparse
+import ctypes
 import os
 import struct
 import sys
@@ -88,12 +95,50 @@ class Glyph:
         self.height = 0
         self.x_off = 0
         self.y_off = 0
-        self.bw = b""
+        self.bw = b""  # UI: the BW plane; reader: hi plane then lo plane
 
 
-# Always hinted 1-bit: the device draws only the BW plane, and the gray-plane
-# path that once lived here (FT_LOAD_TARGET_LIGHT + 5-level binning) is gone.
 MONO_LOAD_FLAGS = freetype.FT_LOAD_RENDER | freetype.FT_LOAD_TARGET_MONO
+GRAY_LOAD_FLAGS = freetype.FT_LOAD_RENDER | freetype.FT_LOAD_TARGET_LIGHT
+
+# Coverage (0-255) at or above which a pixel is gray, and black. Tuned by eye
+# on the simulated panel against the mono weight (2026-11-19); retune on the
+# device if the panel's gray reads differently.
+GRAY_THRESHOLD = 64
+BLACK_THRESHOLD = 168
+
+_darkening_set = False
+
+
+def enable_stem_darkening():
+    """Autofitter stem darkening, process-wide (FreeType property)."""
+    global _darkening_set
+    if _darkening_set:
+        return
+    off = ctypes.c_int(0)
+    err = freetype.raw.FT_Property_Set(freetype.get_handle(), b"autofitter", b"no-stem-darkening",
+                                       ctypes.byref(off))
+    if err:
+        sys.exit(f"FT_Property_Set(no-stem-darkening) failed: {err}")
+    _darkening_set = True
+
+
+def quantise(coverage, w, h, pitch):
+    """8-bit coverage rows -> (hi, lo) planes, packed MSB first, set = ink."""
+    stride = (w + 7) // 8
+    hi = bytearray(stride * h)
+    lo = bytearray(stride * h)
+    for row in range(h):
+        src = row * pitch
+        dst = row * stride
+        for col in range(w):
+            c = coverage[src + col]
+            if c >= GRAY_THRESHOLD:
+                m = 0x80 >> (col & 7)
+                hi[dst + (col >> 3)] |= m
+                if c >= BLACK_THRESHOLD:
+                    lo[dst + (col >> 3)] |= m
+    return bytes(hi), bytes(lo)
 
 
 def glyph_index(face, cp):
@@ -104,12 +149,12 @@ def glyph_index(face, cp):
     return gi
 
 
-def render_glyph(face, cp):
-    """Rasterize one codepoint into the BW plane. Returns None if absent."""
+def render_glyph(face, cp, two_plane=False):
+    """Rasterize one codepoint (BW plane, or hi + lo planes). None if absent."""
     gi = glyph_index(face, cp)
     if gi == 0:
         return None
-    face.load_glyph(gi, MONO_LOAD_FLAGS)
+    face.load_glyph(gi, GRAY_LOAD_FLAGS if two_plane else MONO_LOAD_FLAGS)
     slot = face.glyph
     bmp = slot.bitmap
 
@@ -122,6 +167,15 @@ def render_glyph(face, cp):
 
     if g.width == 0 or g.height == 0:
         g.width = g.height = 0
+        return g
+
+    if two_plane:
+        hi, lo = quantise(bmp.buffer, g.width, g.height, bmp.pitch)
+        if not any(hi):
+            # Coverage too faint for gray: draw nothing, keep the advance.
+            g.width = g.height = 0
+            return g
+        g.bw = hi + lo
         return g
 
     stride = (g.width + 7) // 8
@@ -138,12 +192,12 @@ def render_glyph(face, cp):
     return g
 
 
-def build_style(face, px, blank_advance_q):
+def build_style(face, px, blank_advance_q, two_plane=False):
     """Rasterize every codepoint for one style. Returns (glyphs, missing)."""
     glyphs = []
     missing = []
     for cp in codepoints():
-        g = render_glyph(face, cp)
+        g = render_glyph(face, cp, two_plane)
         if g is None:
             missing.append(cp)
             g = Glyph()
@@ -328,12 +382,15 @@ def face_metrics(face, line_height_pct=None):
     return baseline, target
 
 
-def build_wgf(faces, px, name, kern_sources=None, line_height_pct=None):
+def build_wgf(faces, px, name, kern_sources=None, line_height_pct=None, two_plane=False):
     """Compile one WGF1 blob for a single pixel size.
 
     faces: dict of style -> freetype.Face (regular is required).
     kern_sources: dict of style -> (pairs, upem) from extract_kern_pairs.
+    two_plane: the reader bundle's hi + lo planes instead of the UI BW plane.
     """
+    if two_plane:
+        enable_stem_darkening()
     for f in faces.values():
         f.set_pixel_sizes(0, px)
 
@@ -349,7 +406,7 @@ def build_wgf(faces, px, name, kern_sources=None, line_height_pct=None):
 
     styles = {}
     for style, face in faces.items():
-        glyphs, missing = build_style(face, px, default_advance_q)
+        glyphs, missing = build_style(face, px, default_advance_q, two_plane)
         styles[style] = glyphs
         if missing:
             sample = " ".join(f"U+{c:04X}" for c in missing[:8])
@@ -474,7 +531,7 @@ def build_wgf(faces, px, name, kern_sources=None, line_height_pct=None):
 
     assert len(out) == bitmap_data_offset
     out += bw_pool
-    return add_columns(bytes(out))
+    return add_columns(bytes(out), planes=2 if two_plane else 1)
 
 
 def open_face(spec):
@@ -546,7 +603,7 @@ def main():
         p.add_argument(
             "--mono",
             action="store_true",
-            help="accepted for compatibility; rendering is always hinted 1-bit.",
+            help="accepted for compatibility; changes nothing (header = hinted 1-bit, bundle = two planes).",
         )
 
     b = sub.add_parser("bundle", help="reader font: compressed WGFS bundle")
@@ -594,7 +651,7 @@ def main():
     sizes = [int(s) for s in args.sizes.split(",")]
     blobs = []
     for px in sizes:
-        blob = build_wgf(faces, px, args.name, kern_sources, args.line_height)
+        blob = build_wgf(faces, px, args.name, kern_sources, args.line_height, two_plane=True)
         print(f"  {px}px -> {len(blob):,} bytes", file=sys.stderr)
         blobs.append(blob)
 

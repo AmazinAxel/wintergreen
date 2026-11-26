@@ -832,7 +832,8 @@ inline void poll() {
   }
 }
 
-// A sync in flight: the main loop keeps its frame cadence.
+// A sync in flight: buttons are dead (main.cpp). The loop keeps no cadence for
+// it; the worker ui_wake()s at every hand-over and at the end.
 inline bool active() {
   return g_busy;
 }

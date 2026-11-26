@@ -472,7 +472,7 @@ uint16_t WgbWriter::add_image_ref(uint32_t local_header_offset, uint16_t width, 
   return idx;
 }
 
-// Rows as decoded, then the portrait band copy (WgbFormat.h, WgbImageRef).
+// Rows as decoded, then the portrait column copy (WgbFormat.h, WgbImageRef).
 void WgbWriter::set_image_data(uint16_t idx, std::vector<uint8_t>&& data) {
   if (idx >= image_data_.size())
     return;
@@ -483,12 +483,13 @@ void WgbWriter::set_image_data(uint16_t idx, std::vector<uint8_t>&& data) {
     return;
   }
   const size_t stride = (w + 7) / 8;
-  data.resize(rows + wgb_image_bands_bytes(w, h), 0xFF);
-  uint8_t* bands = data.data() + rows;
+  const size_t cs = (h + 7) / 8;
+  data.resize(rows + wgb_image_cols_bytes(w, h), 0xFF);
+  uint8_t* cols = data.data() + rows;
   for (uint32_t y = 0; y < h; ++y)
     for (uint32_t x = 0; x < w; ++x)
       if (!((data[y * stride + (x >> 3)] >> (7 - (x & 7))) & 1))
-        bands[(y >> 3) * w + x] &= static_cast<uint8_t>(~(0x80u >> (y & 7)));
+        cols[x * cs + (y >> 3)] &= static_cast<uint8_t>(~(0x80u >> (y & 7)));
   image_data_[idx] = std::move(data);
 }
 

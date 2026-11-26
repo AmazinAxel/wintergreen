@@ -32,8 +32,9 @@ class Wgf:
         self.d, self.b = d, base
         (self.glyph_h, self.baseline, self.yadv, self.dadv,
          self.style_flags, self.n_ranges, self.n_glyphs, self.nominal) = struct.unpack_from("<BBBBBHHH", d, base)
+        # The last two fields are the column copy (WgfFormat.h), not gray planes.
         (self.kern_len, self.bmp_off, self.bold_off, self.italic_off,
-         self.bi_off, self.kern_off, self.lsb_off, self.msb_off) = struct.unpack_from("<8I", d, base + 11)
+         self.bi_off, self.kern_off, self.col_off, self.col_index) = struct.unpack_from("<8I", d, base + 11)
         self.ul_pos, self.ul_th = struct.unpack_from("<bB", d, base + 43)
 
     def style(self, which):
@@ -100,30 +101,26 @@ def check(m, label):
                 errs.append(f"{nm}: kerning_length {kl} != computed {need}")
             if base + kl > end:
                 errs.append(f"{nm}: kerning block overruns file")
-        # every glyph's bitmap must lie inside each plane
+        # every glyph's two planes (hi then lo, set = ink) must lie inside the file
         for i in range(ng):
             off, adv, bw, bh, xo, yo, _ = struct.unpack_from("<IBBBbbB", m.d, g + 10 * i)
             if bw == 0 or bh == 0:
                 continue
-            n = ((bw + 7) // 8) * bh
-            for plane_off, pn in ((m.bmp_off, "BW"), (m.lsb_off, "LSB"), (m.msb_off, "MSB")):
-                if not plane_off:
-                    continue
-                if m.b + plane_off + off + n > end:
-                    errs.append(f"{nm}: glyph {i} {pn} bitmap overruns file")
-                    break
+            n = 2 * ((bw + 7) // 8) * bh
+            if m.b + m.bmp_off + off + n > end:
+                errs.append(f"{nm}: glyph {i} bitmap overruns file")
     blank = sum(1 for cp in (0x41, 0x61, 0x30, 0x2E, 0x2C, 0x2D) if not (m.glyph(0, cp) or (None, (0,) * 7))[1][2])
     if blank:
         errs.append(f"{blank} of 6 essential glyphs (A a 0 . , -) have no bitmap")
     print(f"{label}: nominal={m.nominal} baseline={m.baseline} yadv={m.yadv} "
           f"glyph_h={m.glyph_h} styles={[n for i, n in enumerate(STYLE_NAMES) if m.style(i)]} "
-          f"kern={'yes' if m.kern_len else 'no'} gray={'yes' if m.lsb_off else 'no'}")
+          f"kern={'yes' if m.kern_len else 'no'} cols={'yes' if m.col_off else 'no'}")
     for e in errs:
         print(f"   ERROR {e}")
     return not errs
 
 def draw(m, text):
-    """ASCII-art the string, using the same 5 levels the panel gets."""
+    """ASCII-art the string in the three levels a gray reader page gets."""
     pen_q = 0
     cells = {}
     prev = None
@@ -141,11 +138,9 @@ def draw(m, text):
             for col in range(bw):
                 byte = row * stride + (col >> 3)
                 mask = 1 << (7 - (col & 7))
-                b = 1 if not m.bmp_off else (m.d[m.b + m.bmp_off + off + byte] & mask) != 0
-                l = (m.d[m.b + m.lsb_off + off + byte] & mask) != 0 if m.lsb_off else 0
-                s = (m.d[m.b + m.msb_off + off + byte] & mask) != 0 if m.msb_off else 0
-                lvl = {(1, 0, 0): 0, (1, 0, 1): 1, (0, 1, 0): 2, (0, 1, 1): 3, (0, 0, 0): 4}.get(
-                    (int(b), int(s), int(l)))
+                hi = (m.d[m.b + m.bmp_off + off + byte] & mask) != 0
+                lo = (m.d[m.b + m.bmp_off + off + stride * bh + byte] & mask) != 0
+                lvl = 4 if lo else 2 if hi else 0
                 if lvl:
                     cells[(x + xo + col, m.baseline + yo + row)] = lvl
         pen_q += adv

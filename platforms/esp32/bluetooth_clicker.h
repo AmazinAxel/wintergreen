@@ -71,6 +71,8 @@ inline void queue_press(uint8_t btn) {
 // HID keyboard usage IDs (HID Usage Table, keyboard page 0x07).
 inline constexpr uint8_t kKeyRightArrow = 0x4F;
 inline constexpr uint8_t kKeyLeftArrow = 0x50;
+inline constexpr uint8_t kKeyDownArrow = 0x51;
+inline constexpr uint8_t kKeyUpArrow = 0x52;
 
 // One mapping everywhere: right = Button3, left = Button2. In the reader
 // Button3 is next page (ReaderScreen: logical_next_front, both orientations);
@@ -256,8 +258,14 @@ inline bool parse_mac(const char* s, uint8_t out[6]) {
 inline void handle_report(const uint8_t* data, uint16_t len) {
   uint8_t found = 0;
   for (uint16_t i = 0; i < len; ++i) {
-    if (data[i] == kKeyLeftArrow || data[i] == kKeyRightArrow) {
-      found = data[i];
+    // Up = Left (previous), Down = Right (next): normalised here so the hold
+    // path and g_last_key only ever see the two left/right codes.
+    if (data[i] == kKeyLeftArrow || data[i] == kKeyUpArrow) {
+      found = kKeyLeftArrow;
+      break;
+    }
+    if (data[i] == kKeyRightArrow || data[i] == kKeyDownArrow) {
+      found = kKeyRightArrow;
       break;
     }
   }
@@ -1010,11 +1018,6 @@ inline void end_sync(bool reconnect) {
     toggle();
 }
 
-// A connect in flight: the main loop keeps its frame cadence.
-inline bool busy() {
-  return g_busy;
-}
-
 // Milliseconds until a held key becomes a hold (at least 1), or UINT32_MAX
 // when no key is down. The loop sleeps exactly that long instead of polling.
 inline uint32_t hold_wait_ms() {
@@ -1099,9 +1102,6 @@ inline uint8_t battery_pct() {
 }
 inline void toggle() {}
 inline void poll() {}
-inline bool busy() {
-  return false;
-}
 inline uint32_t hold_wait_ms() {
   return UINT32_MAX;
 }

@@ -18,7 +18,7 @@ WORK=$(mktemp -d)
 trap 'rm -rf "$WORK"' EXIT
 
 SAN="-fsanitize=address,undefined -fno-sanitize-recover=undefined"
-CXX="g++ -std=c++17 -g -O1 $SAN -I . -I wintergreen -I third_party/miniz"
+CXX="g++ -std=c++17 -g -O1 -pthread $SAN -I . -I wintergreen -I third_party/miniz"
 LAYOUT="wintergreen/content/TextLayout.cpp wintergreen/content/hyphenation/Hyphenation.cpp"
 READER="wintergreen/content/wgb/WgbReader.cpp"
 BAKE="wintergreen/content/wgb/WgbPaginator.cpp wintergreen/content/wgb/WgbParagraphs.cpp $READER"
@@ -44,9 +44,16 @@ unit blank_para_test $LAYOUT
 unit book_index_test wintergreen/content/BookIndex.cpp wintergreen/content/CoverPaths.cpp $READER
 # shellcheck disable=SC2086
 unit stretch_lut_test $DECODE
-unit blit_test wintergreen/display/DrawBuffer.cpp
+GRAY="wintergreen/display/DrawBuffer.cpp wintergreen/display/GrayPage.cpp"
 # shellcheck disable=SC2086
-unit baked_line_test wintergreen/display/DrawBuffer.cpp $BAKE $LAYOUT $FONT -x c $MINIZ -x none
+unit blit_test $GRAY
+# shellcheck disable=SC2086
+unit baked_line_test $GRAY $BAKE $LAYOUT $FONT -x c $MINIZ -x none
+# shellcheck disable=SC2086
+unit gray_page_test $GRAY $BAKE $LAYOUT $FONT -x c $MINIZ -x none
+unit lut_test
+# shellcheck disable=SC2086
+unit font_test $FONT -x c $MINIZ -x none
 CXX="$CXX -I tools/books" unit labels_test tools/books/labels.cpp wintergreen/content/HtmlEntities.cpp
 
 books=()

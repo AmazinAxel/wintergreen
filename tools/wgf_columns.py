@@ -5,6 +5,8 @@ Portrait text (every list and menu, and the reader in portrait) maps a glyph
 column onto a panel row. From row-major bitmaps that is a bit-by-bit transpose
 per glyph; from a column-major copy it is the same shifted byte copy landscape
 does. The copy is derived from the existing bitmaps, so pixels never change.
+Libron.bin (the reader bundle) is two planes per glyph, set = ink; the UI
+headers are one plane, clear = ink.
 
 Idempotent: an existing column section is dropped and rebuilt.
 
@@ -29,6 +31,7 @@ COL_FIELDS = 35  # col_bitmap_offset, col_index_offset
 
 
 def _transpose(bits, w, h):
+    """1-bit plane, bit clear = ink (UI fonts)."""
     row_bytes = (w + 7) // 8
     col_bytes = (h + 7) // 8
     out = bytearray(b"\xff" * (col_bytes * w))
@@ -39,7 +42,22 @@ def _transpose(bits, w, h):
     return bytes(out)
 
 
-def add_columns(wgf):
+def _transpose_ink(bits, w, h):
+    """One plane of a two-plane glyph, bit set = ink (reader font)."""
+    row_bytes = (w + 7) // 8
+    col_bytes = (h + 7) // 8
+    out = bytearray(col_bytes * w)
+    for r in range(h):
+        for c in range(w):
+            if (bits[r * row_bytes + (c >> 3)] >> (7 - (c & 7))) & 1:
+                out[c * col_bytes + (r >> 3)] |= 0x80 >> (r & 7)
+    return bytes(out)
+
+
+def add_columns(wgf, planes=1):
+    """planes=1: UI fonts (one plane, clear = ink). planes=2: the reader bundle
+    (hi then lo per glyph, set = ink); the column copy is the hi plane's
+    columns, then the lo plane's."""
     wgf = bytes(wgf)
     num_ranges, num_glyphs = struct.unpack_from("<HH", wgf, 5)
     bitmap_data_offset, bold, italic, bold_italic = struct.unpack_from("<4I", wgf, 15)
@@ -63,9 +81,14 @@ def add_columns(wgf):
                 index += struct.pack("<I", 0)
                 continue
             if boff not in seen:
-                src = wgf[bitmap_data_offset + boff : bitmap_data_offset + boff + ((w + 7) // 8) * h]
+                plane = ((w + 7) // 8) * h
+                base = bitmap_data_offset + boff
                 seen[boff] = len(pool)
-                pool += _transpose(src, w, h)
+                if planes == 2:
+                    pool += _transpose_ink(wgf[base : base + plane], w, h)
+                    pool += _transpose_ink(wgf[base + plane : base + 2 * plane], w, h)
+                else:
+                    pool += _transpose(wgf[base : base + plane], w, h)
             index += struct.pack("<I", seen[boff])
 
     col_bitmap = len(wgf)
@@ -83,7 +106,7 @@ def _bundle(raw):
     off = 4 + 4 * count
     blobs = []
     for s in sizes:
-        blobs.append(add_columns(raw[off : off + s]))
+        blobs.append(add_columns(raw[off : off + s], planes=2))  # the reader bundle
         off += s
     out = bytearray(struct.pack("<BBBB", count, 0, 0, 0))
     for b in blobs:

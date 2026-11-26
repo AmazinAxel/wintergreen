@@ -395,7 +395,7 @@ void BookIndex::build_index(const std::string& root_dir) {
       std::string current_dir = std::move(q.front());
       q.pop();
 
-      // Called for each entry in current_dir; shared dot-skip and .epub check.
+      // Called for each entry in current_dir; shared dot-skip and .wgb check.
       auto visit = [&](const char* name, bool is_dir, const std::string& fullpath) {
         if (name[0] == '.') return;
         if (is_dir) { q.push(fullpath); return; }

@@ -48,7 +48,8 @@ set_source_files_properties(${CMAKE_CURRENT_SOURCE_DIR}/reader_font.cpp PROPERTI
     COMPILE_DEFINITIONS "WG_READER_FONT=\"${READER_FONT}\""
     OBJECT_DEPENDS ${READER_FONT})
 target_include_directories(books_core PUBLIC ${REPO_ROOT} ${REPO_ROOT}/wintergreen ${CMAKE_CURRENT_SOURCE_DIR})
-target_link_libraries(books_core PUBLIC miniz)
+find_package(Threads REQUIRED)  # the paginator bakes its four layouts in parallel
+target_link_libraries(books_core PUBLIC miniz Threads::Threads)
 
 add_executable(books ${CMAKE_CURRENT_SOURCE_DIR}/main.cpp)
 target_link_libraries(books PRIVATE books_core)

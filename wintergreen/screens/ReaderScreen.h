@@ -18,9 +18,11 @@ namespace wintergreen {
 // **Pages are fully baked** (see WgbFormat.h): the book carries every page of
 // every layout as a display list, so the reader's position is just a page index
 // into the current layout. Forward and backward are ±1, a chapter is a page,
-// progress is page / page_count. A page turn reads one record and one display
-// list into page_buf_ and blits it; nothing on this path allocates.
-class ReaderScreen final : public IScreen {
+// progress is page / page_count. A page turn takes the page's display list (read
+// ahead after the last waveform, or read now) and hands it to DrawBuffer's gray
+// path (GrayPage.h), which renders it strip by strip on the Turn LUT; nothing on
+// this path allocates.
+class ReaderScreen final : public IScreen, private GrayImageSource {
  public:
   // The current book path
   const std::string& get_path() const {
@@ -59,22 +61,26 @@ class ReaderScreen final : public IScreen {
   uint8_t layout_ = 0;  // wgb_layout_index of page_
   uint32_t page_ = 0;   // index into layout_'s pages
 
-  // The one display-list buffer, claimed at boot (with the screen) and never
-  // freed. A page is drawn straight out of it, so the pre-draw reuses it once
-  // the current page is on the glass.
+  // Two display-list buffers, claimed at boot (with the screen) and never
+  // freed: the page being shown (rendered straight out of it; GrayPage copies it
+  // once up) and the next one, read ahead after each waveform. A turn onto the
+  // read-ahead page swaps the pointers.
   uint8_t* page_buf_ = static_cast<uint8_t*>(std::malloc(kWgbMaxPageBytes));
+  uint8_t* next_buf_ = static_cast<uint8_t*>(std::malloc(kWgbMaxPageBytes));
   size_t page_len_ = 0;
-  // Which page page_buf_ holds.
+  size_t next_len_ = 0;
+  // Which page each buffer holds.
   struct Loaded {
     bool valid = false;
     uint8_t layout = 0;
     uint32_t index = 0;
   };
   Loaded loaded_;
-  // Read page `index` of `layout`'s display list into page_buf_.
+  Loaded next_;
+  // Put page `index` of `layout`'s display list in page_buf_.
   bool load_page_(DrawBuffer& buf, uint8_t layout, uint32_t index);
-  // Read page_ + 1's display list ahead of the refresh — see the definition.
-  void stage_next_page_(DrawBuffer& buf);
+  // Read page_ + 1 into next_buf_ (panel idle only).
+  void prefetch_next_();
 
   HoldRepeat hold_next_;
   HoldRepeat hold_prev_;
@@ -82,9 +88,7 @@ class ReaderScreen final : public IScreen {
   bool open_ok_ = false;
 
   // Low-battery reminder bar, drawn along the bottom of a reading page only.
-  // Sampled from the runtime at the entry points that have one and cached here,
-  // because render_page_() is also reached from the pre-draw path, which has no
-  // runtime. A stale sample only delays the bar by one page turn.
+  // Sampled from the runtime at the entry points that have one and cached here.
   //
   // Latches at or below the threshold until the next boot — see
   // sample_battery_().
@@ -95,14 +99,6 @@ class ReaderScreen final : public IScreen {
   // Direction of the last turn that moved (+1/-1), 0 when the last batch moved
   // nothing. Button::Undo reverts exactly that step, without drawing.
   int8_t last_step_ = 0;
-  // The glass shows a page that Undo has since left, so pause() must not
-  // snapshot it for the resume() fast path.
-  bool pixels_stale_ = false;
-
-  // Guards the resume() fast path — see pause().
-  bool snapshot_ok_ = false;
-  uint8_t snapshot_font_size_ = 0;
-  uint8_t snapshot_rotation_ = 0;
 
   // Reader options menu pushed when user presses Button1.
   ReaderSettings reader_settings_;  // user-adjustable settings, mutated by quickmenu_
@@ -117,35 +113,17 @@ class ReaderScreen final : public IScreen {
   uint8_t wanted_layout_(const DrawBuffer& buf) const;
   // Move page_ into the wanted layout after a font-size or rotation change: the
   // page holding the same text position.
-  void sync_layout_(const DrawBuffer& buf);
+  void sync_layout_(DrawBuffer& buf);
 
-  // Blit a stored 1-bit image (or the slice on this page) — see the definition.
-  bool draw_image_(uint32_t offset, uint32_t size, DrawBuffer& buf, int dest_x, int dest_y, uint16_t width,
-                   uint16_t height, uint16_t src_y = 0, uint16_t clip_h = 0);
+  // GrayImageSource: one strip's part of a stored 1-bit image — see the definition.
+  bool read_image(const WgbImage& img, Rotation rot, int lo, int hi, uint8_t* dst, size_t cap) override;
+  // The last image table entry read_image() fetched (per open book).
+  uint32_t ref_key_ = UINT32_MAX;
+  WgbImageRef ref_{};
+  // Load page_ and set it as the next gray page.
   void render_page_(DrawBuffer& buf);
-  // Draw the display list in page_buf_.
-  void draw_page_(DrawBuffer& buf);
-  bool page_has_image_() const;
   bool next_page_();
   bool prev_page_();
-
-  // Draw the following page during the e-ink waveform, so the next forward
-  // turn is a memcpy and an SPI write.
-  void prerender_next_page_(DrawBuffer& buf);
-  // Set wherever a page goes up without a turn — opening the book, waking into
-  // it, returning from the quick menu — so the next update() pre-draws the page
-  // after it.
-  bool prerender_pending_ = false;
-  // The next page has an image and the panel was busy: pre-draw it once idle.
-  bool predraw_after_idle_ = false;
-  // Commit the pre-drawn page if it is page_; false = render normally.
-  bool take_predrawn_(DrawBuffer& buf);
-  struct PreDrawn {
-    bool valid = false;
-    uint8_t layout = 0;
-    uint32_t index = 0;
-  };
-  PreDrawn predrawn_;
 
   // book.pos holds the layout-independent position of page_'s start:
   // (paragraph record offset, text offset). Last value written or read, so an

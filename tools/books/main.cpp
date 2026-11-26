@@ -269,11 +269,20 @@ std::string epub_name(const std::string& title, const std::string& author, const
   return s + ".epub";
 }
 
-bool process(const fs::path& epub, const fs::path& out, const fs::path& epubs) {
-  Review r;
+// A reviewed book waiting for the bake, which runs once every book is reviewed.
+struct Pending {
+  fs::path epub;
+  std::unique_ptr<Review> review;
+  std::string reviewed;  // the reviewed EPUB in g_tmp
+};
+
+// Interactive part only. Writes the reviewed EPUB to `reviewed`.
+std::unique_ptr<Review> review(const fs::path& epub, const std::string& reviewed) {
+  auto rp = std::make_unique<Review>();
+  Review& r = *rp;
   if (const std::string err = r.open(epub.string()); !err.empty()) {
     std::printf("  %s, skipped\n", err.c_str());
-    return false;
+    return nullptr;
   }
   r.title = books::normalize_space(edit_line("title  ", r.title));
   r.author = books::normalize_space(edit_line("author ", r.author));
@@ -333,14 +342,19 @@ bool process(const fs::path& epub, const fs::path& out, const fs::path& epubs) {
   }
   if (std::none_of(r.chapters.begin(), r.chapters.end(), [](const books::Chapter& c) { return c.keep; })) {
     std::printf("  every chapter dropped, skipped\n");
-    return false;
+    return nullptr;
   }
-
-  const std::string reviewed = (g_tmp / "book.epub").string();
   if (!r.write_epub(reviewed, true)) {
     std::printf("  writing the reviewed EPUB failed, skipped\n");
-    return false;
+    return nullptr;
   }
+  return rp;
+}
+
+bool bake(const Pending& p, const fs::path& out, const fs::path& epubs) {
+  const Review& r = *p.review;
+  const fs::path& epub = p.epub;
+  const std::string& reviewed = p.reviewed;
   std::string summary;
   const std::string name = r.bake(reviewed, out.string(), summary);
   if (name.empty()) {
@@ -696,11 +710,22 @@ int main(int argc, char** argv) {
     std::sort(sources.begin(), sources.end());
   }
 
-  std::vector<fs::path> done;
+  std::vector<Pending> pending;
   for (const auto& e : sources) {
     std::printf("\n== %s\n", e.filename().c_str());
-    if (process(e, out, epubs))
-      done.push_back(e);
+    const std::string reviewed = (g_tmp / ("reviewed" + std::to_string(pending.size()) + ".epub")).string();
+    if (auto r = review(e, reviewed))
+      pending.push_back({e, std::move(r), reviewed});
+  }
+
+  if (!pending.empty())
+    std::printf("\nbaking %zu book(s)\n", pending.size());
+  std::vector<fs::path> done;
+  for (const auto& p : pending) {
+    std::printf("\n== %s\n", p.epub.filename().c_str());
+    std::fflush(stdout);
+    if (bake(p, out, epubs))
+      done.push_back(p.epub);
   }
 
   std::vector<std::string> names;

@@ -133,6 +133,16 @@ turns). See "Build & flash", "Idle power" and "Refresh latency".
 
 Only the reasons are kept — the symbol-by-symbol inventories are in git history.
 
+**Grayscale everywhere (`5942a93`, reverted `a83a0f3`); reader pages brought back
+(2026-11-25, owner's call).** The custom Turn LUT plus draw lists for every screen ghosted
+and misbehaved around the menus, lists and covers; on reading pages it read great. Only
+that part is back (`GrayPage`, docs/display.md "Gray reader pages"): two-plane Libron, the
+Turn table, temperature bands. Not back: draw lists for other screens, the Full LUT,
+4-level sleep frames / covers, two-plane UI fonts and images, blue noise. Removed with it:
+the reader's 1-bit pre-draw and quick-menu snapshot (`prerender_next_page_`,
+`take_predrawn_`, `stage_next_page_`, `predraw_after_idle_`, `pause()` snapshot,
+`DrawBuffer::draw_baked_line`).
+
 **`esp_hidh` (2026-11-11).** Its discovery and CCCD writes ran before encryption and
 mapped nothing, its INPUT events never fired, and its connect failed on every fresh boot
 (measured, 78 ms in). Replaced by raw NimBLE (`docs/bluetooth.md`); with it went the 6 KB

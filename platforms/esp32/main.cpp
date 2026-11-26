@@ -211,12 +211,13 @@ extern "C" void app_main(void) {
       buttons = {};
     app.update(buttons, runtime.frame_time_ms(), buf, runtime);
 
-    // Sleep as long as nothing is due. A radio in transition keeps the frame
-    // cadence (its rows repaint as state changes); a clicker key down shortens
-    // the wait to exactly its hold deadline.
+    // Sleep as long as nothing is due. Every async change wakes the loop itself
+    // (ui_wake: input edges, the panel's BUSY edge, the sync / USB / clicker
+    // tasks at each state change and spare hand-over), so a radio in flight no
+    // longer keeps a 25 ms cadence; keep_awake() is a latch for the frame after
+    // a long wait. A clicker key down shortens the wait to exactly its hold
+    // deadline.
     uint32_t budget = app.idle_wait_ms(buf);
-    if (wg_sync::active() || wg_clicker::busy())
-      budget = 0;
     const uint32_t hold = wg_clicker::hold_wait_ms();
     if (hold < (budget ? budget : runtime.target_frame_ms()))
       budget = hold;

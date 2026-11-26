@@ -85,7 +85,7 @@ item/selection/navigation machinery; every pixel comes from its own `draw_all_`.
 
 **Closes itself when the clicker connects.** `update()` watches `clicker_state()`; a
 Connecting → Connected change while the menu is up calls `on_back()`, returning to the
-book (snapshot fast path).
+book (a gray update from the menu's frame: only what differs is driven).
 
 A flat list: header block, Font Size, Orientation, Clicker (only when a MAC is
 configured), then the chapter grid. There is no separate Chapters page — selecting a
@@ -95,10 +95,9 @@ pops one screen; `ReaderScreen::resume()` consumes it.
 **Chapter grid.** Two columns of boxed numbers (`1`, `2`, ...), nothing else; the header's
 chapter line reads "Chapter N of M". Each chapter is still one list item, in grid order, so
 the inherited linear navigation is the grid's: down / front Button2 steps right, then wraps
-to the next row's left cell; up reverses. Every cell has a 1 px box, the selected one a
-2 px frame (`kCellSelW`, same as the home cover frame, shared `draw_outline()` in
-`ListMenuScreen.h`), never an inverted fill — fewer pixels flip per move, so less ghosting.
-Settings rows keep the inverted selection. Scrolling is item-indexed (base class), but the
+to the next row's left cell; up reverses. Every cell has a 1 px box (`draw_outline()` in
+`ListMenuScreen.h`); the selected one is filled black with its number in white, like the
+settings rows' inverted selection. Scrolling is item-indexed (base class), but the
 grid always draws and counts whole rows from the row holding `scroll_offset()`
 (`first_grid_row_()`); `centred_offset_` and `draw_all_` must agree on that.
 
@@ -218,8 +217,8 @@ by the clicker's hold (`docs/bluetooth.md`): it means "revert the step the last 
 made, without drawing; an action follows". Here: `undo_selected_` (cursor before the last
 press move) is restored. In `ReaderScreen`: `last_step_` (+1/-1 of the last turn that
 moved, 0 if none, so a press at the book's first page undoes nothing) is reverted with
-`prev_page_()`/`next_page_()` and `pixels_stale_` stops `pause()` snapshotting the
-page the glass still shows; a turn still pending in the same batch is just cancelled.
+`prev_page_()`/`next_page_()`; the glass keeps showing the turned page until the action
+that follows redraws; a turn still pending in the same batch is just cancelled.
 Screens that do not handle it ignore it.
 
 **Back no longer flushes a pending move before `on_back()`.** It used to draw + refresh

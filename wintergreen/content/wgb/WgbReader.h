@@ -66,7 +66,7 @@ class WgbReader {
   const EpubMetadata& metadata() const {
     return metadata_;
   }
-  // The open file handle, shared with ReaderScreen::draw_image_ so drawing a
+  // The open file handle, shared with ReaderScreen::read_image so drawing a
   // figure does not reopen the book. Every read here seeks first, so a borrowed
   // read cannot disturb this class's position.
   FILE* file() const {

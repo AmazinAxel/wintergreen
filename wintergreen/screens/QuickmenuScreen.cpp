@@ -182,7 +182,7 @@ void QuickmenuScreen::on_start() {
   }
 
   clear_items();
-  idx_font_size_ = idx_reader_rotate_display_ = -1;
+  idx_font_size_ = idx_reader_rotate_display_ = idx_long_sleep_ = -1;
   first_chapter_ = -1;
 
   char tmp[40];
@@ -228,6 +228,13 @@ void QuickmenuScreen::on_start() {
     add_item(fmt_setting(tmp, sizeof(tmp), "Page Turner", val));
   }
 
+  // Session-only: gone once on, and a deep-sleep wake is a full boot, so it
+  // comes back off without any reset code.
+  if (app_ && !app_->long_sleep()) {
+    idx_long_sleep_ = count();
+    add_item("Longer autosleep");
+  }
+
   if (settings_) {
     idx_reader_rotate_display_ = count();
     add_item(fmt_setting(tmp, sizeof(tmp), "Orientation", rotation_label(app_ ? app_->rotate_reader() : 0)));
@@ -235,11 +242,7 @@ void QuickmenuScreen::on_start() {
     // The reader font set is always present here: without it no book opens, and
     // this menu only exists over an open book.
     idx_font_size_ = count();
-    const BitmapFont* f = app_ ? app_->reader_font()->get_font(settings_->font_size_idx) : nullptr;
-    char val[16] = "";
-    if (f)
-      snprintf(val, sizeof(val), "%d", f->nominal_size() ? f->nominal_size() : f->y_advance());
-    add_item(fmt_setting(tmp, sizeof(tmp), "Font Size", val));
+    add_item(fmt_setting(tmp, sizeof(tmp), "Font Size", settings_->font_size_idx ? "Large" : "Small"));  // 32 / 36 px
   }
 
   // Chapters, inline below the settings: one numbered cell per chapter start.
@@ -490,6 +493,11 @@ void QuickmenuScreen::on_select(int index) {
       app_->set_rotate_reader(v);
       refresh_items_(index);
     }
+    return;
+  }
+  if (index == idx_long_sleep_) {
+    app_->set_long_sleep();
+    refresh_items_(index);
     return;
   }
   if (index == idx_clicker_) {

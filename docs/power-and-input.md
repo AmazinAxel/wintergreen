@@ -42,17 +42,18 @@ is gone because `start()`'s `full_refresh()` writes both planes anyway; and
 **resuming into a book does not build the home screen** — `ScreenManager::push_inactive`
 puts it under the reader unstarted, and the index is read by `record_book_progress()`
 (or the home screen's own resume) only when something needs it. The reader then
-pre-draws the next page on its first frame (`prerender_pending_`, also set on book open
-and quick-menu return), so the first turn after waking is a memcpy. Going to sleep,
+puts its page up as one gray update over the unknown glass (every pixel driven; no
+1-bit boot paint first, docs/display.md "Gray reader pages"). Going to sleep,
 `do_sleep_()` puts the sleep screen up **before** stopping the reader and saving, so
 those SD writes are not latency; the panel's `deep_sleep()` is sent last.
 
 **The CPU never light-sleeps between frames.** The loop is already deadline-driven
-(old plan item B4, read 2026-11-12): `main.cpp` waits `Application::idle_wait_ms()` — 0 while
-a button is down, the perf hold runs, a persist or transition is pending or the panel is
-busy; otherwise until the battery poll or auto-sleep deadline — shortened to the clicker
-hold deadline, and woken early by input through `g_ui_wake`. The 25 ms frame cadence
-runs only while one of those holds. What still wakes the core regardless is the 5 ms
+(old plan item B4, read 2026-11-12; fully event-driven 2026-11-25): `main.cpp` waits
+`Application::idle_wait_ms()` — 0 only while a button is down, power is armed or a
+transition is queued; otherwise until the nearest deadline (perf-hold release, deferred
+card write, battery poll, auto-sleep) — shortened to the clicker hold deadline, and woken
+early through `g_ui_wake` by input edges, the panel's BUSY falling edge and the radio /
+USB tasks. The 25 ms frame cadence runs only while a key is down. What still wakes the core regardless is the 5 ms
 `esp_timer` button sampler (`input.h`), which the ADC ladders need. Between wakes the
 core idles (WFI) awake at ~15 mA; the only levers are deep sleep sooner and B1 below.
 A longer frame period saves a fraction of a milliamp and costs input latency —
@@ -84,7 +85,9 @@ Three invariants; breaking any one undoes it or worse:
   lock a page turn would run at the idle clock — up to 2× slower, a net regression.
   `IRuntime::set_performance_hold` wraps an `ESP_PM_CPU_FREQ_MAX` lock;
   `Application::update` raises it on button activity or a pending screen transition and
-  drops it after `kPerfHoldMs` (300 ms) of quiet. Acquire/release are skipped when
+  drops it as soon as a frame's update has gone out (panel busy, no key down, nothing
+  queued: the CPU would only wait the waveform out at 160 MHz, ~7 mA; 2026-11-25), else
+  after `kPerfHoldMs` (300 ms) of quiet. Acquire/release are skipped when
   unchanged.
 
 ## Input and holds
@@ -117,12 +120,16 @@ panel traffic.
 ### Idle loop (B4, 2026-11-11)
 
 The loop no longer wakes 40 times a second to find nothing. After `app.update`,
-`main.cpp` asks `Application::idle_wait_ms(buf)`: **0** (keep the 25 ms cadence) while
-anything is in motion — a button down (`buttons_down_`), power armed, the perf hold,
-`persist_pending_`, a pending transition, the panel busy — else the nearest timer (1 s
-battery poll, auto-sleep). A sync (`wg_sync::active()`) or a clicker connect
-(`wg_clicker::busy()`) forces cadence; a clicker key down shortens the wait to exactly
-`wg_clicker::hold_wait_ms()`. `Esp32Runtime::wait_next_frame(budget)` blocks on
+`main.cpp` asks `Application::idle_wait_ms(buf)`: **0** (keep the 25 ms cadence) only
+while a button is down (`buttons_down_`, hold-repeat timing), power is armed or a
+transition is queued; else the nearest deadline (perf-hold release, `persist_pending_`'s
+quiet period, 1 s battery poll, auto-sleep; the panel-idle ones skipped while it is busy,
+because its BUSY edge wakes the loop: `epd.h` `busy_isr_` gives `g_ui_wake`). Until
+2026-11-25 a busy panel, the perf hold, a pending persist, a sync and a clicker connect all
+forced the cadence: ~24 empty frames per page turn, thousands per sync. Sync, USB upload
+and clicker tasks `ui_wake()` at every state change; `keep_awake()` is a latch
+(`awake_held_`) so the frame after a long wait does not count the wait as inactivity. A
+clicker key down shortens the wait to exactly `wg_clicker::hold_wait_ms()`. `Esp32Runtime::wait_next_frame(budget)` blocks on
 `g_ui_wake` for that long (`UINT32_MAX` = `portMAX_DELAY`), ticks **rounded up** so a
 deadline a few ms away is not a zero-tick spin.
 

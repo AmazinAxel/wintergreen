@@ -8,6 +8,7 @@
 
 #include "../content/BitmapFont.h"
 #include "../content/wgb/WgbPageView.h"
+#include "GrayPage.h"
 
 namespace wintergreen {
 
@@ -63,6 +64,19 @@ class IDisplay {
   // waiting, so callers that are about to use a bus the panel shares (SD on SPI2)
   // must drain first — concurrent SD traffic corrupts an in-flight update.
   virtual void wait_idle() {}
+
+  // Gray reader pages (GrayPage.h), the only updates on the custom Turn LUT.
+  // gray_begin: wake, wait out any waveform, load the Turn LUT. Then strip
+  // windows of both planes (state = RED << 1 | BW; row0 = first physical row,
+  // full width), queued: the buffers stay untouched until await_strip_slot()
+  // (at most one window left in flight) or finish_writes() (none; before any
+  // card access); bw null = RED only (the handoff). Then gray_fire (returns with the panel busy, as
+  // partial_refresh does).
+  virtual void gray_begin() {}
+  virtual void await_strip_slot() {}
+  virtual void write_window(int /*row0*/, int /*rows*/, const uint8_t* /*bw*/, const uint8_t* /*red*/) {}
+  virtual void finish_writes() {}
+  virtual void gray_fire() {}
 };
 
 // Framebuffer with simple draw helpers.
@@ -71,8 +85,9 @@ class IDisplay {
 // One draw buffer: refresh() sends it to the panel and does not flip. The
 // controller keeps the pixels in its own RAM and the SPI write is synchronous,
 // so the buffer is free to draw into as soon as refresh() returns, and between
-// refreshes it holds the frame on the glass. Every draw path starts from
-// fill() or from a whole-buffer swap, so nothing reads the previous frame.
+// refreshes it holds the frame on the glass (or, under a gray page, the page's
+// hi plane: GrayPage.h). Every draw path starts from fill() or frame(), so
+// nothing reads the previous frame.
 // A second host copy of the displayed frame (there used to be one) had no
 // reader: the fast waveform never takes RED RAM from the host, and
 // RefreshMode::Full, the only mode that would, has no caller. A future Full
@@ -137,15 +152,16 @@ class DrawBuffer {
 
   // Fill the entire draw buffer.
   void fill(bool white = true) {
-    memset(draw_(), white ? 0xFF : 0x00, kBufSize);
+    touch_();
+    memset(buf_, white ? 0xFF : 0x00, kBufSize);
   }
 
   // Fill a logical rectangle.
   void fill_rect(int lx, int ly, int lw, int lh, bool white) {
     if (rotation_ == Rotation::Deg0)
-      fill_rect_physical_(draw_(), lx, ly, lw, lh, white);
+      fill_rect_physical_(buf_, lx, ly, lw, lh, white);
     else
-      fill_rect_physical_(draw_(), ly, DisplayFrame::kPhysicalHeight - lx - lw, lh, lw, white);
+      fill_rect_physical_(buf_, ly, DisplayFrame::kPhysicalHeight - lx - lw, lh, lw, white);
   }
 
   // Blit a 1-bit image (MSB first, bit set = white, rows `stride` bytes apart)
@@ -162,15 +178,18 @@ class DrawBuffer {
   // a shifted byte copy. Home and list covers are baked this way.
   void blit_1bit_cols(int lx, int ly, const uint8_t* cols, int w, int h);
 
-  // One 8-row band of a reader image (WgbFormat.h, portrait copy): w bytes, each
-  // the band's 8 pixels of one column, top MSB. Top-left at (lx, ly); only band
-  // rows [keep_lo, keep_hi) are drawn.
-  void blit_1bit_bands(int lx, int ly, const uint8_t* band, int w, int keep_lo, int keep_hi);
 
   // The draw target as the panel's own frame (kStride bytes per physical row,
   // kBufSize bytes): a baked full-screen frame is read straight into it.
   uint8_t* frame() {
-    return draw_();
+    touch_();
+    return buf_;
+  }
+
+  // The reader's gray page path (GrayPage.h). A page set here goes up at the
+  // next refresh()/full_refresh() on the Turn LUT instead of the draw buffer.
+  GrayPage& gray() {
+    return gray_;
   }
 
   // -- Text & Glyph rendering --
@@ -186,12 +205,6 @@ class DrawBuffer {
                              FontStyle style = FontStyle::Regular) {
     return draw_text_proportional(x, baseline_y, text, text ? strlen(text) : 0, font, white, style);
   }
-
-  // Render all words of a baked line (see WgbFormat.h), each in its own font
-  // and style. `end` bounds the display list the line lives in.
-  void draw_baked_line(const WgbLine& line, const uint8_t* end, const BitmapFontSet& fonts, bool white);
-
-  void set_sunlight_fading_fix(bool v) { sunlight_fading_fix_ = v; }
 
   // -- Display operations
   // --------------------------------------------------
@@ -217,52 +230,54 @@ class DrawBuffer {
   // Application::kGhostFlushIdleMs and config::kFullRefreshEveryNUpdates. To
   // bring it back, count here and call full_refresh(RefreshMode::Full) from
   // wherever the interruption is acceptable — but read "Panel health" first.
+  //
+  // A gray page set since the last draw goes up instead (GrayPage). Leaving a
+  // gray page, RED is rewritten first (GrayPage::handoff).
   void refresh() {
+    if (gray_.pending()) {
+      show_gray_();
+      return;
+    }
+    gray_.handoff(display_, buf_);
     display_.partial_refresh(buf_);
+    gray_.set_glass(GrayPage::Glass::Frame);
   }
 
   // Full hardware refresh of the draw buffer. No previous frame is passed: no
-  // host copy of it exists (class comment), and Half ignores it anyway.
+  // host copy of it exists (class comment), and Half ignores it anyway. A
+  // pending gray page (boot into a book) goes up on the Turn LUT instead.
   void full_refresh(RefreshMode mode = RefreshMode::Half, bool turnOffScreen = false) {
-    display_.full_refresh(buf_, nullptr, mode, turnOffScreen || sunlight_fading_fix_);
+    if (gray_.pending()) {
+      show_gray_();
+      return;
+    }
+    display_.full_refresh(buf_, nullptr, mode, turnOffScreen);
+    gray_.set_glass(GrayPage::Glass::Frame);
   }
 
 
-  // -- Spare buffer: snapshot and offscreen draw ---------------------------
+  // -- Spare buffer --------------------------------------------------------
   //
-  // One extra 48 KB framebuffer serving two jobs that never overlap in time:
-  //
-  //   Snapshot   a copy of the displayed frame, so a screen overlaying another
-  //              (the quick menu over the reader) can be dismissed without the
-  //              screen underneath rebuilding its content.
-  //   Offscreen  a place to draw the *next* page while the panel is still
-  //              running the current page's waveform, so a forward turn becomes
-  //              a memcpy plus an SPI write — no layout and no glyph blitting.
-  //
-  // They share storage because a reader is either in the quick menu or turning
-  // pages, never both, and 48 KB is worth more as heap than as a second spare.
-  // spare_use_ records which one is live; claiming it for one purpose silently
-  // invalidates the other, and both consumers re-check validity before trusting
-  // it (see ReaderScreen::resume and take_predrawn_).
-  //
-  // The framebuffers are never loaned out as scratch, so nothing else can
-  // clobber this.
-  enum class Spare : uint8_t { None, Snapshot, Offscreen, Cache };
-
-  // The spare is claimed at construction and never given back, radios
+  // One extra 48 KB framebuffer with three users that never overlap: a gray
+  // page's lo plane while the reader is up (show_gray_), the book list's and
+  // home screen's cover cache, and a sync's download buffer. Each claim
+  // displaces the others; spare_use_ and the cache generation let the cache
+  // tell. The spare is claimed at construction and never given back, radios
   // included. The null checks below only cover a boot-time malloc failure.
+  enum class Spare : uint8_t { None, Cache };
 
   // Lend the spare to another task until return_spare(): the sync's download
   // buffers (wifi_sync.h). The caller is not on the UI thread, so every other
-  // claim (cache, snapshot, pre-draw)
-  // refuses while it is out, and the screens draw without it: the book list
-  // shows no thumbnails until it comes back. Both calls happen on the UI thread
-  // (wg_sync::poll), so the flag needs no lock. What the spare held is lost.
+  // claim refuses while it is out, and the screens draw without it: the book
+  // list shows no thumbnails until it comes back. Both calls happen on the UI
+  // thread (wg_sync::poll), so the flag needs no lock. What the spare held is
+  // lost.
   uint8_t* lend_spare() {
     if (!spare_ || spare_lent_)
       return nullptr;
     spare_use_ = Spare::None;
     spare_lent_ = true;
+    gray_.invalidate_planes();
     return spare_;
   }
   void return_spare() {
@@ -270,9 +285,8 @@ class DrawBuffer {
   }
 
   // Lend the spare as a cache that may outlive the screen using it: the book
-  // list keeps its cover thumbnails here. Nothing draws into it while the list
-  // is up, so the reader's two uses never overlap it. Like them it is
-  // invalidated by any other claim — a snapshot, a pre-draw, a sync's loan.
+  // list keeps its cover thumbnails here. Invalidated by any other claim — a
+  // gray page, a sync's loan.
   //
   // Validity is a generation, not just the enum: each time the spare *enters*
   // cache use its contents are garbage and the generation moves, so a cache that
@@ -291,6 +305,7 @@ class DrawBuffer {
     }
     if (spare_use_ != Spare::Cache || spare_owner_ != owner) {
       spare_use_ = Spare::Cache;
+      gray_.invalidate_planes();
       spare_owner_ = owner;
       ++spare_cache_gen_;
     }
@@ -301,60 +316,6 @@ class DrawBuffer {
   }
   bool spare_cache_valid(uint32_t gen) const {
     return spare_use_ == Spare::Cache && gen == spare_cache_gen_;
-  }
-
-  // The draw buffer holds the displayed frame, so a snapshot is a pointer
-  // swap: the page becomes the spare and the overlay draws into what the spare
-  // held (every draw starts with fill()). No 48 KB copy either way.
-  void save_snapshot() {
-    if (!spare_ || spare_lent_)
-      return;
-    std::swap(buf_, spare_);
-    spare_use_ = Spare::Snapshot;
-  }
-
-  bool has_snapshot() const {
-    return spare_use_ == Spare::Snapshot;
-  }
-
-  // Swap the snapshot back into the draw buffer, ready for the caller's
-  // refresh(). The spare then holds the overlay's frame, which is garbage.
-  bool restore_snapshot() {
-    if (spare_use_ != Spare::Snapshot)
-      return false;
-    std::swap(buf_, spare_);
-    spare_use_ = Spare::None;
-    return true;
-  }
-
-  // Redirect every draw call into the spare buffer until end_offscreen(). The
-  // draw buffer (the displayed frame) is untouched meanwhile.
-  // Returns false when there is no spare; the caller must then skip the
-  // pre-draw entirely rather than drawing into the live buffer.
-  bool begin_offscreen() {
-    if (!spare_ || spare_lent_)
-      return false;
-    draw_target_ = spare_;
-    spare_use_ = Spare::None;  // not usable until end_offscreen says so
-    return true;
-  }
-
-  void end_offscreen() {
-    draw_target_ = nullptr;
-    spare_use_ = Spare::Offscreen;
-  }
-
-  bool has_offscreen() const {
-    return spare_use_ == Spare::Offscreen;
-  }
-
-  // Swap the offscreen frame into the draw buffer, ready for refresh().
-  bool commit_offscreen() {
-    if (spare_use_ != Spare::Offscreen)
-      return false;
-    std::swap(buf_, spare_);
-    spare_use_ = Spare::None;
-    return true;
   }
 
   // Block until the panel has finished any outstanding refresh. Call before SD
@@ -395,28 +356,40 @@ class DrawBuffer {
   // leave the scarce region for the radio. Allocated once at construction and
   // never freed.
   uint8_t* buf_ = static_cast<uint8_t*>(std::malloc(kBufSize));
-  // Heap for the same reason, and likewise kept for the whole boot. Snapshot
-  // and offscreen commit swap it with buf_, so neither pointer is tied to one
-  // allocation.
+  // Heap for the same reason, and likewise kept for the whole boot.
   uint8_t* spare_ = static_cast<uint8_t*>(std::malloc(kBufSize));
   Spare spare_use_ = Spare::None;
   bool spare_lent_ = false;  // see lend_spare()
   uint32_t spare_cache_gen_ = 0;  // see claim_spare_cache()
   const void* spare_owner_ = nullptr;
-  // Non-null while begin_offscreen() is in effect; see draw_().
-  uint8_t* draw_target_ = nullptr;
   Rotation rotation_ = Rotation::Deg90;
-  bool sunlight_fading_fix_ = true;
 
   // MGR2 sleep image, pointing into memory-mapped flash (set_sleep_image).
   const uint8_t* sleep_img_ = nullptr;
   size_t sleep_img_size_ = 0;
 
-  // Where draw calls land: the draw buffer normally, the spare while an
-  // offscreen pass is in effect. Commit paths (refresh, full_refresh,
-  // restore_snapshot) always use buf_ directly.
-  uint8_t* draw_() {
-    return draw_target_ ? draw_target_ : buf_;
+  GrayPage gray_;
+
+  // A 1-bit draw is starting: a gray page set before it is dropped, and the
+  // draw buffer no longer equals the glass (nor holds a gray page's hi plane)
+  // until the next refresh.
+  void touch_() {
+    gray_.invalidate_planes();
+    gray_.drop_pending();
+    if (gray_.glass() == GrayPage::Glass::Frame)
+      gray_.set_glass(GrayPage::Glass::Unknown);
+  }
+
+  // A gray page keeps the glass as two planes: hi in the draw buffer, lo in the
+  // spare (any cache in it is invalidated). Lent to a sync: no lo plane, so the
+  // next turn drives every pixel.
+  void show_gray_() {
+    uint8_t* lo = nullptr;
+    if (spare_ && !spare_lent_) {
+      spare_use_ = Spare::None;
+      lo = spare_;
+    }
+    gray_.show(display_, buf_, lo);
   }
 
   // Fill a physical horizontal span [x1, x2) on physical row `row`. Physical x

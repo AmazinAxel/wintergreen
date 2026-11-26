@@ -174,12 +174,20 @@ class Application {
 
   void start(DrawBuffer& buf, IRuntime& runtime);
 
-  // Reset the inactivity timer so the device won't sleep.
-  // Called each tick while a Wi-Fi sync runs: suppresses auto-sleep and the
-  // low-battery cutoff, so a transfer is never cut mid-file.
+  // Quick menu "Longer autosleep": 5 min auto-sleep until the next sleep. Not
+  // saved; deep-sleep wake is a full boot, which clears it.
+  bool long_sleep() const { return long_sleep_; }
+  void set_long_sleep() { long_sleep_ = true; }
+
+  // Hold off auto-sleep and the low-battery cutoff for this frame. Called each
+  // frame the loop runs while a sync or USB upload is in flight (wg_*::poll),
+  // so a transfer is never cut mid-file. A latch, consumed by update(): the loop
+  // does not run frames for it, so the frame after a long wait must not count
+  // that wait as inactivity.
   void keep_awake() {
     inactivity_ms_ = 0;
     low_battery_ms_ = 0;
+    awake_held_ = true;
   }
   // Open a book by path, bypassing the menu: the boot resume path.
   void auto_open_book(const char* epub_path, DrawBuffer& buf, IRuntime& runtime);
@@ -203,6 +211,7 @@ class Application {
   uint32_t inactivity_ms_ = 0;
   // Milliseconds since the UI last did anything; drives the DFS performance hold.
   uint32_t perf_idle_ms_ = 0;
+  bool awake_held_ = false;  // keep_awake() this frame; see there
   static constexpr uint32_t kPerfHoldMs = 300;
   // Any button held at the last update(): power hold and hold-repeat count
   // frames' worth of dt while it lasts, so the loop keeps its cadence.
@@ -238,6 +247,7 @@ class Application {
   uint32_t persist_quiet_ms_ = 0;
 
   uint8_t rotate_reader_ = 0;   // independent reader rotation, same encoding
+  bool long_sleep_ = false;     // quick menu "Longer autosleep": this wake only
 
   ScreenManager screen_mgr_;
 
