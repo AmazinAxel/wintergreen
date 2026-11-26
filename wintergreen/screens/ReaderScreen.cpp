@@ -80,14 +80,14 @@ void ReaderScreen::start(DrawBuffer& buf, IRuntime& runtime) {
   buf_ = &buf;
   pos_written_valid_ = false;
   ref_key_ = UINT32_MAX;  // a new book: its own image table
-  next_.valid = false;   // and its own pages
-  if (app_)
-    buf.set_rotation(rotation_from_setting(app_->rotate_reader()));
+  ahead_[0].at.valid = ahead_[1].at.valid = false;  // and its own pages
+  buf.set_rotation(rotation_from_setting(app_->rotate_reader()));
   pos_path_.clear();
 
   // No reader font, no book: update() pops straight back without drawing.
   open_ok_ = false;
   buf.wait_panel_idle();  // opening, .pos and the first page are card reads
+  app_->write_pending_pos();  // a just-closed book's position, before reading ours
   if (!page_buf_ || !ext_font_set_ || !ext_font_set_->valid() || !wgb_.open(path_.c_str()))
     return;
   layout_ = wanted_layout_(buf);
@@ -103,10 +103,6 @@ void ReaderScreen::start(DrawBuffer& buf, IRuntime& runtime) {
   PosKey saved;
   if (load_position_(saved))
     page_ = wgb_.find_page(layout_, saved.para_offset, saved.text_offset);
-  // Step back one page on a fresh open (config::kResumeOnePageBack). The .pos
-  // dedup key keeps what the file holds, so only reading moves it.
-  if (config::kResumeOnePageBack && page_ > 0)
-    --page_;
   render_page_(buf);
 }
 
@@ -118,14 +114,13 @@ void ReaderScreen::pause() {}
 void ReaderScreen::resume(DrawBuffer& buf, IRuntime& runtime) {
   sample_battery_(runtime);
   buf_ = &buf;
-  if (app_)
-    buf.set_rotation(rotation_from_setting(app_->rotate_reader()));
+  buf.set_rotation(rotation_from_setting(app_->rotate_reader()));
   if (!open_ok_)
     return;
 
   // A chapter jump chosen from the quick menu: its page, in the layout the
   // menu was opened in (render_page_ maps it if the layout changed too).
-  const bool jumping = app_ && app_->quickmenu()->has_pending();
+  const bool jumping = app_->quickmenu()->has_pending();
   if (jumping) {
     page_ = app_->quickmenu()->pending_page();
     app_->quickmenu()->clear_pending();
@@ -145,10 +140,9 @@ void ReaderScreen::stop() {
     save_position_();
     // Cache the percentage for the book list, which has no cheap way to derive
     // it (that would mean opening every WGB and .pos on the card).
-    if (app_)
-      app_->record_book_progress(path_, progress_pct());
+    app_->record_book_progress(path_, progress_pct());
   }
-  loaded_.valid = next_.valid = false;
+  loaded_.valid = ahead_[0].at.valid = ahead_[1].at.valid = false;
   wgb_.close();
   pos_path_.clear();
   pos_path_.shrink_to_fit();
@@ -253,38 +247,52 @@ void ReaderScreen::update(const ButtonState& buttons, DrawBuffer& buf, IRuntime&
     buf.refresh();
   } else if (open_ok_ && !buf.display().is_busy()) {
     // First frame after the waveform (the loop runs frame cadence while the
-    // panel is busy): read the next page's list now, so a forward turn reads
+    // panel is busy): read the neighbouring pages' lists now, so a turn reads
     // nothing from the card on the press path.
-    prefetch_next_();
+    prefetch_();
+    app_->load_deferred_index();  // resumed into a book: off the Back path
   }
 }
 
-// Read page_ + 1's record and list into next_buf_. Only with the panel idle:
-// the card shares SPI2 with it.
-void ReaderScreen::prefetch_next_() {
-  const uint32_t want = page_ + 1;
-  if (!next_buf_ || want >= wgb_.page_count(layout_) ||
-      (next_.valid && next_.layout == layout_ && next_.index == want))
-    return;
-  next_.valid = false;
-  WgbPage rec;
-  if (!wgb_.page(layout_, want, rec) || !wgb_.read_page(rec, next_buf_, kWgbMaxPageBytes))
-    return;
-  next_len_ = rec.dl_size;
-  next_ = Loaded{true, layout_, want};
+// Read page_'s neighbours (page_ + 1 first) into ahead_. Only with the panel
+// idle: the card shares SPI2 with it. A slot holding neither neighbour is the
+// one refilled, so a turn either way reads nothing on the press path.
+void ReaderScreen::prefetch_() {
+  const uint32_t count = wgb_.page_count(layout_);
+  const bool has_next = page_ + 1 < count, has_prev = page_ > 0;
+  auto wanted = [&](const Loaded& at) {
+    return (has_next && at.is(layout_, page_ + 1)) || (has_prev && at.is(layout_, page_ - 1));
+  };
+  for (const uint32_t want : {page_ + 1, page_ - 1}) {
+    if ((want == page_ + 1 && !has_next) || (want == page_ - 1 && !has_prev))
+      continue;
+    if (ahead_[0].at.is(layout_, want) || ahead_[1].at.is(layout_, want))
+      continue;
+    Ahead& slot = !wanted(ahead_[0].at) ? ahead_[0] : ahead_[1];
+    if (!slot.buf || wanted(slot.at))
+      continue;
+    slot.at.valid = false;
+    WgbPage rec;
+    if (!wgb_.page(layout_, want, rec) || !wgb_.read_page(rec, slot.buf, kWgbMaxPageBytes))
+      continue;
+    slot.len = rec.dl_size;
+    slot.at = Loaded{true, layout_, want};
+  }
 }
 
 // The card shares SPI2 with the panel, so every read here waits the waveform
 // out first (docs/display.md). A page already in page_buf_ costs nothing; one
-// prefetched into next_buf_ is a pointer swap.
+// read ahead into ahead_ is a pointer swap (the slot keeps the page left).
 bool ReaderScreen::load_page_(DrawBuffer& buf, uint8_t layout, uint32_t index) {
-  if (loaded_.valid && loaded_.layout == layout && loaded_.index == index)
+  if (loaded_.is(layout, index))
     return true;
-  if (next_.valid && next_.layout == layout && next_.index == index) {
-    std::swap(page_buf_, next_buf_);
-    std::swap(page_len_, next_len_);
-    std::swap(loaded_, next_);  // next_ now names the page that was in page_buf_
-    return true;
+  for (Ahead& a : ahead_) {
+    if (a.at.is(layout, index)) {
+      std::swap(page_buf_, a.buf);
+      std::swap(page_len_, a.len);
+      std::swap(loaded_, a.at);
+      return true;
+    }
   }
   loaded_.valid = false;
   WgbPage rec;
@@ -357,16 +365,17 @@ void ReaderScreen::save_position_() {
   const PosKey now{p.para_offset, p.text_offset};
   if (pos_written_valid_ && now == pos_written_)
     return;
-  FILE* f = std::fopen(pos_path_.c_str(), "w");
-  if (!f)
-    return;
   // Where the page starts, independent of font size and rotation: the
   // paragraph record's offset in the WGB and the text offset within it.
-  std::fprintf(f, "%u %u\n", static_cast<unsigned>(now.para_offset), static_cast<unsigned>(now.text_offset));
-  if (std::fclose(f) == 0) {
-    pos_written_ = now;
-    pos_written_valid_ = true;
-  }
+  // Written by Application::flush_persist once the next screen is up.
+  char line[24];
+  const int n = std::snprintf(line, sizeof(line), "%u %u\n", static_cast<unsigned>(now.para_offset),
+                              static_cast<unsigned>(now.text_offset));
+  if (n <= 0 || n >= static_cast<int>(sizeof(line)))
+    return;
+  app_->queue_book_pos(pos_path_, std::string(line, static_cast<size_t>(n)));
+  pos_written_ = now;
+  pos_written_valid_ = true;
 }
 
 bool ReaderScreen::load_position_(PosKey& out) {

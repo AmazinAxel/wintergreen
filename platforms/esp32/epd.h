@@ -55,10 +55,16 @@
 #define CMD_DEEP_SLEEP 0x10
 
 // ---- Refresh modes (internal) ----
-enum EpdRefreshMode { EPD_FULL_REFRESH, EPD_HALF_REFRESH, EPD_FAST_REFRESH };
+enum EpdRefreshMode { EPD_HALF_REFRESH, EPD_FAST_REFRESH };
 
 class EInkDisplay : public wintergreen::IDisplay {
  public:
+  // Panel SPI clock, 40 MHz (2x the SSD1677's rated 20). 80 MHz tried
+  // 2026-11-25 (with SPI_DEVICE_NO_DUMMY): nothing rendered at all. Stays 40.
+  static constexpr int kPanelSpiHz = 40 * 1000 * 1000;
+  // CS setup/hold in SPI cycles: SSD1677 ~60 ns; 3 @ 40 MHz = 75 ns.
+  static constexpr int kCsCycles = 3;
+
   static constexpr uint16_t DISPLAY_WIDTH = wintergreen::DisplayFrame::kPanelWidth;  // 800 (full panel)
   static constexpr uint16_t DISPLAY_HEIGHT = wintergreen::DisplayFrame::kPhysicalHeight;
   static constexpr uint16_t DISPLAY_WIDTH_BYTES = wintergreen::DisplayFrame::kStride;
@@ -141,11 +147,15 @@ class EInkDisplay : public wintergreen::IDisplay {
     // 5942a93), so a gray strip window (range, counters, both planes) is queued
     // whole and the CPU renders the next strip while DMA sends this one.
     spi_device_interface_config_t dev{};
-    dev.clock_speed_hz = 40 * 1000 * 1000;
+    dev.clock_speed_hz = kPanelSpiHz;
     dev.mode = 0;
     dev.spics_io_num = EPD_CS;
     dev.queue_size = 2 * kTxPerWindow;
     dev.pre_cb = dc_pre_cb_;
+    // SSD1677 wants ~60 ns CS setup and hold; the peripheral's
+    // default (0 cycles) gives half a clock. The old GPIO CS had microseconds.
+    dev.cs_ena_pretrans = kCsCycles;
+    dev.cs_ena_posttrans = kCsCycles;
     spi_bus_add_device(SPI2_HOST, &dev, &spi_);
 
     // The C3's die sensor, for the Turn LUT's band: chip temperature, a few
@@ -180,42 +190,22 @@ class EInkDisplay : public wintergreen::IDisplay {
 
   // ---- wintergreen::IDisplay ----
 
-  // RED RAM is the *previous* frame, and only EPD_FULL_REFRESH reads it.
-  //
-  // The full-refresh waveform is prior-state dependent: it drives each pixel from
-  // its old level to its new one, and the level it starts from is what RED holds.
-  // This used to write `pixels` to both planes with CTRL1_BYPASS_RED set, which
-  // told the controller to ignore RED altogether — so those 48 KB went out over
-  // SPI and were discarded, and the waveform fell back to the controller's own
-  // notion of the previous frame. After a session of fast partials that notion is
-  // stale, so pixels that should have been given a long white drive got a short
-  // one and stayed grey.
-  //
-  // Visible as a sleep cover that comes up washed out in its light areas, only on
-  // light covers (a dark one is mostly large transitions that get driven anyway)
-  // and only sometimes, since it depends on what was last on the glass.
-  //
-  // Half keeps BYPASS_RED. It is the boot paint — Application::start()'s
-  // full_refresh() defaults to it — and that sequence has already produced a
-  // panel that ran a waveform and then displayed nothing for the rest of time
-  // (see the EPD_HALF_REFRESH case in refreshDisplay). It draws from a cleared
-  // panel on a cold boot, so it has no previous frame to honour and gains
-  // nothing from one. Leave it alone.
-  void full_refresh(const uint8_t* pixels, const uint8_t* prev, wintergreen::RefreshMode mode,
-                    bool turnOffScreen) override {
-
+  // The one full-panel waveform: boot paint, sleep image, a book-list rebuild.
+  // OTP "half" mode with CTRL1_BYPASS_RED, so it paints from `pixels` alone;
+  // `pixels` also goes to RED, which the next fast update reads as the previous
+  // frame. Everything about it is load-bearing (see the EPD_HALF_REFRESH case in
+  // refreshDisplay): a variant once ran its waveform and then showed nothing
+  // for the rest of time. A prior-state "full" mode (RED = old frame, TEMP_LOAD)
+  // never had a caller and is gone (see 1cdf3fe).
+  void full_refresh(const uint8_t* pixels, bool turnOffScreen) override {
     finish_writes();
     wakeIfNeeded();
     waitWhileBusy();
-    const bool full = (mode != wintergreen::RefreshMode::Half);
-    // Without a previous frame there is nothing better to start from than the
-    // new one, which is the old behaviour.
-    const uint8_t* red = (full && prev) ? prev : pixels;
     // Buffer covers all 800 columns; panel offset is baked into draw-function coordinates.
     setRamArea(0, 0, DISPLAY_WIDTH, DISPLAY_HEIGHT);
     writeRamBuffer(CMD_WRITE_RAM_BW, pixels, BUFFER_SIZE);
-    writeRamBuffer(CMD_WRITE_RAM_RED, red, BUFFER_SIZE);
-    refreshDisplay(full ? EPD_FULL_REFRESH : EPD_HALF_REFRESH, turnOffScreen);
+    writeRamBuffer(CMD_WRITE_RAM_RED, pixels, BUFFER_SIZE);
+    refreshDisplay(EPD_HALF_REFRESH, turnOffScreen);
   }
 
   // Fire and return: the controller now holds the pixels in its own RAM, so both
@@ -316,6 +306,12 @@ class EInkDisplay : public wintergreen::IDisplay {
       cmd(CMD_SET_RAM_Y_COUNTER);
       small_(t[n++], 1, {lo8_(y_end), hi8_(y_end)});
     };
+    // Data entry mode first, every window: the controller resets to Y increment,
+    // and a boot straight into a book writes its first gray page before any
+    // setRamArea() has set it (each strip landed scrambled; the glass model and
+    // every later diff, gray or OTP, were then wrong).
+    cmd(CMD_DATA_ENTRY_MODE);
+    small_(t[n++], 1, {0x01});  // X inc, Y dec
     cmd(CMD_SET_RAM_X_RANGE);
     small_(t[n++], 1, {0, 0, lo8_(x_end), hi8_(x_end)});
     cmd(CMD_SET_RAM_Y_RANGE);
@@ -429,7 +425,7 @@ class EInkDisplay : public wintergreen::IDisplay {
 
   // Two windows of transactions in flight at most (GrayPage's two send-buffer
   // pairs). The descriptors live here until their results are collected.
-  static constexpr int kTxPerWindow = 16;
+  static constexpr int kTxPerWindow = 18;
   spi_transaction_t ring_[2][kTxPerWindow] = {};
   int ring_n_[2] = {};
   int ring_slot_ = 0;
@@ -502,13 +498,10 @@ class EInkDisplay : public wintergreen::IDisplay {
   // Callers that send further SPI commands right afterwards (deep sleep, screen
   // power-off) must keep wait=true — a command mid-waveform aborts it.
   void refreshDisplay(EpdRefreshMode mode, bool turnOffScreen = false, bool wait = true) {
-    turn_loaded_ = false;  // every mode below sets LUT_LOAD: the OTP table replaces ours
-    sendCommand(CMD_DISPLAY_UPDATE_CTRL1);
-    // Only EPD_HALF_REFRESH bypasses RED. Fast has always used it as the previous
-    // frame, and Full now does too — that is what makes a full refresh drive from
-    // the pixel's actual old level rather than from whatever the controller last
-    // tracked. See full_refresh() for what the bypass cost on the sleep cover.
-    sendData(mode == EPD_HALF_REFRESH ? CTRL1_BYPASS_RED : CTRL1_NORMAL);
+    turn_loaded_ = false;  // both modes set LUT_LOAD: the OTP table replaces ours
+    // Half (full_refresh) bypasses RED; fast reads it as the previous frame.
+    sendCommandData(CMD_DISPLAY_UPDATE_CTRL1,
+                    {static_cast<uint8_t>(mode == EPD_HALF_REFRESH ? CTRL1_BYPASS_RED : CTRL1_NORMAL)});
 
     // best guess at display mode bits:
     // bit | hex | name                    | effect
@@ -521,39 +514,11 @@ class EInkDisplay : public wintergreen::IDisplay {
     // 2   | 04  | DISPLAY_START           | Run display
     // 1   | 02  | ANALOG_OFF_PHASE        | Shutdown step 1 (undocumented)
     // 0   | 01  | CLOCK_OFF               | Disable internal oscillator
-
-    // TEMP_LOAD (0x20) makes the controller sample the sensor selected by
-    // CMD_TEMP_SENSOR_CONTROL — the internal one, chosen in
-    // initDisplayController() — into the temperature register, and the OTP
-    // waveform is then picked for *that* reading.
     //
-    // Without it the register only ever holds what the host last wrote, which is
-    // the fixed 0x5A below: every waveform on this device ran as though the panel
-    // were at one unchanging temperature. e-ink waveform timing is genuinely
-    // temperature-dependent, and driving a cold panel with a warm panel's
-    // waveform under-develops the pixels — which reads as ghosting and washed-out
-    // contrast, the exact symptoms the periodic full refresh exists to fix.
-    //
-    // **Only EPD_FULL_REFRESH takes it**, and the other two are excluded for
-    // different reasons. EPD_FAST_REFRESH is every menu and list update, the 1-bit
-    // hot path (reader pages run the Turn LUT, gray_fire, with its own bands).
-    // EPD_HALF_REFRESH is the boot paint, which on a device that deep-sleeps
-    // after a minute runs every time it is picked up; a correct, colder, longer
-    // waveform there was simply too visible. See the note in that case.
-    //
-    // What is left is exactly the set of updates that recondition the panel: the
-    // periodic DC-balancing flush and the sleep image, neither of which anybody
-    // is waiting on.
-    //
-    // The temperature cannot be read back: CMD_READ_TEMP needs MISO and the
-    // panel is wired write-only. The controller acts on it; nothing can print it.
-    //
-    // If a future panel revision disagrees, setting this to 0x00 restores the
-    // previous fixed-temperature behaviour exactly — the 0x5A seed write below
-    // is kept for that reason. It is a constant rather than a config option
-    // because it is a property of the controller, not a preference.
-    static constexpr uint8_t kTempLoad = 0x20;
-
+    // TEMP_LOAD is never set: the OTP waveform is picked by the 0x5A the host
+    // writes. Sampling the internal sensor on the boot paint made it visibly
+    // longer (0x5A is warmer than a room) on every pick-up. The temperature
+    // cannot be read back (CMD_READ_TEMP needs MISO; the panel is write-only).
     uint8_t displayMode = 0x00;
     if (!isScreenOn) {
       isScreenOn = true;
@@ -566,9 +531,6 @@ class EInkDisplay : public wintergreen::IDisplay {
     }
 
     switch (mode) {
-      case EPD_FULL_REFRESH:
-        displayMode |= 0x34 | kTempLoad;
-        break;
       case EPD_HALF_REFRESH:
         // This temperature-register write is NOT redundant, however much it
         // looks it. initDisplayController() does select the internal sensor
@@ -577,27 +539,8 @@ class EInkDisplay : public wintergreen::IDisplay {
         // black flash) and then showed nothing at all. 0xD4 includes LUT_LOAD,
         // and the OTP waveform this loads is selected by the temperature
         // register; without the write it does not come up with a usable LUT.
-        // Application::start()'s full_refresh() defaults to Half, so this is the
-        // path that draws the very first screen. Leave it alone.
-        //
-        // **This path deliberately does NOT take TEMP_LOAD**, and the reason is
-        // what the user sees rather than what the panel wants.
-        //
-        // Half is the boot paint — Application::start() ends with
-        // full_refresh(), whose default is Half — and because deep-sleep wake is
-        // a full boot, that is the waveform that runs *every time the device is
-        // picked up*. Letting the controller sample its sensor here made it
-        // visibly longer: 0x5A corresponds to a much warmer panel than a room,
-        // and e-ink waveforms get longer and invert more times as they get
-        // colder. Correct, and far too distracting several times an hour.
-        //
-        // EPD_FULL_REFRESH keeps TEMP_LOAD, and that is where it earns its keep:
-        // the periodic DC-balancing flush and the sleep image are the updates
-        // that actually recondition the panel, and they happen when nobody is
-        // waiting on them. Any under-driving this path leaves behind is cleared
-        // by the next flush.
-        sendCommand(CMD_WRITE_TEMP);
-        sendData(0x5A);
+        // This is the path that draws the very first screen. Leave it alone.
+        sendCommandData(CMD_WRITE_TEMP, {0x5A});
         displayMode |= 0xD4;
         break;
       case EPD_FAST_REFRESH:
@@ -642,6 +585,12 @@ class EInkDisplay : public wintergreen::IDisplay {
 
     sendCommand(CMD_BORDER_WAVEFORM);
     sendData(0x01);
+
+    // The fast (menu) waveform reads the temperature register, never loads it.
+    // It used to inherit 0x5A from the boot paint (Half); a boot straight into a
+    // book now paints gray first, so seed it.
+    sendCommand(CMD_WRITE_TEMP);
+    sendData(0x5A);
 
   }
 

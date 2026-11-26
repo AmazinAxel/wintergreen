@@ -1,7 +1,6 @@
 // The waveform tables epd.h uploads (platforms/esp32/panel_lut.h): 105 bytes in
 // the controller's layout, HOLD really idle, the turn's targets driving at once
-// as the stock X4 Pro text waveform (no reset pass before the new page), the
-// Full table = the X4 OEM factory table (band-lengthened, same shape),
+// as the stock X4 Pro text waveform (no reset pass before the new page),
 // temperature bands that only lengthen, clamp, and do not flap, and the
 // vendor's voltages untouched.
 #include <cassert>
@@ -61,15 +60,12 @@ int main() {
 
   for (Band b : {Band::Warm, Band::Cool, Band::Cold}) {
     const Timing t = timing(b);
-    uint8_t turn[kLutBytes], full[kLutBytes];
+    uint8_t turn[kLutBytes];
     build_turn(turn, t);
-    build_full(full, b);
-    for (int i = 0; i < 10; ++i) {
+    for (int i = 0; i < 10; ++i)
       assert(turn[kVsOffset + 40 + i] == 0);  // VCOM LUT4 idle
-      assert(full[kVsOffset + 40 + i] == 0);
-    }
     for (int i = 0; i < 5; ++i)
-      assert(turn[kFrOffset + i] == kFrameRate && full[kFrOffset + i] == 0x22);
+      assert(turn[kFrOffset + i] == kFrameRate);
 
     // Turn: LUT0 HOLD never drives; the targets are the stock text waveform's
     // rows, frame for frame, all driving from the start (no reset pass).
@@ -83,39 +79,15 @@ int main() {
       // Gray = to-black's drive (erases what was there), then pulled back.
       assert(g.code[i] == (i < t.black ? kVsBlack : i < t.black + t.gray_back ? kVsWhite : kVsHold));
     }
-
-    // Full: the OEM table's VS rows untouched; white ends on white, black on
-    // black; the band only lengthens phases (warm = verbatim, 50 frames).
-    const Seq f[4] = {run(full, 0), run(full, 1), run(full, 2), run(full, 3)};
-    for (int i = 0; i < 50; ++i)
-      assert(full[i] == kFactoryFull[i]);
-    auto last_drive = [](const Seq& s) {
-      for (int i = s.len - 1; i >= 0; --i)
-        if (s.code[i] != kVsHold)
-          return s.code[i];
-      return static_cast<int>(kVsHold);
-    };
-    assert(last_drive(f[0]) == kVsWhite && last_drive(f[3]) == kVsBlack);
-    assert(f[0].len == f[3].len);
-    if (b == Band::Warm) {
-      assert(f[0].len == 50);
-      for (size_t i = 0; i < kLutBytes; ++i)
-        assert(full[i] == kFactoryFull[i]);
-    }
   }
 
-  // The waveform picked on hardware: 25 frames at FR 0x33, gray 4 back.
-  assert(timing(Band::Warm).turn_len() == 25 && kFrameRate == 0x33 && kGrayBack == 4);
+  // The waveform picked on hardware: 13 frames at FR 0x33 (stock text halved), gray 2 back.
+  assert(timing(Band::Warm).turn_len() == 13 && kFrameRate == 0x33 && kGrayBack == 2);
+  assert(timing(Band::Warm).black + timing(Band::Warm).gray_back <= timing(Band::Warm).turn_len());
 
   // Bands only lengthen, and clamp to a byte.
   assert(timing(Band::Cool).turn_len() > timing(Band::Warm).turn_len() &&
          timing(Band::Cold).turn_len() > timing(Band::Cool).turn_len());
-  {
-    uint8_t w[kLutBytes], c[kLutBytes];
-    build_full(w, Band::Warm);
-    build_full(c, Band::Cold);
-    assert(run(c, 3).len > run(w, 3).len);
-  }
   assert(scaled_(250, Band::Cold) == 255);
 
   // Hysteresis: hovering at a boundary does not flip.

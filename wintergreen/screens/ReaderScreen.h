@@ -61,26 +61,33 @@ class ReaderScreen final : public IScreen, private GrayImageSource {
   uint8_t layout_ = 0;  // wgb_layout_index of page_
   uint32_t page_ = 0;   // index into layout_'s pages
 
-  // Two display-list buffers, claimed at boot (with the screen) and never
+  // Three display-list buffers, claimed at boot (with the screen) and never
   // freed: the page being shown (rendered straight out of it; GrayPage copies it
-  // once up) and the next one, read ahead after each waveform. A turn onto the
-  // read-ahead page swaps the pointers.
+  // once up) and its two neighbours, read ahead after each waveform. A turn
+  // either way onto a read-ahead page swaps pointers; the slot then holds the
+  // page just left, which is the new page's other neighbour.
   uint8_t* page_buf_ = static_cast<uint8_t*>(std::malloc(kWgbMaxPageBytes));
-  uint8_t* next_buf_ = static_cast<uint8_t*>(std::malloc(kWgbMaxPageBytes));
   size_t page_len_ = 0;
-  size_t next_len_ = 0;
-  // Which page each buffer holds.
+  // Which page a buffer holds.
   struct Loaded {
     bool valid = false;
     uint8_t layout = 0;
     uint32_t index = 0;
+    bool is(uint8_t l, uint32_t i) const {
+      return valid && layout == l && index == i;
+    }
   };
   Loaded loaded_;
-  Loaded next_;
+  struct Ahead {
+    uint8_t* buf = static_cast<uint8_t*>(std::malloc(kWgbMaxPageBytes));
+    size_t len = 0;
+    Loaded at;
+  };
+  Ahead ahead_[2];
   // Put page `index` of `layout`'s display list in page_buf_.
   bool load_page_(DrawBuffer& buf, uint8_t layout, uint32_t index);
-  // Read page_ + 1 into next_buf_ (panel idle only).
-  void prefetch_next_();
+  // Read page_ + 1 and page_ - 1 into ahead_ (panel idle only).
+  void prefetch_();
 
   HoldRepeat hold_next_;
   HoldRepeat hold_prev_;

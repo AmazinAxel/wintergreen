@@ -25,12 +25,10 @@ void Application::start(DrawBuffer& buf, IRuntime& runtime) {
   started_ = true;
   running_ = true;
 
-  // All of the possible menus!! There's only four, pretty much the bare minimum!
   home_.set_app(this);
   menu_.set_app(this);
   reader_.set_app(this);
   quickmenu_.set_app(this);
-
 
   load_settings_();
 
@@ -61,7 +59,7 @@ void Application::start(DrawBuffer& buf, IRuntime& runtime) {
   } else {
     // The index has to be loaded here to answer that; both screens load it only
     // when it is empty, so this costs nothing extra.
-    if (data_dir_ && BookIndex::instance().entries().empty())
+    if (BookIndex::instance().entries().empty())
       BookIndex::instance().load(index_path_);
 
     // The carousel shows the most recently *opened* books, so it needs reading
@@ -72,7 +70,6 @@ void Application::start(DrawBuffer& buf, IRuntime& runtime) {
       if (e.last_open_order != 0) { any_opened = true; break; }
     screen_mgr_.push(any_opened ? static_cast<IScreen*>(&home_) : static_cast<IScreen*>(&menu_), buf, runtime);
   }
-
 
   buf.full_refresh();
 }
@@ -90,8 +87,8 @@ void Application::auto_open_book(const char* epub_path, DrawBuffer& buf, IRuntim
 // order, so one fread straight into the draw buffer is the whole job. No
 // scratch buffer, no blit. A short file leaves a partial frame, which the
 // caller's wordmark fallback overwrites in full.
-static bool show_book_cover_sleep_(DrawBuffer& buf, const char* data_dir, const std::string& book_path) {
-  if (!data_dir || book_path.empty()) return false;
+static bool show_book_cover_sleep_(DrawBuffer& buf, const std::string& book_path) {
+  if (book_path.empty()) return false;
 
   const std::string cpath = cover_sleep_bin_path(book_path.c_str());
   FILE* f = std::fopen(cpath.c_str(), "rb");
@@ -100,11 +97,11 @@ static bool show_book_cover_sleep_(DrawBuffer& buf, const char* data_dir, const 
   std::fclose(f);
   if (!ok)
     return false;
-
+  // The full refresh bypasses RED (CTRL1_BYPASS_RED) and paints from the frame alone, which
   // Half ignores prev (CTRL1_BYPASS_RED) and paints from `pixels` alone, which
   // is what keeps it to a single pass and makes the sleep screen appear quietly.
   //
-  // RefreshMode::Full was tried here for a reported left/right fade on one
+  // A prior-state full mode was tried here for a reported left/right fade on one
   // cover. It did not fix it and its extra inversion phases were visibly
   // flashier, so it was reverted. The fade is not a panel artefact: measuring
   // cover_sleep.bin directly, ink coverage runs 0.52 at the centre column band
@@ -112,7 +109,7 @@ static bool show_book_cover_sleep_(DrawBuffer& buf, const char* data_dir, const 
   // vignette and the panel is rendering it faithfully. Other covers are
   // near-uniform (the hobbit ~0.95, lord of the flies ~0.10) and have no
   // gradient to show. Don't go looking for a waveform fix for this one.
-  buf.full_refresh(RefreshMode::Half, /*turnOffScreen=*/true);
+  buf.full_refresh(/*turnOffScreen=*/true);
   return true;
 }
 
@@ -126,8 +123,7 @@ void Application::do_sleep_(DrawBuffer& buf, bool wordmark_image) {
   buf.set_rotation(Rotation::Deg90);
 
   // The cover of the most recently opened book is the default sleep screen.
-  // The embedded wintergreen image is kept as the fallback, and is what a
-  // power-button long-press should show once that gesture is wired up.
+  // The embedded wordmark is the fallback.
   // The cover shows only while a book is actually open, and never for a hidden
   // one — the sleep screen is on display while the device sits around, so a
   // hidden book must not be advertised by it. Anything else gets the wordmark.
@@ -149,7 +145,7 @@ void Application::do_sleep_(DrawBuffer& buf, bool wordmark_image) {
   // a reader stop() drains the panel first and must not find it asleep.
   bool shown = false;
   if (!cover_book.empty())
-    shown = show_book_cover_sleep_(buf, data_dir_, cover_book);
+    shown = show_book_cover_sleep_(buf, cover_book);
   if (!shown)
     shown = buf.show_sleep_image_embedded();
 
@@ -195,14 +191,13 @@ void Application::update(const ButtonState& buttons, uint32_t dt_ms, DrawBuffer&
       runtime.set_performance_hold(false);
   }
 
-
   // Low-battery cutoff. Deep-discharging a Li-ion cell below ~3.0 V costs it
   // permanent capacity, so the device puts itself away before it gets there and
   // main.cpp refuses to boot again until it has been charged.
   //
   // This is dangerous code: a false positive makes the device look bricked, and
   // it shipped once with three faults that together did exactly that. Anything
-  // that changes it must preserve all five guards below.
+  // that changes it must preserve every guard below.
   //
   //   1. A zero reading means "cannot measure" and is ignored.
   //   2. So is anything below kImplausibleMv — a broken ADC reads near zero, and
@@ -218,8 +213,7 @@ void Application::update(const ButtonState& buttons, uint32_t dt_ms, DrawBuffer&
   //   6. It samples once a second, not once a frame. The cell cannot move in
   //      25 ms, and an ADC conversion plus its calibration curve is real work to
   //      repeat 40 times a second for an answer that never changes.
-  if (kLowBatteryCutoffMv > 0 && !buf.display().is_busy()) {
-    static constexpr int kImplausibleMv = 2500;
+  if (!buf.display().is_busy()) {
     battery_poll_ms_ += dt_ms;
     if (battery_poll_ms_ >= kBatteryPollMs) {
       const uint32_t elapsed = battery_poll_ms_;
@@ -253,7 +247,6 @@ void Application::update(const ButtonState& buttons, uint32_t dt_ms, DrawBuffer&
       }
     }
   }
-
 
   // Power button: hold to sleep, tap to select. The tap resolves on release —
   // the only way to tell it apart from a hold — and is forwarded to the screen
@@ -364,7 +357,7 @@ uint32_t Application::idle_wait_ms(DrawBuffer& buf) const {
     wait = due(perf_idle_ms_, kPerfHoldMs);  // releases the 160 MHz hold
   if (persist_pending_ && !busy)
     wait = std::min(wait, due(persist_quiet_ms_, kPersistQuietMs));
-  if (kLowBatteryCutoffMv > 0 && !busy)
+  if (!busy)
     wait = std::min(wait, due(battery_poll_ms_, kBatteryPollMs));
   if (config::kAutoSleepMinutes > 0) {
     const uint32_t timeout_ms = static_cast<uint32_t>(long_sleep_ ? 5 : config::kAutoSleepMinutes) * 60u * 1000u;
@@ -379,6 +372,7 @@ void Application::flush_persist() {
   if (!persist_pending_)
     return;
   persist_pending_ = false;
+  write_pending_pos();
   BookIndex::instance().save(index_path_);  // returns at once when clean
   save_settings_();                         // skips the write when unchanged
 }
@@ -397,10 +391,8 @@ IScreen* Application::screen_for_(ScreenId id) {
       return nullptr;
   }
 }
-void Application::save_settings_() {
-  if (settings_path_.empty())
-    return;
 
+void Application::save_settings_() {
   ReaderScreen* reader = &reader_;
   const bool reader_active = screen_mgr_.contains(reader);
 
@@ -442,7 +434,6 @@ void Application::save_settings_() {
     settings_written_ = out;
 }
 
-
 void Application::record_book_opened(const std::string& path) {
   // In-memory only. Neither file is written here.
   //
@@ -456,8 +447,39 @@ void Application::record_book_opened(const std::string& path) {
   // resumes at the position you started from.
   BookIndex::instance().mark_opened(path);
 }
+void Application::queue_book_pos(const std::string& path, std::string line) {
+  if (path.empty())
+    return;
+  if (!pending_pos_path_.empty() && pending_pos_path_ != path)
+    write_pending_pos();  // never drop another book's position
+  pending_pos_path_ = path;
+  pending_pos_line_ = std::move(line);
+  persist_pending_ = true;
+}
+
+// Direct fopen("w"), as the reader always wrote it: two numbers, and a torn
+// write only costs the position (the book reopens at its start).
+void Application::write_pending_pos() {
+  if (pending_pos_path_.empty())
+    return;
+  if (FILE* f = std::fopen(pending_pos_path_.c_str(), "w")) {
+    std::fwrite(pending_pos_line_.data(), 1, pending_pos_line_.size(), f);
+    std::fclose(f);
+  }
+  pending_pos_path_.clear();
+  pending_pos_line_.clear();
+}
+
+void Application::load_deferred_index() {
+  if (!index_deferred_)
+    return;
+  index_deferred_ = false;
+  if (BookIndex::instance().entries().empty())
+    BookIndex::instance().load(index_path_);
+}
+
 void Application::record_book_progress(const std::string& path, int pct) {
-  if (!data_dir_ || path.empty())
+  if (path.empty())
     return;
   BookIndex& idx = BookIndex::instance();
   // A session that resumed straight into a book never read the index (see
@@ -479,8 +501,6 @@ void Application::record_book_progress(const std::string& path, int pct) {
 }
 
 void Application::load_settings_() {
-  if (settings_path_.empty())
-    return;
   FILE* f = std::fopen(settings_path_.c_str(), "r");
   if (!f) {
     // Power was lost between the remove() and the rename() in save_settings_
@@ -513,7 +533,6 @@ void Application::load_settings_() {
       rotate_reader_ = static_cast<uint8_t>(uval == 1 ? 1 : 0);
   }
   std::fclose(f);
-
 
   pending_book_path_ = last_book_path; // to open
 }

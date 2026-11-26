@@ -20,10 +20,6 @@ class MainMenu final : public ListMenuScreen {
  public:
   MainMenu() = default;
 
-  void set_books_dir(const char* dir) {
-    books_dir_ = dir;
-  }
-
   // The full path of the currently highlighted entry (even if not yet opened).
   std::string current_book_path() const {
     const int idx = entries_index_for(selected());
@@ -37,10 +33,6 @@ class MainMenu final : public ListMenuScreen {
   // so it never survives leaving the list.
   void set_show_hidden(bool v) {
     show_hidden_ = v;
-  }
-
-  const char* books_dir() const {
-    return books_dir_;
   }
 
   std::string_view get_item_label(int index) const override;
@@ -72,7 +64,6 @@ class MainMenu final : public ListMenuScreen {
   void on_back() override;
 
  private:
-  const char* books_dir_ = nullptr;
   std::string initial_selection_;   // path to pre-select after scan
   DrawBuffer* buf_ = nullptr;
   // Cached BookIndex::generation() value from the last populate_list_(). When
@@ -148,7 +139,7 @@ class MainMenu final : public ListMenuScreen {
   void select_first_book_();
   // NAS sync: hands off to IRuntime::start_sync() and returns.
   void run_sync_();
-  // Reads <books_dir>/.hidden/ into hidden_. Only called when the gesture asks
+  // Reads <kCardRoot>/.hidden/ into hidden_. Only called when the gesture asks
   // for it, so the card is not walked on every visit to this screen.
   void scan_hidden_();
 

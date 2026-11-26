@@ -133,6 +133,12 @@ turns). See "Build & flash", "Idle power" and "Refresh latency".
 
 Only the reasons are kept — the symbol-by-symbol inventories are in git history.
 
+**Turn-LUT exit reset (experiment, closed 2026-11-25: success).** `kResetLeavingTurn` gated a SW reset + controller init before the first OTP update after a gray page, in case `LUT_LOAD` leaves the Turn voltages in place. Run with it off: no menu ghosting after reading, faster reader → menu. Hardcoded off; `leave_turn_`, `turn_regs_`, `IDisplay::gray_end` deleted. See docs/display.md "Leaving the Turn LUT: no reset".
+
+**Dead paths removed in the 2026-11-25 audit.** `RefreshMode` (`Full` never had a caller; `full_refresh(pixels, turnOffScreen)` is the one Half paint), `EPD_FULL_REFRESH` and `kTempLoad` with it; `panel_lut::kFactoryFull` / `build_full` (OEM 4-gray full table, nothing uploaded it); `kLowBatteryCutoffMv == 0` "disabled" branches (the cutoff is a fixed 3200); `Application::set_state_root` / `set_books_dir` / `data_dir_` and `MainMenu::books_dir_` (card root is `kCardRoot`, `Application.h`), and every null check on them and on screens' `app_` (always set in `Application::start`); `Esp32Runtime`'s destructor (static, never destroyed); `release_sleep_holds_()` (boot-time release of the 2026-11-11 B3 pin holds, long since cleared).
+
+**`kResumeOnePageBack`, `kHoldAccelStep` (2026-11-25).** Config options, both shipped off (`false` / `0`); hardcoded off and deleted. Reader resumes on the saved page; list hold repeat moves one entry per repeat (`hold_reps_*` step counters gone).
+
 **Grayscale everywhere (`5942a93`, reverted `a83a0f3`); reader pages brought back
 (2026-11-25, owner's call).** The custom Turn LUT plus draw lists for every screen ghosted
 and misbehaved around the menus, lists and covers; on reading pages it read great. Only

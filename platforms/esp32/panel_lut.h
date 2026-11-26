@@ -1,20 +1,23 @@
 #pragma once
 
-// SSD1677 waveform tables for the GDEQ0426T82, built at runtime from a few
+// SSD1677 Turn waveform table for the GDEQ0426T82, built at runtime from a few
 // named frame counts. No IDF dependency: tools/tests/lut_test.cpp builds the
-// same tables on the host.
+// same table on the host. Everything but reader pages runs the OTP waveforms.
 //
 // One update drives each pixel by the waveform its two RAM bits select
-// (state = RED << 1 | BW, LUT0..LUT3; SSD1677 datasheet Table 6-5). Two tables:
+// (state = RED << 1 | BW, LUT0..LUT3; SSD1677 datasheet Table 6-5).
 //
-//   Turn (page turns, menus). State = slot. LUT0 HOLD (no drive), LUT1
+//   Turn (gray reader pages). State = slot. LUT0 HOLD (no drive), LUT1
 //   to-white, LUT2 to-gray, LUT3 to-black. All three drive at once, so the
 //   old page fades out while the new one comes in (no reset pass first):
 //
-//     frame      0 1             17   21   25
-//     to-white     | white 24 ...............|
-//     to-gray    | black 17 .....| white 4 |
-//     to-black   | black 17 .....|
+//     frame      0 1        9   11  13
+//     to-white     | white 12 ......|
+//     to-gray    | black 9 | white 2|
+//     to-black   | black 9 |
+//
+//   (Halved from the stock text waveform below, 2026-11-25; frame counts at
+//   kToWhite.)
 //
 //   Black and white are the Xteink X4 Pro stock firmware's one-pass text
 //   waveform (kX4ProTextSsd1677, extracted by the FreeInk SDK,
@@ -23,10 +26,11 @@
 //   show through new gray. Ours is the X4 OEM full table's trick: drive to
 //   black like to-black (whatever was there is gone), then pull back with
 //   white. Picked on hardware from 1..4 frames back (2026-11-19 comparison
-//   screen): 4 matched a 1 px checkerboard (50%) and showed no old text.
+//   screen): 4 matched a 1 px checkerboard (50%) and showed no old text;
+//   2 since the halving.
 //
-//   The stock waveform re-drives every black pixel each update; DrawBuffer
-//   does the same inside the damage (held black fades within minutes, so
+//   The stock waveform re-drives every black pixel each update; GrayPage
+//   does the same in changed strips (held black fades within minutes, so
 //   glyphs half re-driven read uneven). Its white-rest "nudge" row is our
 //   HOLD: held gray and black share that slot.
 //
@@ -35,19 +39,10 @@
 //   (slow, AA flashed every update); OEM full recipes per slot (50 frames) and
 //   a black-then-white flash for every driven pixel (58): too slow to read.
 //
-//   Full (boot paint, sleep). State = level (LUT0 white .. LUT3 black). The
-//   Xteink X4's own OEM 4-gray table verbatim (kFactoryFull: 50 frames, FR
-//   0x22), only lengthened in the cold bands. Its grays drive toward black and
-//   pull back with a few frames of white; our own short black pulses from
-//   white came out far darker than the 0.5 / 0.75 covers are dithered for.
-//   So the turn's gray and the full refresh's gray are no longer one recipe.
-//
 // Turn unrolled into phases (10 groups x 4), no repeat counts.
 //
-// Not DC-balanced on turns (neither is the stock waveform). The sleep/boot
+// Not DC-balanced (neither is the stock waveform). The sleep/boot OTP
 // full refreshes clear residual charge.
-//
-// docs/display.md "Waveform tuning" is the checklist.
 
 #include <cstddef>
 #include <cstdint>
@@ -75,37 +70,17 @@ inline constexpr uint8_t kVcom = 0x30;                             // 0x2C
 // Frame rate byte (each nibble one group pair), from the stock text waveform.
 inline constexpr uint8_t kFrameRate = 0x33;
 
-// Turn frame counts at room temperature (stock text waveform).
-inline constexpr int kToWhite = 24;     // to-white: VSL
+// Turn frame counts at room temperature: the stock text waveform (24 / 17 / 4,
+// ~600 ms) halved, 13 frames ~310 ms at ~24 ms per frame (2026-11-25, owner's
+// pick on hardware: "so good"). The stock 25 was the 2026-11-19 pick; 17 (~410 ms)
+// was the middle step.
+inline constexpr int kToWhite = 12;     // to-white: VSL
 inline constexpr int kWhiteStart = 1;   // ... from this frame
-inline constexpr int kToBlack = 17;     // to-black: VSH1 from frame 0
-inline constexpr int kGrayBack = 4;     // to-gray: to-black's drive, then this many VSL frames
+inline constexpr int kToBlack = 9;      // to-black: VSH1 from frame 0
+inline constexpr int kGrayBack = 2;     // to-gray: to-black's drive, then this many VSL frames
 
 inline constexpr size_t kLutBytes = 105;  // 0x32: 5 x 10 VS, 10 x 5 TP/RP, 5 FR
 inline constexpr int kMaxPhases = 40;     // 10 groups x 4 phases
-
-// The X4 OEM firmware's 4-gray full-refresh table ("quality", 50 frames, FR
-// 0x22; FreeInk SDK lut_factory_quality, from the OEM binary), voltages
-// stripped (they are kGateVoltage .. kVcom above, identical). LUT0 white,
-// LUT1 light, LUT2 gray, LUT3 black.
-inline constexpr uint8_t kFactoryFull[kLutBytes] = {
-    0x00, 0x4A, 0x88, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,  //
-    0x80, 0x62, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,  //
-    0x88, 0x60, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,  //
-    0xA8, 0x44, 0x04, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,  //
-    0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,  //
-    0x08, 0x0B, 0x02, 0x03, 0x00,                                //
-    0x0C, 0x02, 0x07, 0x02, 0x00,                                //
-    0x01, 0x00, 0x02, 0x00, 0x00,                                //
-    0x00, 0x00, 0x00, 0x00, 0x00,                                //
-    0x00, 0x00, 0x00, 0x00, 0x00,                                //
-    0x00, 0x00, 0x00, 0x00, 0x00,                                //
-    0x00, 0x00, 0x00, 0x00, 0x00,                                //
-    0x00, 0x00, 0x00, 0x00, 0x00,                                //
-    0x00, 0x00, 0x00, 0x00, 0x00,                                //
-    0x00, 0x00, 0x00, 0x00, 0x01,                                //
-    0x22, 0x22, 0x22, 0x22, 0x22,                                //
-};
 
 struct Timing {
   int white, white_start, black, gray_back;
@@ -203,17 +178,6 @@ inline void build_turn(uint8_t (&out)[kLutBytes], const Timing& t) {
       {3, 0, t.black, B},
   };
   build_(out, segs, 4);
-}
-
-// kFactoryFull, every phase lengthened by the band (same shape, so the same
-// levels; RP untouched).
-inline void build_full(uint8_t (&out)[kLutBytes], Band band) {
-  std::memcpy(out, kFactoryFull, kLutBytes);
-  for (int g = 0; g < 10; ++g)
-    for (int ph = 0; ph < 4; ++ph) {
-      uint8_t& tp = out[kTpOffset + g * 5 + ph];
-      tp = static_cast<uint8_t>(scaled_(tp, band));
-    }
 }
 
 }  // namespace panel_lut

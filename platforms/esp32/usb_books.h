@@ -128,7 +128,7 @@ inline bool receive_book_(uint8_t* chunk, bool& index_changed) {
   uint8_t files = 0;
   if (!read_name_(dir) || !read_(&files, 1))
     return false;
-  const std::string book_dir = std::string(g_app->main_menu()->books_dir()) + "/" + dir;
+  const std::string book_dir = std::string(wintergreen::kCardRoot) + "/" + dir;
   g_buf->wait_panel_idle();
   ::mkdir(book_dir.c_str(), 0777);
   for (uint8_t i = 0; i < files; ++i)

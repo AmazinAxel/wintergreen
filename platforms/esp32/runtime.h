@@ -31,13 +31,6 @@ class Esp32Runtime final : public wintergreen::IRuntime {
     init_pm_();
   }
 
-  ~Esp32Runtime() override {
-    if (adc_cali_handle_) {
-      adc_cali_delete_scheme_curve_fitting(adc_cali_handle_);
-    }
-  }
-
-
   // Measured duration of the last frame, not the target — Application uses it as
   // dt for the auto-sleep countdown, which drifts if the nominal value is returned.
   uint32_t frame_time_ms() const override {
@@ -48,7 +41,7 @@ class Esp32Runtime final : public wintergreen::IRuntime {
     return target_frame_ms_;
   }
 
-  // B4: idle screens block until their nearest deadline (seconds) instead of
+  // Idle screens block until their nearest deadline (seconds) instead of
   // waking 40 times a second to find nothing to do.
   void wait_next_frame(uint32_t budget_ms) override {
     const uint32_t now = millis();
@@ -126,7 +119,6 @@ class Esp32Runtime final : public wintergreen::IRuntime {
       last_pct_ = static_cast<uint8_t>(pct);
     return last_pct_;
   }
-
 
   // Dynamic frequency scaling. The lock is held only while the UI is working;
   // see IRuntime::set_performance_hold for why layout needs it explicitly.

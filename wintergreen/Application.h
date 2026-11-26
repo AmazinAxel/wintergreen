@@ -26,7 +26,7 @@ enum class ScreenId : uint8_t {
 
 // Terminal battery voltage. Below this the device saves state, shows the
 // wordmark and deep-sleeps, and main.cpp's verify_battery() refuses to boot
-// again until the cell has been charged. 0 disables the whole mechanism.
+// again until the cell has been charged.
 //
 // **Not a config option, on purpose.** It is a property of the cell and the
 // board's brownout margin, not a preference, and getting it wrong makes the
@@ -43,6 +43,12 @@ enum class ScreenId : uint8_t {
 // taken with the panel *idle*, so the loaded voltage during a refresh is already
 // lower than what is measured here.
 inline constexpr uint16_t kLowBatteryCutoffMv = 3200;
+// Readings below this are a broken or uncalibrated ADC, not a cell (one that
+// far gone is past its protection IC): both cutoff checks ignore them.
+inline constexpr int kImplausibleMv = 2500;
+
+// Where sdcard.h mounts the card (SD_MOUNT): books, settings and index.
+inline constexpr const char* kCardRoot = "/sdcard";
 
 // Two orientations only. The reversed ones were dropped, and with them every
 // drawing branch for them: they are the same physical hold as their
@@ -59,38 +65,17 @@ inline const char* rotation_label(uint8_t v) {
 class Application {
  public:
   Application() = default;
-  void set_books_dir(const char* dir) {
-    menu_.set_books_dir(dir);
-  }
-
-  // Where persistent state lives. Two hidden files at the root of the card, and
-  // **no directory**: there used to be a `.wintergreen/` folder holding
-  // `settings`, `book_index.dat` and one `<hash>.pos` per book. The positions
-  // moved next to their books (see book_pos_path) and the other two are now
-  // dotfiles, so nothing has to be created before the first save.
-  //
-  // They stay two files rather than one because they are written on completely
-  // different schedules: settings is a few dozen bytes saved whenever the device
-  // sleeps, while the index is ~30 KB written once a session. Merging them would
-  // rewrite the index every time a font size changed.
-  void set_state_root(const char* dir) {
-    data_dir_ = dir;
-    if (!dir)
-      return;
-    settings_path_ = std::string(dir) + "/.wintergreen";
-    index_path_ = std::string(dir) + "/.wintergreen-index";
-  }
-
+  // Persistent state: two hidden files at kCardRoot, no
+  // directory. They stay two files because they are written on different
+  // schedules: settings is a few dozen bytes saved whenever the device sleeps,
+  // the index ~30 KB once a session. Positions live beside their books
+  // (book_pos_path).
   const std::string& index_path() const {
     return index_path_;
   }
 
-  // Root the EPUB-cache cover paths are derived from. Only the WGB branch of
-  // CoverPaths is reachable on device, so this is effectively just "the card".
-  const char* data_dir_ = nullptr;
-
-  std::string settings_path_;
-  std::string index_path_;
+  const std::string settings_path_ = std::string(kCardRoot) + "/.wintergreen";
+  const std::string index_path_ = std::string(kCardRoot) + "/.wintergreen-index";
   std::string settings_written_;
   std::string pending_book_path_;
 
@@ -136,13 +121,23 @@ class Application {
   }
 
   // Called when a book is opened: bumps the open-order counter in the in-memory
-  // index and persists settings. The index itself is written once per session,
-  // by record_book_progress() when the reader closes.
+  // index (nothing written). The index itself is written once per session,
+  // by flush_persist() after the reader closes.
   void record_book_opened(const std::string& path);
 
   // Called by ReaderScreen when it closes: caches the reading percentage in the
   // index so the book list can show it without reopening every book.
   void record_book_progress(const std::string& path, int pct);
+
+  // The reader's .pos line for `path`, written by flush_persist() once the
+  // next screen is up (it was an SD write between Back and the home screen).
+  // write_pending_pos() writes it now: a reader start, before reading .pos.
+  void queue_book_pos(const std::string& path, std::string line);
+  void write_pending_pos();
+
+  // Reader idle (panel idle, after the read-ahead): a session resumed straight
+  // into a book reads the index now instead of on Back.
+  void load_deferred_index();
 
   // Navigate to a screen: push on top of the current screen (current stays on stack).
   // Or replace the current screen (pop it first, then push the new one).
@@ -239,6 +234,8 @@ class Application {
   // underneath unstarted and the book index is not read until something needs
   // it. See record_book_progress().
   bool index_deferred_ = false;
+  std::string pending_pos_path_;  // queue_book_pos
+  std::string pending_pos_line_;
 
   // Index and settings writes owed by a reader close or a pop from the reader
   // stack, held back so the next screen draws first. See the end of update().

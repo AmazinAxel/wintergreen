@@ -160,7 +160,7 @@ ms to ~25:
 
 - the reader's and list's page/row repeat fired once **per frame** with no delay, so a
   tap registered as two presses. They now use `HoldRepeat` (`Input.h`), driven by
-  `config::kHoldDelayMs` / `kHoldRepeatMs` / `kHoldAccelStep`.
+  `config::kHoldDelayMs` / `kHoldRepeatMs`.
 - the clicker's hold is its own constant, `config::kBluetoothHoldDelayMs` (100), timed by
   `esp_timer` in `wg_clicker::poll()` with the loop waking at the deadline
   (`docs/bluetooth.md`).
@@ -173,11 +173,7 @@ ms to ~25:
 `kMaxPerTick` — cashing in a multi-second stall as a burst reads as a freeze then a
 jump.
 
-The menu's acceleration step is read into a local before its inner loop. Written as
-`for (i = 0; i < ++hold_reps_up_; ++i)` the increment sits in the loop *condition* and
-is re-evaluated every pass, so the bound outruns `i` and the loop never terminates —
-that shipped once and hung the device on any button hold. The step is also capped at
-the list length.
+The menu once had a per-repeat acceleration step (`kHoldAccelStep`, removed 2026-11-25; each repeat now moves one entry). Its loop was written as `for (i = 0; i < ++hold_reps_up_; ++i)`: the increment sat in the loop *condition* and was re-evaluated every pass, so the bound outran `i` and the loop never terminated — that shipped once and hung the device on any button hold.
 
 Beware `pdMS_TO_TICKS(1)`: at `FREERTOS_HZ=100` it is **0 ticks**, and `vTaskDelay(0)`
 only yields, so any wait loop using it spins the CPU flat out. `epd.h`'s
@@ -189,9 +185,9 @@ only yields, so any wait loop using it spins the CPU flat out. `epd.h`'s
 Added 2026-11-11: `deep_sleep_now_()` drove SD CS (GPIO12), panel CS (GPIO21) and panel
 RST (GPIO5) high and held them (`gpio_hold_en` + `gpio_deep_sleep_hold_en`). Never
 measured; deep-sleep drain was visibly worse with it (GPIO12 is in the VDD_SPI pad
-group). Removed: nothing is held, sleep is the pre-B3 path. `app_main` still calls
-`release_sleep_holds_()` first so a device that slept under the old firmware gets its
-pins back (a held CS cannot be driven). Don't re-add without an ammeter.
+group). Removed: nothing is held, sleep is the pre-B3 path. The boot-time release for
+devices that slept under that firmware (`release_sleep_holds_()`) went 2026-11-25.
+Don't re-add without an ammeter.
 
 ## The power button
 

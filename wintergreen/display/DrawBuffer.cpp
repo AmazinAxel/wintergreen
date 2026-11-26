@@ -223,7 +223,7 @@ int DrawBuffer::draw_text_proportional(int x, int baseline_y, const char* text, 
   return draw_text_impl_(buf_, rotation_, x, baseline_y, text, len, font, white, style);
 }
 
-// Decode MGR2 into the draw buffer and paint it with RefreshMode::Half.
+// Decode MGR2 into the draw buffer and paint it with a full refresh.
 //
 // This used to build both RAM planes and fire grayscale_refresh_1pass. That
 // was dropped for two reasons, and the first is the reason it looked wrong:
@@ -280,7 +280,7 @@ bool DrawBuffer::show_sleep_image_embedded() {
   }
 
   gray_.drop_pending();
-  display_.full_refresh(buf_, nullptr, RefreshMode::Half, /*turnOffScreen=*/true);
+  display_.full_refresh(buf_, /*turnOffScreen=*/true);
   gray_.set_glass(GrayPage::Glass::Frame);
   return true;
 }

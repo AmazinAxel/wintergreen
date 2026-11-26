@@ -103,9 +103,9 @@ void HomeScreen::on_start() {
   set_buf_rotation_(Rotation::Deg90);
 
   // Same rule as MainMenu::on_start(): the resident index is authoritative, so
-  // only parse book_index.dat when nothing is loaded (a cold boot). Backing out
+  // only parse the index file when nothing is loaded (a cold boot). Backing out
   // of a book used to re-read and re-parse the whole file off the SD card here.
-  if (app_ && app_->data_dir_ && BookIndex::instance().entries().empty()) {
+  if (BookIndex::instance().entries().empty()) {
     const std::string& idx_path = app_->index_path();
     BookIndex::instance().load(idx_path);
   }
@@ -201,7 +201,7 @@ void HomeScreen::on_start() {
 }
 
 void HomeScreen::on_select(int index) {
-  if (!app_ || index < 0 || index >= num_books_) return;
+  if (index < 0 || index >= num_books_) return;
   const std::string path(slots_[index].path);  // once per open, not per visit
   app_->record_book_opened(path);
   app_->reader()->set_path(path.c_str());
@@ -257,10 +257,8 @@ void HomeScreen::update(const ButtonState& buttons, DrawBuffer& buf, IRuntime& r
   // wait for and no hold to distinguish. Open the plain list at once.
   if (!back_down && buttons.is_pressed(Button::Button0) && !back_was_down_) {
     back_hold_ms_ = 0;
-    if (app_) {
-      app_->main_menu()->set_show_hidden(false);
-      app_->push_screen(ScreenId::MainMenu);
-    }
+    app_->main_menu()->set_show_hidden(false);
+    app_->push_screen(ScreenId::MainMenu);
     return;
   }
 
@@ -278,10 +276,8 @@ void HomeScreen::update(const ButtonState& buttons, DrawBuffer& buf, IRuntime& r
       // it started, so it cannot immediately pop itself.
       if (back_hold_ms_ >= kHiddenHoldMs) {
         back_consumed_ = true;
-        if (app_) {
-          app_->main_menu()->set_show_hidden(true);
-          app_->push_screen(ScreenId::MainMenu);
-        }
+        app_->main_menu()->set_show_hidden(true);
+        app_->push_screen(ScreenId::MainMenu);
         return;
       }
     }
@@ -291,7 +287,7 @@ void HomeScreen::update(const ButtonState& buttons, DrawBuffer& buf, IRuntime& r
     // A hold that already opened the list resolves here as nothing at all.
     if (back_consumed_) {
       back_consumed_ = false;
-    } else if (app_) {
+    } else {
       app_->main_menu()->set_show_hidden(false);
       app_->push_screen(ScreenId::MainMenu);
     }

@@ -55,15 +55,13 @@ namespace wintergreen::config {
 
   inline constexpr uint8_t kAutoSleepMinutes = 1;
 
-  inline constexpr bool kResumeOnePageBack = false;
   inline constexpr uint32_t kHoldDelayMs = 250;
   inline constexpr uint32_t kHoldRepeatMs = 100;
-  inline constexpr int kHoldAccelStep = 0;
   inline constexpr uint32_t kBluetoothHoldDelayMs = 100;
 }
 ```
 
-If you use a white Xteink in the sun, I recommend enabling the fading fix, but it can cause more full screen refreshes. If you own a newer Xteink, you may not need the fix since I've used the device in the sun without needing to enable the option (which I have kept from nous). Auto sleep should be set to as low a value as comfortably possible. I personally recommend 1-2 minutes, depending on your reading speed.
+Auto sleep should be set to as low a value as comfortably possible. I personally recommend 1-2 minutes, depending on your reading speed.
 
 The button timing should also be modified to your liking! Especially to scroll through a large library of books or chapters, I suggest lower values for repeating and hold. Be warned that below 200ms repeat, it can get a little disorientating since the e-ink panel can only refresh so fast! The defaults are very sensible.
 

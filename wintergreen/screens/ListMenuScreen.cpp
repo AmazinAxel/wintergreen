@@ -4,7 +4,6 @@
 #include <cstdio>
 #include <cstring>
 
-
 #include "../Application.h"
 #include "../display/ui_font_header.h"
 #include "../display/ui_font_large.h"
@@ -314,7 +313,7 @@ void ListMenuScreen::update(const ButtonState& buttons, DrawBuffer& buf, IRuntim
           // hold) must not cost a refresh of a screen that is about to go. If
           // on_back() stays, `moved` still draws it below.
           on_back();
-          if (app_ && app_->has_pending_transition()) {
+          if (app_->has_pending_transition()) {
             return;
           }
           break;
@@ -322,7 +321,7 @@ void ListMenuScreen::update(const ButtonState& buttons, DrawBuffer& buf, IRuntim
         case Button::Button1:  // select
           if (n > 0 && selected_ < n) {
             on_select(selected_);
-            if (app_ && app_->has_pending_transition()) {
+            if (app_->has_pending_transition()) {
               return;
             }
             needs_draw = true;
@@ -336,46 +335,25 @@ void ListMenuScreen::update(const ButtonState& buttons, DrawBuffer& buf, IRuntim
   }
 
   // Hold-down: repeats start after config::kHoldDelayMs, then come every
-  // config::kHoldRepeatMs, with the step growing by config::kHoldAccelStep entries
-  // per repeat so a long hold accelerates through the list. Driven by elapsed time
-  // rather than frames — the press itself is already handled above, and frame
-  // duration swings with render and panel work, so counting frames made a tap
-  // register as two presses whenever frames were short.
+  // config::kHoldRepeatMs, one entry each. Driven by elapsed time rather than
+  // frames — the press itself is already handled above, and frame duration
+  // swings with render and panel work, so counting frames made a tap register
+  // as two presses whenever frames were short.
   const uint32_t dt_ms = runtime.frame_time_ms();
   const int up_repeats = hold_up_.tick(buttons.is_down(logical_up_front) || buttons.is_down(logical_up_side), dt_ms);
   const int down_repeats =
       hold_down_.tick(buttons.is_down(logical_down_front) || buttons.is_down(logical_down_side), dt_ms);
 
-  // The step is read into a local before the inner loop. Writing this as
-  // `for (i = 0; i < ++hold_reps_up_; ++i)` re-evaluates the increment in the
-  // condition every pass, so the bound outruns i and the loop never ends.
-  // Repeat r moves 1 + r*kHoldAccelStep entries, capped at the list length —
-  // beyond that it is just spinning around a list it has already crossed.
-  auto step_for = [n](int repeat_index) {
-    const int step = 1 + repeat_index * config::kHoldAccelStep;
-    return step < n ? step : n;
-  };
-
   if (up_repeats > 0 && n > 0) {
-    for (int r = 0; r < up_repeats; ++r) {
-      const int step = step_for(hold_reps_up_++);
-      for (int i = 0; i < step; ++i)
-        move_up();
-    }
+    for (int r = 0; r < up_repeats; ++r)
+      move_up();
     moved = true;
-  } else if (hold_up_.idle()) {
-    hold_reps_up_ = 0;
   }
 
   if (down_repeats > 0 && n > 0) {
-    for (int r = 0; r < down_repeats; ++r) {
-      const int step = step_for(hold_reps_down_++);
-      for (int i = 0; i < step; ++i)
-        move_down();
-    }
+    for (int r = 0; r < down_repeats; ++r)
+      move_down();
     moved = true;
-  } else if (hold_down_.idle()) {
-    hold_reps_down_ = 0;
   }
 
   if (moved || needs_draw || force_redraw_) {
@@ -386,8 +364,7 @@ void ListMenuScreen::update(const ButtonState& buttons, DrawBuffer& buf, IRuntim
 }
 
 void ListMenuScreen::on_back() {
-  if (app_)
-    app_->pop_screen();
+  app_->pop_screen();
 }
 
 }  // namespace wintergreen

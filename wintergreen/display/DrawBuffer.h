@@ -16,8 +16,6 @@ namespace wintergreen {
 // landscape. The reversed orientations were dropped — see rotation_from_setting.
 enum class Rotation { Deg0 = 0, Deg90 = 90 };
 
-// Refresh mode for full-screen updates.
-enum class RefreshMode { Full, Half };
 
 // Physical screen constants and bit-packed pixel helpers (used internally by DrawBuffer).
 struct DisplayFrame {
@@ -40,14 +38,9 @@ class IDisplay {
  public:
   virtual ~IDisplay() = default;
 
-  // Full physical refresh. `pixels` is the new frame; `prev` is the one currently
-  // on the glass, or nullptr when it is not known.
-  //
-  // RefreshMode::Full drives each pixel from its actual old state to its new one,
-  // which needs `prev` in RED RAM — see EInkDisplay::full_refresh. Half ignores
-  // `prev` entirely and is the boot paint; don't change what it does.
-  virtual void full_refresh(const uint8_t* pixels, const uint8_t* prev, RefreshMode mode,
-                            bool turnOffScreen = false) = 0;
+  // Full physical refresh of `pixels` (the one OTP full-panel mode: boot
+  // paint, sleep image). turnOffScreen powers the rails down at its end.
+  virtual void full_refresh(const uint8_t* pixels, bool turnOffScreen = false) = 0;
 
   // Partial refresh: new_pixels -> BW RAM, then fire the waveform without waiting.
   virtual void partial_refresh(const uint8_t* new_pixels) = 0;
@@ -88,10 +81,7 @@ class IDisplay {
 // refreshes it holds the frame on the glass (or, under a gray page, the page's
 // hi plane: GrayPage.h). Every draw path starts from fill() or frame(), so
 // nothing reads the previous frame.
-// A second host copy of the displayed frame (there used to be one) had no
-// reader: the fast waveform never takes RED RAM from the host, and
-// RefreshMode::Full, the only mode that would, has no caller. A future Full
-// caller must keep its own copy of the old frame.
+// No host copy of the displayed frame: no update here needs the old frame.
 //
 // The framebuffers are never loaned out as scratch: image decoding and EPUB
 // conversion, the two things that used to borrow them, are both gone from the
@@ -228,7 +218,7 @@ class DrawBuffer {
   //
   // Gone with it: partials_since_full_, flush_pending(), flush_ghosting(),
   // Application::kGhostFlushIdleMs and config::kFullRefreshEveryNUpdates. To
-  // bring it back, count here and call full_refresh(RefreshMode::Full) from
+  // bring it back, count here and call full_refresh() from
   // wherever the interruption is acceptable — but read "Panel health" first.
   //
   // A gray page set since the last draw goes up instead (GrayPage). Leaving a
@@ -243,15 +233,14 @@ class DrawBuffer {
     gray_.set_glass(GrayPage::Glass::Frame);
   }
 
-  // Full hardware refresh of the draw buffer. No previous frame is passed: no
-  // host copy of it exists (class comment), and Half ignores it anyway. A
-  // pending gray page (boot into a book) goes up on the Turn LUT instead.
-  void full_refresh(RefreshMode mode = RefreshMode::Half, bool turnOffScreen = false) {
+  // Full hardware refresh of the draw buffer. A pending gray page (boot into a
+  // book) goes up on the Turn LUT instead.
+  void full_refresh(bool turnOffScreen = false) {
     if (gray_.pending()) {
       show_gray_();
       return;
     }
-    display_.full_refresh(buf_, nullptr, mode, turnOffScreen);
+    display_.full_refresh(buf_, turnOffScreen);
     gray_.set_glass(GrayPage::Glass::Frame);
   }
 

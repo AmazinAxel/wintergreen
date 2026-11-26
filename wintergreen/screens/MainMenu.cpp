@@ -13,7 +13,6 @@
 
 namespace wintergreen {
 
-
 // Stable merge sort over an index permutation.
 //
 // This exists instead of std::stable_sort because the standard algorithm is a
@@ -65,16 +64,11 @@ static std::vector<uint16_t> iota_indices_(size_t n) {
   return idx;
 }
 
-
 void MainMenu::on_start() {
-  if (!app_->data_dir_)
-    return;
-
   const std::string& index_path = app_->index_path();
 
   if (show_hidden_ && hidden_.empty())
     scan_hidden_();
-
 
   if (BookIndex::instance().entries().empty())
     BookIndex::instance().load(index_path);
@@ -205,27 +199,18 @@ void MainMenu::on_back() {
 }
 
 void MainMenu::scan_directory_() {
-  if (!books_dir_ || !app_->data_dir_)
-    return;
-
-  std::string root_dir = books_dir_;
-  const std::string& index_path = app_->index_path();
-
-  BookIndex::instance().build_index(root_dir);
-  BookIndex::instance().save(index_path);
-
+  BookIndex::instance().build_index(kCardRoot);
+  BookIndex::instance().save(app_->index_path());
 }
 
 void MainMenu::scan_hidden_() {
   hidden_.clear();
-  if (!books_dir_)
-    return;
   if (buf_)
     buf_->wait_panel_idle();  // the card shares SPI2 with the panel
 
   std::vector<std::string> paths;
   std::queue<std::string> q;
-  q.push(std::string(books_dir_) + "/.hidden");
+  q.push(std::string(kCardRoot) + "/.hidden");
   while (!q.empty()) {
     const std::string dir = std::move(q.front());
     q.pop();
@@ -247,7 +232,7 @@ void MainMenu::scan_hidden_() {
   // written here only when the set of hidden books changed), so a reveal opens
   // no WGB except for a book added since. The folder walk above stays: it is
   // what notices books added or removed by hand.
-  const std::string cache_path = std::string(books_dir_) + "/.hidden/.wintergreen-index";
+  const std::string cache_path = std::string(kCardRoot) + "/.hidden/.wintergreen-index";
   struct Cached {
     std::string path, title, author;
   };
@@ -444,7 +429,6 @@ void MainMenu::populate_list_() {
     initial_selection_.clear();
   }
 }
-
 
 // ── Cover thumbnails ────────────────────────────────────────────────────────
 

@@ -173,7 +173,7 @@ moving the cursor under the user would be wrong. With no books there is no hairl
 Sync is the only row.
 
 **Hidden books are a mode of `MainMenu`, not a screen.** A 1 s back long-press **on the
-home screen** opens the list with the books under `<books_dir>/.hidden/` at the top, above
+home screen** opens the list with the books under `/sdcard/.hidden/` (`kCardRoot`) at the top, above
 their own hairline (`set_show_hidden()` before the push). That gesture is the only way to
 see them, and `MainMenu::stop()` clears the flag.
 

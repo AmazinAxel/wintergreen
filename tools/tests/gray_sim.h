@@ -279,7 +279,7 @@ struct Panel : IDisplay {
     ++windows;
   }
 
-  void full_refresh(const uint8_t* px, const uint8_t*, RefreshMode, bool) override {
+  void full_refresh(const uint8_t* px, bool) override {
     finish_writes();
     std::memcpy(bw.data(), px, bw.size());
     std::memcpy(red.data(), px, red.size());

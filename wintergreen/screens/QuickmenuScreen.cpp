@@ -230,14 +230,14 @@ void QuickmenuScreen::on_start() {
 
   // Session-only: gone once on, and a deep-sleep wake is a full boot, so it
   // comes back off without any reset code.
-  if (app_ && !app_->long_sleep()) {
+  if (!app_->long_sleep()) {
     idx_long_sleep_ = count();
     add_item("Longer autosleep");
   }
 
   if (settings_) {
     idx_reader_rotate_display_ = count();
-    add_item(fmt_setting(tmp, sizeof(tmp), "Orientation", rotation_label(app_ ? app_->rotate_reader() : 0)));
+    add_item(fmt_setting(tmp, sizeof(tmp), "Orientation", rotation_label(app_->rotate_reader())));
 
     // The reader font set is always present here: without it no book opens, and
     // this menu only exists over an open book.
@@ -480,7 +480,7 @@ void QuickmenuScreen::on_select(int index) {
 
   if (index == idx_font_size_) {
     uint8_t max_idx = ReaderSettings::kNumFontSizePresets;
-    const int n = app_ ? app_->reader_font()->num_fonts() : 0;
+    const int n = app_->reader_font()->num_fonts();
     if (n > 0 && n < max_idx)
       max_idx = static_cast<uint8_t>(n);
     settings_->font_size_idx = static_cast<uint8_t>((settings_->font_size_idx + 1) % max_idx);
@@ -488,11 +488,9 @@ void QuickmenuScreen::on_select(int index) {
     return;
   }
   if (index == idx_reader_rotate_display_) {
-    if (app_) {
-      uint8_t v = static_cast<uint8_t>(app_->rotate_reader() == 1 ? 0 : 1);
-      app_->set_rotate_reader(v);
-      refresh_items_(index);
-    }
+    uint8_t v = static_cast<uint8_t>(app_->rotate_reader() == 1 ? 0 : 1);
+    app_->set_rotate_reader(v);
+    refresh_items_(index);
     return;
   }
   if (index == idx_long_sleep_) {

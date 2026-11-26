@@ -47,9 +47,9 @@ hands it to `GrayPage` (below, "Gray reader pages"); nothing allocates. `baked_l
 proves the gray page equal to an independent render of the PageContent it was baked from.
 
 **Display lists come off the card, so every read follows the SPI2 rule.** The next page's
-record and list are **read ahead** into a second 4 KB buffer (`prefetch_next_`, on the
+record and list, and the previous one's, are **read ahead** into two 4 KB slots (`ahead_`, `prefetch_`, on the
 first frame after a waveform: the panel's BUSY edge wakes the loop, `busy_isr_` → `ui_wake`),
-so a forward turn reads nothing on the press path, a pointer swap; a turn straight
+so a turn either way reads nothing on the press path, a pointer swap (the slot keeps the page left); a turn straight
 back lands on the swapped-out page, free too. Anything else (`load_page_` miss, layout
 change, chapter table, book open) waits for the panel first. Until 2026-11-25 the page
 *record* read and the layout-change search ran before that wait: a press during a
@@ -197,8 +197,9 @@ There is one draw buffer, not a front/back pair. `refresh()` sends it and does n
 flip: the controller keeps the pixels, the SPI write is synchronous, and every draw
 starts from `fill()` or `frame()`, so nothing reads the previous frame. Between
 refreshes the draw buffer is the frame on the glass (under a gray page: its `hi` plane). The second host copy (48 KB) was
-removed because nothing read it; `RefreshMode::Full`, the only mode that takes the old
-frame from the host, has no caller, and one added later must keep its own copy.
+removed because nothing read it. `RefreshMode` is gone too (2026-11-25): `Full`, the only
+mode that took the old frame from the host, never had a caller, so `full_refresh` is the
+one OTP Half paint. A prior-state full mode added later must keep its own copy.
 
 ## Gray reader pages (2026-11-25)
 
@@ -241,6 +242,15 @@ Windows are queued only inside `GrayPage::show`, which drains them before readin
 card and before returning, so `wait_idle()` does **not** drain: the sync and USB tasks
 call it from their own tasks, and the queue (`windows_`, `ring_`) is the UI task's.
 
+**Regressions fixed after `1cdf3fe`** (everything layered/ghosted, boot to menus to turns):
+every window sets data entry mode `0x01` itself (a boot into a book wrote its first gray
+page before any `setRamArea()`, in the controller's Y-increment default: strips scrambled,
+glass model wrong from then on; `5942a93`'s `begin_update` had set it); HW CS gets
+`cs_ena_pretrans`/`posttrans` = 3 cycles (SSD1677 ~60 ns setup/hold, 0 cycles = 12.5 ns);
+init seeds temperature `0x5A` (fast waveform used to inherit it from the boot Half paint).
+A SW reset on leaving the Turn LUT (to drop its voltages before OTP updates) was tried
+and closed the same day: see "Leaving the Turn LUT: no reset" below.
+
 **Glass model** (`GrayPage::Glass`): `Frame` = the 1-bit `buf_`, put up by an OTP update
 (old levels exact: book opened from a list, quick menu closed; written over by the new
 planes strip by strip); `Page` = the planes while `planes_ok_`; `Unknown` = boot (every
@@ -270,9 +280,8 @@ and are driven). Half (boot paint, sleep) bypasses RED and needs none.
 band, uploads LUT + gate / source / VCOM unless already loaded for that band;
 `gray_fire` = CTRL1 0x00, CTRL2 0x0C (**never LUT_LOAD**: it would replace the table from
 OTP). Every OTP update sets LUT_LOAD, and every controller init resets the table, so both
-clear `turn_loaded_`. **Unverified on the device**: whether OTP LUT_LOAD also restores
-the OTP voltages after our upload (if menus look wrong after a gray page, resend the
-init voltages in the handoff).
+clear `turn_loaded_`. The Turn voltages (`kGateVoltage` .. `kVcom`, the vendor's values
+for this panel) stay in the registers after a gray page; menus run on them fine (below).
 
 Images in pages stay 1-bit. Each strip an image crosses reads its part after
 `finish_writes()` (the card shares SPI2; that strip loses the DMA overlap), all after
@@ -282,8 +291,21 @@ Tests: `baked_line_test` (render vs independent reference, kept planes = glass),
 `gray_page_test` (simulated controller with late-applied queued windows, OTP + Turn
 semantics, handoff, dirty strips), `lut_test`, `font_test`.
 
-Not measured on the device yet: turn latency (render + SPI ahead of the ~600 ms Turn
-waveform), and whether OTP LUT_LOAD restores the voltages (above).
+Not measured on the device yet: turn latency (render + SPI ahead of the ~310 ms Turn
+waveform).
+
+### Leaving the Turn LUT: no reset (experiment closed 2026-11-25, success)
+
+Question: OTP `LUT_LOAD` restores the waveform table, but maybe not the gate / source /
+VCOM registers `gray_begin` writes, so menus after a gray page might run on the Turn
+voltages. The guard was a SW reset + `initDisplayController()` on the first OTP update
+after a gray page (`leave_turn_`, `gray_end` in the handoff, flag `kResetLeavingTurn`).
+Run on hardware with the reset **off**: menus after reading do not ghost, and reader →
+menu is faster (no reset, no analog power-up). Hardcoded off; `leave_turn_`, `turn_regs_`,
+`gray_end` and the flag are deleted, the handoff waits with `wait_idle()`. The Turn
+voltages are the vendor's own for this panel (`panel_lut.h`), so OTP waveforms on them
+stay inside its envelope. Reopen only if menus ghost after a reading session and the
+ghost survives a sleep (the canary in "Panel health").
 
 ### Panel health
 
@@ -302,7 +324,7 @@ survived sleep anyway, and every session is bracketed by two full-panel waveform
 
 | When | What runs |
 |---|---|
-| going to sleep | the sleep image — `full_refresh(RefreshMode::Half)`, cover or wordmark |
+| going to sleep | the sleep image — `full_refresh(turnOffScreen)` (Half), cover or wordmark |
 | waking | `Application::start()`'s `full_refresh()` (Half) |
 
 With `kAutoSleepMinutes = 1` that is a full-panel waveform every time the device is put
@@ -312,12 +334,12 @@ read*.
 **What is genuinely uncovered:** a session that never idles for a whole minute. Page
 turns every 45 s keep `inactivity_ms_` below the timeout indefinitely, so 30 minutes is
 ~40 partial updates with no full refresh. That is within normal e-reader practice (Kobo
-exposes 1–100 pages *and* "never"), and the page-turn waveform is the vendor's OTP fast
-LUT. Expect faint ghosting late in a long session; expect it gone after the next sleep.
+exposes 1–100 pages *and* "never"); page turns run the Turn LUT (stock text waveform, halved),
+menus the OTP fast LUT. Expect faint ghosting late in a long session; expect it gone after the next sleep.
 
 The canary is ghosting that *survives* a sleep/wake cycle. Nothing in the current design
 would produce that; if it appears, the fix is a counter in `DrawBuffer::refresh()`
-calling `full_refresh(RefreshMode::Full)` — accepting that no threshold both protects
+calling `full_refresh()` — accepting that no threshold both protects
 the panel mid-session and stays out of the way.
 
 ### The half-refresh temperature write — do not remove it
@@ -331,37 +353,21 @@ It was removed on exactly that reasoning, and the result was a device that ran o
 flash and then displayed nothing at all, ever. `0xD4` includes **LUT_LOAD**, and the OTP
 waveform it loads is selected via the temperature register; without the write the panel
 comes up with no usable LUT. What made it costly to find: **`Application::start()` ends
-with `buf.full_refresh()`, whose default is `RefreshMode::Half`** — so the one broken
+with `buf.full_refresh()`, the Half paint** — so the one broken
 path is the one that paints the very first screen.
 
 Two lessons that generalise: a vendor init sequence is not a place to remove things that
 "should" be no-ops; and "the code reached this point" is not "the panel showed
 something".
 
-**Temperature compensation is live**, and the mechanism explains the `0x5A` disaster.
-Selecting the sensor only says *which* sensor, not when to read it. The reading happens
-when **TEMP_LOAD (CTRL2 bit 5, 0x20)** is set in the update sequence, and that bit was
-**never set anywhere in this driver** — so the controller never sampled its own sensor
-and the register only ever held the fixed `0x5A`.
-
-`refreshDisplay()` ORs TEMP_LOAD into **one** path:
-
-- **`EPD_FULL_REFRESH` (0x34 → 0x54)** — the sleep image and any DC-balancing flush, the
-  updates that recondition the panel and that nobody waits on.
-- **`EPD_FAST_REFRESH` is excluded** — it runs the custom LUT, a fixed table no
-  temperature can select between, and it is the page-turn hot path.
-- **`EPD_HALF_REFRESH` is excluded for a UX reason**, tried the other way first. Half is
-  the boot paint, which with `kAutoSleepMinutes = 1` runs *every time the device is
-  picked up*. With TEMP_LOAD it got visibly longer and flashed more: `0x5A` corresponds
-  to a much warmer panel than a room, and e-ink waveforms lengthen as they get colder.
-  Several times an hour it was intolerable. Any under-driving is cleared by the next
-  full refresh.
-
-Two deliberate safety properties: **the `0x5A` write stays** as the seed the controller
-falls back to, so a sensor that does not answer leaves a usable value; and **`kTempLoad`
-is the one line to flip** (`0x00` restores the previous fixed-temperature behaviour).
-It is a local constant rather than a config option: whether the controller implements
-CTRL2 bit 5 is a property of the hardware, not a preference.
+**TEMP_LOAD (CTRL2 bit 5, 0x20) is never set.** Selecting the sensor only says *which*
+sensor; the controller samples it only when TEMP_LOAD is in the update sequence, so the
+temperature register holds the host's `0x5A` and every OTP waveform is picked for it.
+TEMP_LOAD on the Half paint was tried: `0x5A` is warmer than a room, so the sampled
+waveform was visibly longer and flashier on every pick-up, intolerable several times an
+hour. It lived on only in a `Full` mode with no caller (`kTempLoad`, `EPD_FULL_REFRESH`,
+deleted 2026-11-25). Reader pages get temperature from the C3's die sensor instead (Turn
+bands, `panel_lut.h`). The `0x5A` write stays (above), and is also seeded at init.
 
 **Still not possible: reading the temperature back.** `CMD_READ_TEMP` would need MISO
 from the panel, and the panel is wired write-only.
@@ -385,3 +391,17 @@ common case, paying the whole saving back as latency.
 
 The rails are still powered down where it costs nothing: `refreshDisplay()`'s
 `turnOffScreen` path at the end of a full refresh, which is what the sleep image uses.
+
+### Turn length (2026-11-25, owner asked for the latency floor)
+
+Turn = the stock text waveform halved: 13 frames (`kToWhite` 12, `kToBlack` 9,
+`kGrayBack` 2) ~310 ms at FR 0x33, the old 1-bit OTP turn's time; owner's pick on
+hardware over 25 (~600 ms, 2026-11-19) and 17 (~410 ms). Temperature bands still lengthen
+it. Press-path costs cut with it: the `.pos` write moved off Back (`queue_book_pos` →
+`flush_persist`), the deferred index read moved to the reader's first idle frame
+(`load_deferred_index`), and back turns read ahead too (`ahead_`). Left: press → fire is
+render + both planes over DMA, ~20-40 ms at 160 MHz; reader → menu pays the handoff only
+(no SW reset: "Leaving the Turn LUT: no reset").
+
+**Panel SPI at 80 MHz: failed (2026-11-25).** With `SPI_DEVICE_NO_DUMMY` so the HAL took
+it over the GPIO matrix: nothing rendered at all. `kPanelSpiHz` stays 40.

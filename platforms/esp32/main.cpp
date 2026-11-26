@@ -26,19 +26,6 @@
 // Wake is the power button, level-triggered on LOW.
 static constexpr gpio_num_t kPowerPin = GPIO_NUM_3;
 
-// No pin is held through deep sleep. Firmware from 2026-11-11 held SD CS
-// (GPIO12), panel CS and panel RST high; deep-sleep drain rose with it (GPIO12
-// sits in the VDD_SPI pad group). Released first thing in app_main so a device
-// that went to sleep under that firmware gets its pins back: a held CS cannot
-// be driven.
-static constexpr gpio_num_t kOldSleepHoldPins[] = {GPIO_NUM_12, EPD_CS, EPD_RST};
-
-static void release_sleep_holds_() {
-  gpio_deep_sleep_hold_dis();
-  for (gpio_num_t p : kOldSleepHoldPins)
-    gpio_hold_dis(p);
-}
-
 [[noreturn]] static void deep_sleep_now_() {
   esp_sleep_enable_gpio_wakeup_on_hp_periph_powerdown(1ULL << kPowerPin, ESP_GPIO_WAKEUP_GPIO_LOW);
   esp_deep_sleep_disable_rom_logging();
@@ -109,9 +96,6 @@ static void verify_wakeup_press() {
 // "fine": stranding a device because it cannot read its own battery would be
 // worse than the discharge it is trying to prevent.
 static void verify_battery(const Esp32Runtime& runtime) {
-  if (wintergreen::kLowBatteryCutoffMv == 0)
-    return;
-  static constexpr int kImplausibleMv = 2500;
   // Eight back-to-back reads, averaged. These used to be 25 ms apart, keeping the
   // worst — 175 ms of sleeping on every wake, guarding against load transients
   // that cannot happen here: this runs before the panel or the card is powered,
@@ -119,7 +103,7 @@ static void verify_battery(const Esp32Runtime& runtime) {
   int sum = 0;
   for (int i = 0; i < 8; ++i) {
     const int mv = runtime.battery_millivolts();
-    if (mv < kImplausibleMv)
+    if (mv < wintergreen::kImplausibleMv)
       return;
     sum += mv;
   }
@@ -133,7 +117,6 @@ static void verify_battery(const Esp32Runtime& runtime) {
 // turn allocates nothing; the radios come and go beside them without anything
 // being handed back. See docs/history.md "OOM rescue".
 extern "C" void app_main(void) {
-  release_sleep_holds_();
   verify_wakeup_press();
 
   static Esp32InputSource input;
@@ -171,9 +154,6 @@ extern "C" void app_main(void) {
     wait_power_release_();
     deep_sleep_now_();
   }
-  // State lives in two dotfiles at the card root — see set_state_root.
-  app.set_books_dir("/sdcard");
-  app.set_state_root("/sdcard");
 
   static FontManager font_mgr(app);
   font_mgr.init();  // hands the reader font to the app

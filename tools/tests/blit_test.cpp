@@ -14,7 +14,7 @@ using namespace wintergreen;
 
 struct CaptureDisplay : IDisplay {
   const uint8_t* last = nullptr;
-  void full_refresh(const uint8_t* pixels, const uint8_t*, RefreshMode, bool) override { last = pixels; }
+  void full_refresh(const uint8_t* pixels, bool) override { last = pixels; }
   void partial_refresh(const uint8_t* pixels) override { last = pixels; }
 };
 

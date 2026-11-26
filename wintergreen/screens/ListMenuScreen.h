@@ -237,8 +237,6 @@ class ListMenuScreen : public IScreen {
   int scroll_shift_ = 0;
   HoldRepeat hold_up_;
   HoldRepeat hold_down_;
-  int hold_reps_up_ = 0;    // repeats fired so far this hold; drives the step size
-  int hold_reps_down_ = 0;
 
   bool on_start_set_selection_ = false;
   bool force_redraw_ = false;
